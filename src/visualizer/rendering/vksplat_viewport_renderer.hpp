@@ -4,9 +4,12 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include "core/error.hpp"
 #include "core/exportable_storage.hpp"
 #include "core/splat_data.hpp"
+#include "dirty_flags.hpp"
 #include "lod_page_cache.hpp"
 #include "lod_pool_quant.hpp"
 #include "lod_upload_engine.hpp"
@@ -37,6 +40,10 @@
 #include <utility>
 #include <vector>
 
+namespace lfs::vis::shaders {
+    struct ShaderPrograms;
+} // namespace lfs::vis::shaders
+
 namespace lfs::vis {
 
     // Starts with file-only work: shader blobs are cached for the first
@@ -44,8 +51,11 @@ namespace lfs::vis {
     LFS_VIS_API void preloadVkSplatSpirvFiles();
 
     class VksplatViewportRenderer {
+        friend struct UserShaderTestAccess;
         friend struct VksplatScratchReleaseTestAccess;
         friend struct SplitOutputLifetimeTestAccess;
+        friend struct HiGSExportTestAccess;
+        friend struct StochasticHistoryTestAccess;
 
     public:
         struct RenderResult {
@@ -65,6 +75,11 @@ namespace lfs::vis {
             std::uint64_t lod_page_generation = 0;
             // True while page decodes/uploads are still in flight.
             bool lod_streaming_active = false;
+            bool stochastic_accumulation_active = false;
+            // The host a requested custom effect draw runs; it drew with the
+            // built-in programs while no published program set holds it.
+            bool custom_active = false;
+            bool custom_pending = false;
         };
 
         struct ModelInputSnapshot {
@@ -114,7 +129,10 @@ namespace lfs::vis {
             SplitLeft = 1,
             SplitRight = 2,
             Preview = 3,
+            VrLeft = 4,
+            VrRight = 5,
         };
+        static_assert(OutputSlotRing::kOutputSlotCount == static_cast<std::size_t>(OutputSlot::VrRight) + 1);
 
         struct SelectionMaskRequest {
             lfs::rendering::FrameView frame_view;
@@ -143,14 +161,13 @@ namespace lfs::vis {
         VksplatViewportRenderer(const VksplatViewportRenderer&) = delete;
         VksplatViewportRenderer& operator=(const VksplatViewportRenderer&) = delete;
 
-        [[nodiscard]] std::expected<RenderResult, std::string> render(
+        [[nodiscard]] LFS_VIS_API std::expected<RenderResult, std::string> render(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
             const lfs::rendering::ViewportRenderRequest& request,
             bool force_input_upload,
             OutputSlot output_slot = OutputSlot::Main,
-            bool synchronize_input_upload = false,
-            bool deterministic_export = false);
+            bool synchronize_input_upload = false);
         [[nodiscard]] std::expected<RenderResult, std::string> rerenderSelectionOverlay(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
@@ -200,6 +217,7 @@ namespace lfs::vis {
         // While the camera moves during training, the viewer and training take
         // turns on the shared scratch (see kTrainingFramesPerNavigationRender).
         void setCameraNavigating(bool navigating);
+        void invalidateStochasticHistory(DirtyMask dirty_flags = DirtyFlag::ALL);
 
         // Invoked with the completion value immediately after each live-model
         // submit, BEFORE the shared arena frame is released — the trainer's
@@ -219,10 +237,10 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgba(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
-        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgb8(
+        [[nodiscard]] LFS_VIS_API std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgb8(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
-        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgba8(
+        [[nodiscard]] LFS_VIS_API std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgba8(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
         // Reads the most recent render's raw per-pixel linear depth (the
@@ -248,7 +266,7 @@ namespace lfs::vis {
             lfs::core::Tensor& destination,
             int destination_x,
             int destination_y) const;
-        [[nodiscard]] std::expected<float, std::string> sampleDepthAtPixel(
+        [[nodiscard]] LFS_VIS_API std::expected<float, std::string> sampleDepthAtPixel(
             VulkanContext& context,
             const DepthSampleRequest& request) const;
 
@@ -281,17 +299,40 @@ namespace lfs::vis {
         [[nodiscard]] std::uint64_t readbackRingFullWaitCount() const;
         [[nodiscard]] std::uint64_t readbackCellPinWaitCount() const;
 
-        [[nodiscard]] std::expected<lfs::core::Tensor, std::string> buildSelectionMask(
+        [[nodiscard]] LFS_VIS_API std::expected<lfs::core::Tensor, std::string> buildSelectionMask(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
             const SelectionMaskRequest& request,
             bool force_input_upload);
 
         void releasePreviewResources();
+        void releaseVrResources();
         void releaseSplitOutputResources();
         void retainPublishedSplitImages(VkImageView left, VkImageView right);
         void releaseSceneResources();
         void reset();
+
+        auto initializePrograms(VulkanContext& context) { return ensureInitialized(context); }
+        using ProgramSetHandle = VulkanGSRenderer::ProgramSetHandle;
+        struct PreparedDraw {
+            VulkanGSRenderer::HostInputs inputs;
+            VulkanGSRenderer::HostPlan hosts;
+            std::uint64_t device_generation = 0;
+            bool stochastic = false, warmup = false;
+        };
+        [[nodiscard]] std::expected<PreparedDraw, std::string> prepare(VulkanContext&, const core::SplatData&,
+                                                                       const rendering::ViewportRenderRequest&, OutputSlot, bool synchronize_input_upload = false, bool capture = false);
+        [[nodiscard]] PreparedDraw prepareDecision(const rendering::ViewportRenderRequest&, OutputSlot, bool synchronize_input_upload, bool capture = false);
+        [[nodiscard]] VulkanGSRenderer::HostPlan hostsFor(const VulkanGSRenderer::HostInputs& inputs) { return renderer_.hostsFor(inputs); }
+        [[nodiscard]] lfs::Result<bool> preparePrograms(const std::shared_ptr<const shaders::ShaderPrograms>&,
+                                                        ProgramSetHandle&, std::function<void()> finished, bool live = false);
+        void usePrograms(const ProgramSetHandle& handle) {
+            std::erase_if(program_sets_, [](const auto& entry) { return entry.second.first.expired(); });
+            renderer_.useProgramSet(handle);
+        }
+        [[nodiscard]] std::uint64_t deviceGeneration() const { return renderer_.deviceGeneration(); }
+        [[nodiscard]] std::uint64_t programSetSerial() const { return renderer_.programSetSerial(); }
+        std::function<Status(const PreparedDraw&, const rendering::ViewportRenderRequest&)> prepare_custom;
         [[nodiscard]] std::optional<LodPageCache::Snapshot> ensureLodPageCacheSnapshot(
             const lfs::core::SplatData& splat_data);
         // VRAM page-pool budget in splats for RAD-backed LoD streaming; 0 = full residency.
@@ -374,7 +415,8 @@ namespace lfs::vis {
             const lfs::rendering::ViewportRenderRequest& request,
             std::size_t num_splats,
             std::size_t ring_slot,
-            OutputSlot output_slot);
+            OutputSlot output_slot,
+            std::span<const float> custom_tail = {});
         [[nodiscard]] lfs::Status ensureOutputImages(
             VulkanContext& context,
             glm::ivec2 size,
@@ -392,7 +434,60 @@ namespace lfs::vis {
             bool depth_view,
             float depth_min,
             float depth_max,
-            lfs::rendering::DepthVisualizationMode depth_visualization_mode);
+            lfs::rendering::DepthVisualizationMode depth_visualization_mode,
+            const _VulkanBuffer* color_override = nullptr);
+
+        // The custom effect a stochastic frame projects with: the program set
+        // and the effect's inputs. Default draws have none.
+        struct StochasticEffect {
+            std::uint64_t program_set = 0;
+            std::optional<lfs::rendering::GaussianCustomEffectState> state;
+            bool operator==(const StochasticEffect&) const = default;
+        };
+        struct StochasticHistory {
+            VulkanGSStochasticBuffers buffers;
+            VulkanGSRendererUniforms camera{};
+            const lfs::core::SplatData* model = nullptr;
+            StochasticEffect effect;
+            std::uint64_t generation = 0;
+            std::uint32_t samples = 0;
+            std::size_t last_color = 0;
+            bool valid = false;
+        };
+        struct StochasticFrame {
+            VulkanGSRendererUniforms camera{};
+            const lfs::core::SplatData* model = nullptr;
+            StochasticEffect effect;
+            std::uint64_t generation = 0;
+            std::uint32_t samples = 0;
+            std::size_t output_color = 0;
+            bool history_valid = false;
+            bool enabled = false;
+        };
+        // Projection scratch is shared by all views. Only the last submitted
+        // projection can be reused, even when another view still has color history.
+        struct StochasticProjectionCache {
+            StochasticFrame frame;
+            OutputSlot slot = OutputSlot::Main;
+            std::uint64_t first_submission = 0;
+            std::uint64_t last_submission = 0;
+            std::size_t wave_count = 0;
+            std::optional<VulkanGSRenderer::StochasticTileState> tiles;
+        };
+        [[nodiscard]] static bool canReuseStochasticProjection(
+            const StochasticFrame& frame, OutputSlot slot, const StochasticProjectionCache& cache);
+        static void updateStochasticProjectionStats(
+            StochasticProjectionCache& cache, const VulkanGSRenderer::TileInstanceStats& stats);
+        [[nodiscard]] StochasticFrame prepareStochasticFrame(
+            VulkanGSRendererUniforms& uniforms, const lfs::core::SplatData& model,
+            OutputSlot slot, bool content_changed, StochasticEffect effect) const;
+        [[nodiscard]] const _VulkanBuffer* resolveStochasticFrame(
+            const VulkanGSRendererUniforms& uniforms, const StochasticFrame& frame,
+            OutputSlot slot, const glm::vec3& background);
+        void commitStochasticFrame(const StochasticFrame& frame, OutputSlot slot);
+        void retireStochasticBuffer(_VulkanBuffer& buffer, bool destroy_now);
+        void releaseUnusedStochasticBuffers(OutputSlot slot, std::uint32_t mode);
+        void releaseStochasticBuffers();
         [[nodiscard]] lfs::Status waitForRingSlot(
             std::size_t ring_slot,
             std::string_view reason);
@@ -677,6 +772,13 @@ namespace lfs::vis {
         std::unique_ptr<ComposePipeline> compose_;
         static constexpr std::size_t kOutputSlotCount = OutputSlotRing::kOutputSlotCount;
         static constexpr std::size_t kFrameRingSize = OutputSlotRing::kFrameRingSize;
+        std::array<StochasticHistory, kOutputSlotCount> stochastic_histories_;
+        std::uint64_t stochastic_history_generation_ = 1;
+        std::array<std::uint32_t, kOutputSlotCount> stochastic_sample_serials_{};
+        StochasticProjectionCache stochastic_projection_cache_;
+        // Stochastic frames keep depth keys alive, so the sort-index copy owns
+        // its own allocation instead of aliasing them.
+        bool stochastic_sort_indices_owned_ = false;
         OutputSlotRing ring_{};
         OutputImagePool output_pool_{};
         struct PublishedOutput {
@@ -707,6 +809,9 @@ namespace lfs::vis {
         bool last_render_used_macro_chain_ = false;
         std::size_t resident_depth_wave_armed_ = 0;
         int resident_sort_bits_ = 0;
+        bool resident_projection_custom_ = false;
+        // Program sets of linked shader programs, reused while those programs live.
+        std::unordered_map<const shaders::ShaderPrograms*, std::pair<std::weak_ptr<const shaders::ShaderPrograms>, ProgramSetHandle>> program_sets_;
         // The first frame after an input reset remains on the legacy chain;
         // it uses the same fixed-K wave machinery as every other legacy frame.
         bool macro_chain_warmup_pending_ = true;
@@ -718,6 +823,21 @@ namespace lfs::vis {
         std::array<ModelInputSnapshot, kInputRingSize> ring_uploaded_{};
         int current_input_sh_degree_ = -1;
         std::size_t last_vram_report_signature_ = 0;
+
+        struct ModelBounds {
+            const void* means = nullptr;
+            std::size_t count = 0;
+            std::uint64_t deleted_version = 0;
+            bool valid = false;
+            bool has_bounds = false;
+            glm::vec3 min{0.0f};
+            glm::vec3 max{0.0f};
+        };
+        ModelBounds orthographic_bounds_;
+        [[nodiscard]] float orthographicEyeSetback(const lfs::rendering::FrameView& frame_view,
+                                                   const lfs::core::SplatData& splat_data,
+                                                   const lfs::rendering::GaussianSceneState& scene,
+                                                   bool content_changed);
 
         struct SharedScratchArena {
             std::shared_ptr<lfs::core::ExportableBlock> block;

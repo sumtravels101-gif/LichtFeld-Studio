@@ -2,8 +2,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "image_codecs.hpp"
+#include "core/native_fs.hpp"
 #include "image_exr.hpp"
 
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 
 #include <jpeglib.h>
@@ -45,14 +47,14 @@ namespace lfs::core::image_codecs {
         constexpr std::array<std::uint8_t, 8> kPngSignature{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a};
 
         std::string lower_extension(const std::filesystem::path& path) {
-            auto extension = path.extension().string();
+            auto extension = lfs::core::path_to_utf8(path.extension());
             std::transform(extension.begin(), extension.end(), extension.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             return extension;
         }
 
         bool read_file(const std::filesystem::path& path, std::vector<std::uint8_t>& data, std::string& error) {
-            std::ifstream file(path, std::ios::binary | std::ios::ate);
+            std::ifstream file(native_fs::native_path(path), std::ios::binary | std::ios::ate);
             if (!file) {
                 error = "Could not open file " + path_to_utf8(path);
                 return false;
@@ -74,7 +76,7 @@ namespace lfs::core::image_codecs {
 
         bool read_prefix(const std::filesystem::path& path, std::vector<std::uint8_t>& data, std::string& error,
                          const std::size_t limit = 32) {
-            std::ifstream file(path, std::ios::binary);
+            std::ifstream file(native_fs::native_path(path), std::ios::binary);
             if (!file) {
                 error = "Could not open file " + path_to_utf8(path);
                 return false;
@@ -150,21 +152,11 @@ namespace lfs::core::image_codecs {
         }
 
         std::FILE* open_binary_file(const std::filesystem::path& path) {
-#ifdef _WIN32
-            return _wfopen(path.c_str(), L"rb");
-#else
-            const auto path_utf8 = path_to_utf8(path);
-            return std::fopen(path_utf8.c_str(), "rb");
-#endif
+            return open_file(path, "rb");
         }
 
         std::FILE* open_output_file(const std::filesystem::path& path) {
-#ifdef _WIN32
-            return _wfopen(path.c_str(), L"wb");
-#else
-            const auto path_utf8 = path_to_utf8(path);
-            return std::fopen(path_utf8.c_str(), "wb");
-#endif
+            return open_file(path, "wb");
         }
 
         void* allocate_target(DecodeTarget& target, const std::size_t bytes, std::string& error) {
@@ -589,8 +581,14 @@ namespace lfs::core::image_codecs {
             std::vsnprintf(message.data(), message.size(), format, args);
             if (!error.empty())
                 error += "; ";
-            if (module && *module)
-                error += std::string(module) + ": ";
+            if (module && *module) {
+                // libtiff names the file it was given; show the caller's spelling, not the extended one.
+                std::string_view name = module;
+                if (name.starts_with(R"(\\?\UNC\)"))
+                    error += R"(\\)" + std::string(name.substr(8)) + ": ";
+                else
+                    error += std::string(name.starts_with(R"(\\?\)") ? name.substr(4) : name) + ": ";
+            }
             error += message.data();
             return 1;
         }
@@ -617,7 +615,7 @@ namespace lfs::core::image_codecs {
             TIFFOpenOptionsSetErrorHandlerExtR(options, tiff_error_handler_ext_r, &error);
             TIFFOpenOptionsSetWarningHandlerExtR(options, tiff_warning_handler_ext_r, nullptr);
 #ifdef _WIN32
-            TIFF* tiff = TIFFOpenWExt(path.c_str(), mode, options);
+            TIFF* tiff = TIFFOpenWExt(native_fs::native_path(path).c_str(), mode, options);
 #else
             const auto path_utf8 = path_to_utf8(path);
             TIFF* tiff = TIFFOpenExt(path_utf8.c_str(), mode, options);
@@ -630,6 +628,97 @@ namespace lfs::core::image_codecs {
                     error = "TIFF open failed: " + error;
             }
             return tiff;
+        }
+
+        bool tiff_photometric_is_raw(const std::uint16_t photometric) {
+            return photometric == PHOTOMETRIC_MINISBLACK || photometric == PHOTOMETRIC_MINISWHITE ||
+                   photometric == PHOTOMETRIC_RGB;
+        }
+
+        // Stored sample order for gray and RGB. The orientation tag is metadata for
+        // viewers; camera poses are computed on the bytes in the file, so it is not applied.
+        bool read_tiff_tiles(TIFF* tiff, std::uint8_t* dest, const std::uint32_t width, const std::uint32_t height,
+                             const std::uint16_t channels, const std::size_t sample_size, const std::uint16_t planar,
+                             std::string& error) {
+            std::uint32_t tile_width = 0;
+            std::uint32_t tile_height = 0;
+            TIFFGetField(tiff, TIFFTAG_TILEWIDTH, &tile_width);
+            TIFFGetField(tiff, TIFFTAG_TILELENGTH, &tile_height);
+            const auto tile_bytes = TIFFTileSize(tiff);
+            const auto tile_row = TIFFTileRowSize(tiff);
+            if (tile_width == 0 || tile_height == 0 || tile_bytes <= 0 || tile_row <= 0) {
+                error = "TIFF tile size is zero";
+                return false;
+            }
+            const auto tile_row_bytes = static_cast<std::size_t>(tile_row);
+            const auto pixel_bytes = static_cast<std::size_t>(channels) * sample_size;
+            const bool separate = planar == PLANARCONFIG_SEPARATE;
+            if (!separate && tile_width == width && tile_height == height &&
+                static_cast<std::size_t>(tile_bytes) == static_cast<std::size_t>(width) * height * pixel_bytes) {
+                if (TIFFReadTile(tiff, dest, 0, 0, 0, 0) < 0) {
+                    error = error.empty() ? "TIFF tile read failed" : "TIFF tile read failed: " + error;
+                    return false;
+                }
+                return true;
+            }
+            std::vector<std::uint8_t> tile(static_cast<std::size_t>(tile_bytes));
+            const std::uint16_t planes = separate ? channels : static_cast<std::uint16_t>(1);
+            for (std::uint16_t plane = 0; plane < planes; ++plane) {
+                for (std::uint32_t y = 0; y < height;) {
+                    const auto rows = std::min(tile_height, height - y);
+                    for (std::uint32_t x = 0; x < width;) {
+                        const auto cols = std::min(tile_width, width - x);
+                        if (TIFFReadTile(tiff, tile.data(), x, y, 0, plane) < 0) {
+                            error = error.empty() ? "TIFF tile read failed" : "TIFF tile read failed: " + error;
+                            return false;
+                        }
+                        for (std::uint32_t row = 0; row < rows; ++row) {
+                            const auto* src = tile.data() + static_cast<std::size_t>(row) * tile_row_bytes;
+                            if (!separate) {
+                                std::memcpy(dest + (static_cast<std::size_t>(y + row) * width + x) * pixel_bytes, src,
+                                            static_cast<std::size_t>(cols) * pixel_bytes);
+                            } else {
+                                auto* dst = dest + ((static_cast<std::size_t>(y + row) * width + x) * channels + plane) * sample_size;
+                                for (std::uint32_t col = 0; col < cols; ++col)
+                                    std::memcpy(dst + static_cast<std::size_t>(col) * channels * sample_size,
+                                                src + static_cast<std::size_t>(col) * sample_size, sample_size);
+                            }
+                        }
+                        if (cols < tile_width)
+                            break;
+                        x += tile_width;
+                    }
+                    if (rows < tile_height)
+                        break;
+                    y += tile_height;
+                }
+            }
+            return true;
+        }
+
+        // Palette, YCbCr and CMYK need the RGBA reader for their colour conversion.
+        // Pass the file orientation so that conversion does not flip the stored layout.
+        bool read_tiff_rgba_stored(TIFF* tiff, Image& result, const std::uint32_t width, const std::uint32_t height,
+                                   std::string& error) {
+            std::uint16_t orientation = ORIENTATION_TOPLEFT;
+            TIFFGetFieldDefaulted(tiff, TIFFTAG_ORIENTATION, &orientation);
+            std::vector<std::uint32_t> rgba(static_cast<std::size_t>(width) * height);
+            if (!TIFFReadRGBAImageOriented(tiff, width, height, rgba.data(), orientation, 0)) {
+                error = error.empty() ? "TIFF RGBA fallback failed" : "TIFF RGBA fallback failed: " + error;
+                return false;
+            }
+            result.width = static_cast<int>(width);
+            result.height = static_cast<int>(height);
+            result.channels = 4;
+            result.sample_type = SampleType::UInt8;
+            result.data.resize(rgba.size() * 4);
+            for (std::size_t i = 0; i < rgba.size(); ++i) {
+                result.data[i * 4 + 0] = static_cast<std::uint8_t>(rgba[i] & 0xff);
+                result.data[i * 4 + 1] = static_cast<std::uint8_t>((rgba[i] >> 8) & 0xff);
+                result.data[i * 4 + 2] = static_cast<std::uint8_t>((rgba[i] >> 16) & 0xff);
+                result.data[i * 4 + 3] = static_cast<std::uint8_t>((rgba[i] >> 24) & 0xff);
+            }
+            return true;
         }
 
         bool decode_tiff(const std::filesystem::path& path, Image& result, std::string& error) {
@@ -655,29 +744,10 @@ namespace lfs::core::image_codecs {
                 error = "Unsupported TIFF layout";
                 return false;
             }
-            if (TIFFIsTiled(tiff) && bits == 8 && sample_format == SAMPLEFORMAT_UINT) {
-                std::vector<std::uint32_t> rgba(static_cast<std::size_t>(width) * height);
-                if (!TIFFReadRGBAImageOriented(tiff, width, height, rgba.data(), ORIENTATION_TOPLEFT, 0)) {
-                    TIFFClose(tiff);
-                    if (error.empty())
-                        error = "TIFF RGBA fallback failed";
-                    else
-                        error = "TIFF RGBA fallback failed: " + error;
-                    return false;
-                }
-                result.width = static_cast<int>(width);
-                result.height = static_cast<int>(height);
-                result.channels = 4;
-                result.sample_type = SampleType::UInt8;
-                result.data.resize(rgba.size() * 4);
-                for (std::size_t i = 0; i < rgba.size(); ++i) {
-                    result.data[i * 4 + 0] = static_cast<std::uint8_t>(rgba[i] & 0xff);
-                    result.data[i * 4 + 1] = static_cast<std::uint8_t>((rgba[i] >> 8) & 0xff);
-                    result.data[i * 4 + 2] = static_cast<std::uint8_t>((rgba[i] >> 16) & 0xff);
-                    result.data[i * 4 + 3] = static_cast<std::uint8_t>((rgba[i] >> 24) & 0xff);
-                }
+            if (TIFFIsTiled(tiff) && !tiff_photometric_is_raw(photometric)) {
+                const bool read = read_tiff_rgba_stored(tiff, result, width, height, error);
                 TIFFClose(tiff);
-                return true;
+                return read;
             }
             if ((bits != 8 && bits != 16 && bits != 32) ||
                 (sample_format != SAMPLEFORMAT_UINT && sample_format != SAMPLEFORMAT_IEEEFP) ||
@@ -693,30 +763,37 @@ namespace lfs::core::image_codecs {
             result.sample_type = sample_format == SAMPLEFORMAT_IEEEFP ? SampleType::Float32 : bits == 16 ? SampleType::UInt16
                                                                                                          : SampleType::UInt8;
             result.data.resize(static_cast<std::size_t>(width) * height * channels * sample_size);
-            const tmsize_t scanline_size = TIFFScanlineSize(tiff);
-            std::vector<std::uint8_t> row(static_cast<std::size_t>(std::max<tmsize_t>(scanline_size, 1)));
             const auto row_bytes = static_cast<std::size_t>(width) * channels * sample_size;
-            for (std::uint32_t y = 0; y < height; ++y) {
-                if (planar == PLANARCONFIG_CONTIG) {
-                    if (TIFFReadScanline(tiff, row.data(), y, 0) < 0) {
-                        TIFFClose(tiff);
-                        error = error.empty() ? "TIFF scanline read failed" : "TIFF scanline read failed: " + error;
-                        return false;
-                    }
-                    std::memcpy(result.data.data() + static_cast<std::size_t>(y) * row_bytes, row.data(), row_bytes);
-                } else {
-                    for (std::uint16_t channel = 0; channel < channels; ++channel) {
-                        if (TIFFReadScanline(tiff, row.data(), y, channel) < 0) {
+            if (TIFFIsTiled(tiff)) {
+                if (!read_tiff_tiles(tiff, result.data.data(), width, height, channels, sample_size, planar, error)) {
+                    TIFFClose(tiff);
+                    return false;
+                }
+            } else {
+                const tmsize_t scanline_size = TIFFScanlineSize(tiff);
+                std::vector<std::uint8_t> row(static_cast<std::size_t>(std::max<tmsize_t>(scanline_size, 1)));
+                for (std::uint32_t y = 0; y < height; ++y) {
+                    if (planar == PLANARCONFIG_CONTIG) {
+                        if (TIFFReadScanline(tiff, row.data(), y, 0) < 0) {
                             TIFFClose(tiff);
-                            error = error.empty() ? "TIFF planar scanline read failed"
-                                                  : "TIFF planar scanline read failed: " + error;
+                            error = error.empty() ? "TIFF scanline read failed" : "TIFF scanline read failed: " + error;
                             return false;
                         }
-                        for (std::uint32_t x = 0; x < width; ++x) {
-                            std::memcpy(result.data.data() + (static_cast<std::size_t>(y) * width * channels +
-                                                              static_cast<std::size_t>(x) * channels + channel) *
-                                                                 sample_size,
-                                        row.data() + static_cast<std::size_t>(x) * sample_size, sample_size);
+                        std::memcpy(result.data.data() + static_cast<std::size_t>(y) * row_bytes, row.data(), row_bytes);
+                    } else {
+                        for (std::uint16_t channel = 0; channel < channels; ++channel) {
+                            if (TIFFReadScanline(tiff, row.data(), y, channel) < 0) {
+                                TIFFClose(tiff);
+                                error = error.empty() ? "TIFF planar scanline read failed"
+                                                      : "TIFF planar scanline read failed: " + error;
+                                return false;
+                            }
+                            for (std::uint32_t x = 0; x < width; ++x) {
+                                std::memcpy(result.data.data() + (static_cast<std::size_t>(y) * width * channels +
+                                                                  static_cast<std::size_t>(x) * channels + channel) *
+                                                                     sample_size,
+                                            row.data() + static_cast<std::size_t>(x) * sample_size, sample_size);
+                            }
                         }
                     }
                 }
@@ -751,12 +828,13 @@ namespace lfs::core::image_codecs {
                                                                           : SampleType::UInt8;
             const auto sample_size = static_cast<std::size_t>(bits / 8);
             const auto row_bytes = static_cast<std::size_t>(width) * channels * sample_size;
+            const bool raw_samples = tiff_photometric_is_raw(photometric);
             const bool direct = width > 0 && height > 0 && channels == target.channels && planar == PLANARCONFIG_CONTIG &&
-                                !TIFFIsTiled(tiff) && source_type == target.sample_type &&
+                                source_type == target.sample_type &&
                                 ((bits == 8 && target.sample_type == SampleType::UInt8) ||
                                  (bits == 16 && target.sample_type == SampleType::UInt16) ||
                                  (bits == 32 && target.sample_type == SampleType::Float32)) &&
-                                TIFFScanlineSize(tiff) == static_cast<tmsize_t>(row_bytes);
+                                (TIFFIsTiled(tiff) ? raw_samples : TIFFScanlineSize(tiff) == static_cast<tmsize_t>(row_bytes));
             if (!direct) {
                 TIFFClose(tiff);
                 error = "TIFF layout requires conversion";
@@ -767,12 +845,20 @@ namespace lfs::core::image_codecs {
                 return false;
             }
             result = {static_cast<int>(width), static_cast<int>(height), target.channels, target.sample_type};
-            for (std::uint32_t y = 0; y < height; ++y) {
-                auto* row = static_cast<std::uint8_t*>(target.data) + static_cast<std::size_t>(y) * row_bytes;
-                if (TIFFReadScanline(tiff, row, y, 0) < 0) {
+            if (TIFFIsTiled(tiff)) {
+                if (!read_tiff_tiles(tiff, static_cast<std::uint8_t*>(target.data), width, height, channels, sample_size,
+                                     planar, error)) {
                     TIFFClose(tiff);
-                    error = error.empty() ? "TIFF scanline read failed" : "TIFF scanline read failed: " + error;
                     return false;
+                }
+            } else {
+                for (std::uint32_t y = 0; y < height; ++y) {
+                    auto* row = static_cast<std::uint8_t*>(target.data) + static_cast<std::size_t>(y) * row_bytes;
+                    if (TIFFReadScanline(tiff, row, y, 0) < 0) {
+                        TIFFClose(tiff);
+                        error = error.empty() ? "TIFF scanline read failed" : "TIFF scanline read failed: " + error;
+                        return false;
+                    }
                 }
             }
             if (photometric == PHOTOMETRIC_MINISWHITE && channels == 1 && sample_format == SAMPLEFORMAT_UINT)

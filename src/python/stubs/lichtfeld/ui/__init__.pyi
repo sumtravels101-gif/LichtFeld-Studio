@@ -229,6 +229,12 @@ def remember_camera_view_snap() -> bool:
 def set_remember_camera_view_snap(enabled: bool) -> None:
     """Enable or disable camera view snap persistence"""
 
+def take_splat_export_request() -> list[str]: ...
+
+def get_splat_drag_preferences() -> dict: ...
+
+def set_splat_drag_preferences(arg: dict, /) -> None: ...
+
 def scene_graph_selection_markers() -> bool:
     """Return whether Scene Graph selection markers are visible"""
 
@@ -236,10 +242,10 @@ def set_scene_graph_selection_markers(enabled: bool) -> None:
     """Show or hide Scene Graph selection markers"""
 
 def get_progress_bar_style() -> str:
-    """Return the status bar progress style (classic or miner)"""
+    """Return the status bar progress style (classic, miner, or tessle)"""
 
 def set_progress_bar_style(style: str) -> None:
-    """Set the status bar progress style (classic or miner)"""
+    """Set the status bar progress style (classic, miner, or tessle)"""
 
 def get_viewport_chrome_style() -> str:
     """Return the viewport controls style (solid, translucent, or frosted)"""
@@ -331,6 +337,11 @@ class Panel:
 
     def on_unmount(self, doc): ...
 
+    def on_visibility_changed(self, visible):
+        """
+        Release transient resources on hide, even when the document stays mounted.
+        """
+
     def on_update(self, doc): ...
 
     def on_scene_changed(self, doc): ...
@@ -399,6 +410,16 @@ def get_panel_names(space: PanelSpace = PanelSpace.FLOATING) -> list[str]:
 
 def set_panel_enabled(panel_id: str, enabled: bool) -> None:
     """Enable or disable a panel by id"""
+
+def save_startup_sidebar() -> bool:
+    """
+    Save the right sidebar as a startup default; saved .licht workspaces take precedence.
+    """
+
+def clear_startup_sidebar() -> None:
+    """
+    Clear startup sidebar defaults without changing the current project workspace.
+    """
 
 def reset_layout() -> str:
     """
@@ -1945,6 +1966,11 @@ def open_mesh_file_dialog(start_dir: str = '') -> str:
     Open a file dialog to select a mesh file. Returns empty string if cancelled.
     """
 
+def open_init_file_dialog(start_dir: str = '') -> str:
+    """
+    Open a file dialog to select a training initialization file: a splat, point cloud or mesh. Returns empty string if cancelled.
+    """
+
 def open_checkpoint_file_dialog() -> str:
     """
     Open a file dialog to select a checkpoint file. Returns empty string if cancelled.
@@ -1989,9 +2015,10 @@ def save_text_file_dialog(default_name: str = 'lichtfeld_logs') -> str:
     """Choose a text log export path. Returns empty string if cancelled."""
 
 def save_json_file_dialog(default_name: str = 'config.json') -> str:
-    """
-    Open a save file dialog for JSON files. Returns empty string if cancelled.
-    """
+    """Choose a JSON path. Returns empty string if cancelled."""
+
+def save_json_file_dialog_with_confirmation(default_name: str = 'config.json') -> tuple[str, bool]:
+    """Return (JSON path, overwrite_confirmed); empty path on cancellation."""
 
 def save_png_file_dialog(default_name: str = 'export.png') -> str:
     """
@@ -2127,6 +2154,34 @@ def is_ctrl_down() -> bool:
 
 def is_shift_down() -> bool:
     """Check if Shift is currently held"""
+
+def is_mouse_button_down(button: int = 0) -> bool:
+    """Check if a mouse button is held: 0 left, 1 right, 2 middle"""
+
+def begin_value_drag() -> bool:
+    """
+    Hide and lock the pointer for a value drag from a UI event handler. Motion keeps accumulating past the window edge; returns False when the pointer cannot be locked.
+    """
+
+def take_value_drag_delta() -> float:
+    """
+    Horizontal pointer motion in window points since the previous call during a value drag.
+    """
+
+def value_drag_state() -> str:
+    """
+    'active' while the value drag holds the pointer, 'cancelled' after Escape, the right button or focus loss ended it, otherwise 'idle'.
+    """
+
+def request_viewport_overlay_sync() -> None:
+    """
+    Run the viewport overlay's document sync on the next frame. It does not wake the frame loop; pair it with request_redraw when no input will arrive.
+    """
+
+def end_value_drag() -> None:
+    """
+    Release the value drag pointer lock and return the pointer to where the drag started.
+    """
 
 @overload
 def tr(key: str) -> str:
@@ -2285,7 +2340,7 @@ def apply_cropbox() -> None:
     """Apply the selected cropbox"""
 
 def set_crop_tool_shape(shape: str) -> None:
-    """Set the active crop tool shape: box or ellipsoid"""
+    """Set the active crop tool shape: box, ellipsoid, or polygon"""
 
 def get_crop_tool_shape() -> str:
     """Get the active crop tool shape"""
@@ -2301,6 +2356,11 @@ def get_crop_tool_operation() -> str:
 def apply_crop_tool() -> None:
     """
     Apply the active crop tool primitive through the node-backed crop command path
+    """
+
+def start_crop_polygon() -> None:
+    """
+    Edit the selected splat's or point cloud's crop polygon, or start drawing one on a camera-facing plane
     """
 
 def can_apply_align() -> bool:
@@ -2330,6 +2390,21 @@ def get_align_edge_to_axis() -> bool:
 def set_align_edge_to_axis(enabled: bool) -> None:
     """Enable or disable align edge-to-+X in-plane yaw (session lifetime)"""
 
+def can_apply_scale_distance() -> bool:
+    """True when 2 valid points are picked for scale distance"""
+
+def get_scale_distance_measured() -> float:
+    """Get measured distance between 2 picked points"""
+
+def apply_scale_distance(target_distance: float) -> bool:
+    """Request scale distance modal to rescale scene"""
+
+def clear_scale_distance() -> None:
+    """Request scale distance modal to clear picked points"""
+
+def get_scale_distance_points() -> list[list[float]]:
+    """Get picked points for scale distance tool"""
+
 def fit_crop_tool(use_percentile: bool = False) -> None:
     """
     Fit the active crop tool primitive through the node-backed crop command path
@@ -2342,6 +2417,16 @@ def reset_crop_tool() -> None:
 
 def delete_crop_tool_volume() -> None:
     """Delete the active crop tool primitive and leave the crop tool"""
+
+def toggle_crop_tool_inverse() -> None:
+    """
+    Invert the selected crop polygon, crop box or ellipsoid, as the pie menu's Invert does
+    """
+
+def get_crop_tool_inverse() -> bool | None:
+    """
+    Whether the crop volume Invert acts on is inverted, or None without one
+    """
 
 def fit_cropbox_to_scene(use_percentile: bool = False) -> None:
     """Fit cropbox to scene bounds"""
@@ -2368,7 +2453,7 @@ def duplicate_node(name: str) -> None:
     """Duplicate a node and its children"""
 
 def merge_group(name: str) -> None:
-    """Merge group children into a single PLY"""
+    """Merge group children into a single model"""
 
 def save_node_to_disk(node_name: str) -> None:
     """
@@ -2518,10 +2603,49 @@ class SequencerUIState:
     def sequence_fps(self, arg: float, /) -> None: ...
 
     @property
+    def camera_width(self) -> int:
+        """Sequence camera aspect width (1-8192)"""
+
+    @camera_width.setter
+    def camera_width(self, arg: int, /) -> None: ...
+
+    @property
+    def camera_height(self) -> int:
+        """Sequence camera aspect height (1-8192)"""
+
+    @camera_height.setter
+    def camera_height(self, arg: int, /) -> None: ...
+
+    @property
+    def framerate(self) -> int:
+        """Video export FPS numerator"""
+
+    @property
+    def framerate_denominator(self) -> int:
+        """Video export FPS denominator"""
+
+    @property
+    def export_fit(self) -> int:
+        """Video fitting: 0 fit, 1 crop, 2 stretch"""
+
+    @property
     def selected_keyframe(self) -> int: ...
 
 def get_sequencer_state() -> SequencerUIState:
     """Get sequencer UI state for modification"""
+
+def get_reveal_clip() -> object:
+    """
+    Read the live sequencer reveal clip, including shader_id for Custom, or None if absent
+    """
+
+def set_reveal_clip(value: dict) -> bool:
+    """
+    Set the live sequencer reveal clip; Custom (effect 12) requires shader_id; returns false for invalid input
+    """
+
+def remove_reveal_clip() -> bool:
+    """Remove the live sequencer reveal clip"""
 
 def has_keyframes() -> bool:
     """Check if sequencer has any keyframes"""
@@ -2546,9 +2670,9 @@ def clear_keyframes() -> None:
 def set_playback_speed(speed: float) -> None:
     """Set sequencer playback speed"""
 
-def export_video(width: int, height: int, framerate: int, crf: int, path: str = '', include_provenance: bool = True) -> None:
+def export_video(width: int, height: int, framerate: int, crf: int, path: str = '', include_provenance: bool = True, framerate_denominator: int = 1, camera_width: int = 0, camera_height: int = 0, framing: str = 'fit') -> None:
     """
-    Export video with specified settings. Without a path a save dialog opens, which a script cannot answer; pass one to export directly. include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded.
+    Export video with specified settings. Without a path a save dialog opens, which a script cannot answer; pass one to export directly. include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded. FPS is framerate/framerate_denominator. Camera aspect defaults to the output size (0, 0); framing is 'fit', 'crop' (alias 'fill'), or 'stretch'.
     """
 
 def add_keyframe() -> None:
@@ -2568,7 +2692,7 @@ def select_keyframe(index: int) -> None:
 
 def delete_keyframe(index: int) -> None:
     """
-    Delete keyframe by index; raises ValueError for the protected first keyframe
+    Delete a real keyframe by index, including the first; synthetic loop points cannot be deleted
     """
 
 def set_keyframe_easing(index: int, easing: int) -> None:
@@ -2720,6 +2844,14 @@ def supports_system_theme() -> bool:
 def themes() -> list:
     """Get available theme presets with stable ids and UI metadata"""
 
+def get_native_floating_windows() -> bool:
+    """
+    Whether floating panels use native windows on the next application start.
+    """
+
+def set_native_floating_windows(enabled: bool) -> None:
+    """Save the experimental window mode. Requires an application restart."""
+
 def set_ui_scale(scale: float) -> None:
     """Set UI scale (0.0 = auto from OS, or 1.0-4.0)"""
 
@@ -2738,8 +2870,74 @@ def get_zoom_speed_preference() -> float:
 def set_navigation_speed_preference(speed: float, persist: bool = True) -> None:
     """Set the default WASD navigation speed (1-100)"""
 
+def get_camera_browse_repeat() -> bool:
+    """Get whether held camera shortcuts repeat through dataset images"""
+
+def set_camera_browse_repeat(enabled: bool) -> None:
+    """Enable held camera shortcuts through dataset images"""
+
+def get_camera_browse_repeat_rate() -> float:
+    """Get camera image repeat rate in images per second"""
+
+def set_camera_browse_repeat_rate(rate: float, persist: bool = True) -> None:
+    """Set camera image repeat rate (1-20 images per second)"""
+
 def get_navigation_speed_preference() -> float:
     """Get the default WASD navigation speed"""
+
+def get_gamepad_test_state() -> dict:
+    """
+    Read connected controllers and the selected diagnostic sample; never consumes input or moves the camera.
+    """
+
+def take_gamepad_test_state() -> dict:
+    """
+    Read and consume diagnostic presses, independently of navigation commands.
+    """
+
+def set_gamepad_test_active(active: bool) -> None:
+    """
+    Acquire controller discovery while the gamepad preferences page is visible; release it on exit.
+    """
+
+def set_gamepad_test_device(device_id: int) -> bool:
+    """Select a connected controller for input testing, or zero for none."""
+
+def get_gamepad_navigation_state() -> dict:
+    """
+    Read saved gamepad preferences, current connection and navigation routing status.
+    """
+
+def set_gamepad_navigation(enabled: bool, device_id: int, dead_zone: float = 0.15000000596046448, look_speed: float = 1.5, move_speed: float = 1.0) -> bool:
+    """
+    Persist navigation enablement, tuning and assignments; connection IDs and viewport arming remain session-local.
+    """
+
+def get_gamepad_profiles_json() -> str:
+    """
+    Get the named controller layouts and optional model associations; independent of keymaps.
+    """
+
+def set_gamepad_profiles_json(serialized: str, expected: str = '') -> bool:
+    """
+    Validate and atomically apply named profiles, preserving global enablement and connected-device selection.
+    """
+
+def reset_gamepad_profiles() -> bool:
+    """
+    Reset all controller profiles and model associations and disable navigation. Does not affect keyboard profiles.
+    """
+
+def get_gamepad_profile_json() -> str: ...
+
+def get_gamepad_default_profile_json() -> str: ...
+
+def set_gamepad_bindings_json(serialized: str, expected_revision: int) -> bool:
+    """Atomically edit bindings without replacing enablement or tuning."""
+
+def set_gamepad_profile_json(serialized: str) -> bool: ...
+
+def get_gamepad_binding_catalog_json() -> str: ...
 
 def get_rendering_defaults_json() -> str:
     """
@@ -2760,6 +2958,18 @@ def apply_rendering_defaults() -> None:
     """
     Explicitly apply user defaults to the current project; other rendering fields are preserved.
     """
+
+def get_marketplace_preferences() -> dict:
+    """Get Marketplace preferences from the canonical user preferences store"""
+
+def set_marketplace_view(view: str) -> None:
+    """Set the Marketplace layout (card or list)"""
+
+def set_marketplace_git_checkout(enabled: bool) -> None:
+    """Set whether Marketplace installs use Git checkouts"""
+
+def reset_marketplace_preferences() -> None:
+    """Reset Marketplace layout and installation preferences"""
 
 def get_project_manager_preferences() -> dict:
     """
@@ -2804,6 +3014,17 @@ def get_mcp_access_token() -> str:
 
 def set_mcp_preferences(enabled: bool, expose_network: bool, port: int, request_logging: bool = False) -> bool:
     """Persist and immediately apply MCP HTTP server preferences"""
+
+def get_vr_state() -> dict:
+    """
+    Get whether VR can be entered, whether it is active, and the runtime status
+    """
+
+def get_vr_preferences() -> dict:
+    """Get the VR preferences"""
+
+def set_vr_preferences(enabled: bool, resolution_scale: float, scene_units_per_meter: float, move_speed: float, persist: bool = True) -> None:
+    """Set the VR preferences; VR support takes effect after restart"""
 
 def get_mcp_port_override() -> int | None:
     """Get the MCP port set on the command line for this session, or None"""

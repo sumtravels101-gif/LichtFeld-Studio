@@ -6,8 +6,12 @@
 
 #include "coordinate_conventions.hpp"
 #include "render_constants.hpp"
+#include <algorithm>
+#include <cmath>
 #include <glm/glm.hpp>
+#include <limits>
 #include <optional>
+#include <vector>
 
 namespace lfs::rendering {
 
@@ -77,15 +81,62 @@ namespace lfs::rendering {
         [[nodiscard]] glm::mat4 getProjectionMatrix(
             const float near_plane_override = DEFAULT_NEAR_PLANE,
             const float far_plane_override = DEFAULT_FAR_PLANE) const {
-            return createProjectionMatrix(
+            glm::mat4 projection = createProjectionMatrix(
                 cameraSize(),
                 focalLengthToVFov(focal_length_mm),
                 orthographic,
                 ortho_scale,
                 near_plane_override,
                 far_plane_override);
+            if (!orthographic && intrinsics_override) {
+                const auto camera_size = cameraSize();
+                const auto intrinsics = getCameraIntrinsics();
+                const float width = static_cast<float>(camera_size.x);
+                const float height = static_cast<float>(camera_size.y);
+                // Top-left pixel intrinsics to RH (-Z forward) clip space.
+                // Retain the existing near/far and GLM depth convention.
+                projection[0][0] = 2.0f * intrinsics.focal_x / width;
+                projection[1][1] = 2.0f * intrinsics.focal_y / height;
+                projection[2][0] = 1.0f - 2.0f * intrinsics.center_x / width;
+                projection[2][1] = 2.0f * intrinsics.center_y / height - 1.0f;
+            }
+            return projection;
         }
     };
+
+    // An orthographic image does not change when the eye slides along the view axis, but the rasterizer culls
+    // everything behind the eye. Returns how far to move the eye back so the node-local bounds, placed by every
+    // model transform (identity when there are none), lie in front of it.
+    [[nodiscard]] inline float orthographicEyeSetback(const FrameView& frame_view,
+                                                      const glm::vec3& local_min,
+                                                      const glm::vec3& local_max,
+                                                      const std::vector<glm::mat4>* model_transforms) {
+        const glm::vec3 forward = dataCameraToWorldFromVisualizerRotation(frame_view.rotation)[2];
+        float nearest = std::numeric_limits<float>::max();
+        float extent = 0.0f;
+        const auto visit = [&](const glm::mat4& transform) {
+            glm::vec3 world_min(std::numeric_limits<float>::max());
+            glm::vec3 world_max(std::numeric_limits<float>::lowest());
+            for (int corner = 0; corner < 8; ++corner) {
+                const glm::vec3 local{(corner & 1) ? local_max.x : local_min.x,
+                                      (corner & 2) ? local_max.y : local_min.y,
+                                      (corner & 4) ? local_max.z : local_min.z};
+                const glm::vec3 world = glm::vec3(transform * glm::vec4(local, 1.0f));
+                nearest = std::min(nearest, glm::dot(world - frame_view.translation, forward));
+                world_min = glm::min(world_min, world);
+                world_max = glm::max(world_max, world);
+            }
+            extent = std::max(extent, glm::length(world_max - world_min));
+        };
+        if (model_transforms && !model_transforms->empty()) {
+            for (const auto& transform : *model_transforms)
+                visit(transform);
+        } else {
+            visit(glm::mat4(1.0f));
+        }
+        const float margin = DEFAULT_NEAR_PLANE + 0.01f * extent;
+        return std::isfinite(nearest) && std::isfinite(extent) ? std::max(0.0f, margin - nearest) : 0.0f;
+    }
 
     struct TextureHandle {
         unsigned int id = 0;

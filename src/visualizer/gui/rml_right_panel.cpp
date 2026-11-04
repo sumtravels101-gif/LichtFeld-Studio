@@ -6,16 +6,20 @@
 #include "core/logger.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/panel_layout.hpp"
+#include "gui/panel_registry.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
 #include "gui/rmlui/rml_input_utils.hpp"
 #include "gui/rmlui/rml_theme.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
+#include "input/input_controller.hpp"
+#include "input/sdl_key_mapping.hpp"
 #include "internal/resource_paths.hpp"
 #include "theme/theme.hpp"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
+#include <RmlUi/Core/ElementUtilities.h>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -23,6 +27,15 @@
 #include <limits>
 
 namespace lfs::vis::gui {
+
+    namespace {
+        bool setPixelProperty(Rml::Element* element, Rml::PropertyId id, float value) {
+            const auto* current = element->GetLocalProperty(id);
+            if (current && current->unit == Rml::Unit::PX && std::abs(current->Get<float>() - value) < 0.001f)
+                return false;
+            return element->SetProperty(id, Rml::Property(value, Rml::Unit::PX));
+        }
+    } // namespace
 
     void RmlRightPanel::init(RmlUIManager* mgr) {
         assert(mgr);
@@ -34,51 +47,7 @@ namespace lfs::vis::gui {
             return;
         }
 
-        auto ctor = rml_context_->CreateDataModel("right_panel_tabs");
-        assert(ctor);
-
-        if (auto h = ctor.RegisterStruct<TabSnapshot>()) {
-            h.RegisterMember("id", &TabSnapshot::id);
-            h.RegisterMember("label", &TabSnapshot::label);
-            h.RegisterMember("dom_id", &TabSnapshot::dom_id);
-            h.RegisterMember("closeable", &TabSnapshot::closeable);
-        }
-        ctor.RegisterArray<std::vector<TabSnapshot>>();
-        ctor.Bind("tabs", &tabs_);
-        ctor.Bind("active_tab", &active_tab_);
-        ctor.Bind("tabs_overflow", &tabs_overflow_);
-        ctor.Bind("can_scroll_tabs_left", &can_scroll_tabs_left_);
-        ctor.Bind("can_scroll_tabs_right", &can_scroll_tabs_right_);
-
-        ctor.BindEventCallback("tab_click",
-                               [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) {
-                                   if (!args.empty()) {
-                                       auto id = args[0].Get<Rml::String>();
-                                       if (!id.empty() && on_tab_changed)
-                                           on_tab_changed(std::string(id));
-                                   }
-                               });
-        ctor.BindEventCallback("tab_close",
-                               [this](Rml::DataModelHandle, Rml::Event& event, const Rml::VariantList& args) {
-                                   event.StopPropagation();
-                                   if (!args.empty()) {
-                                       auto id = args[0].Get<Rml::String>();
-                                       if (!id.empty() && on_tab_closed)
-                                           on_tab_closed(std::string(id));
-                                   }
-                               });
-        ctor.BindEventCallback("scroll_tabs_left",
-                               [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-                                   if (can_scroll_tabs_left_)
-                                       scrollTabs(-1.0f);
-                               });
-        ctor.BindEventCallback("scroll_tabs_right",
-                               [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
-                                   if (can_scroll_tabs_right_)
-                                       scrollTabs(1.0f);
-                               });
-
-        tab_model_ = ctor.GetModelHandle();
+        bindTabModel();
 
         try {
             const auto rml_path = lfs::vis::getAssetPath("rmlui/right_panel.rml");
@@ -94,18 +63,78 @@ namespace lfs::vis::gui {
         }
 
         resize_handle_el_ = document_->GetElementById("resize-handle");
-        left_border_el_ = document_->GetElementById("left-border");
         splitter_el_ = document_->GetElementById("splitter");
         tab_bar_el_ = document_->GetElementById("tab-bar");
         tab_strip_viewport_el_ = document_->GetElementById("tab-strip-viewport");
-        tab_separator_el_ = document_->GetElementById("tab-separator");
 
         updateTheme();
+    }
+
+    void RmlRightPanel::bindTabModel() {
+        auto ctor = rml_context_->CreateDataModel("right_panel_tabs");
+        assert(ctor);
+
+        if (auto h = ctor.RegisterStruct<TabSnapshot>()) {
+            h.RegisterMember("id", &TabSnapshot::id);
+            h.RegisterMember("label", &TabSnapshot::label);
+            h.RegisterMember("dom_id", &TabSnapshot::dom_id);
+            h.RegisterMember("closeable", &TabSnapshot::closeable);
+        }
+        ctor.RegisterArray<std::vector<TabSnapshot>>();
+        ctor.Bind("tabs", &tabs_);
+        ctor.Bind("active_tab", &active_tab_);
+        ctor.Bind("tabs_overflow", &tabs_overflow_);
+        ctor.Bind("can_scroll_tabs_up", &can_scroll_tabs_up_);
+        ctor.Bind("can_scroll_tabs_down", &can_scroll_tabs_down_);
+        ctor.BindEventCallback("scroll_tabs_up",
+                               [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+                                   scrollTabs(-tab_strip_viewport_el_->GetClientHeight() * 0.75f);
+                               });
+        ctor.BindEventCallback("scroll_tabs_down",
+                               [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+                                   scrollTabs(tab_strip_viewport_el_->GetClientHeight() * 0.75f);
+                               });
+        ctor.BindEventCallback("tab_close",
+                               [this](Rml::DataModelHandle, Rml::Event& event, const Rml::VariantList& args) {
+                                   event.StopPropagation();
+                                   if (!args.empty() && on_tab_closed) {
+                                       const auto id = args[0].Get<Rml::String>();
+                                       if (!id.empty())
+                                           on_tab_closed(id);
+                                   }
+                               });
+        ctor.BindEventCallback("tab_click",
+                               [this](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) {
+                                   if (!args.empty()) {
+                                       auto id = args[0].Get<Rml::String>();
+                                       if (!id.empty() && on_tab_changed)
+                                           selectTab(std::string(id));
+                                   }
+                               });
+        ctor.BindEventCallback("tab_keydown",
+                               [this](Rml::DataModelHandle, Rml::Event& event, const Rml::VariantList& args) {
+                                   const auto key = static_cast<Rml::Input::KeyIdentifier>(event.GetParameter("key_identifier", 0));
+                                   if ((key == Rml::Input::KI_RETURN || key == Rml::Input::KI_SPACE) &&
+                                       event.GetTargetElement()->IsClassSet("tab") && !args.empty()) {
+                                       event.StopPropagation();
+                                       const auto id = args[0].Get<Rml::String>();
+                                       if (!id.empty() && on_tab_changed)
+                                           selectTab(id);
+                                   }
+                               });
+        tab_model_ = ctor.GetModelHandle();
     }
 
     void RmlRightPanel::shutdown() {
         tab_model_ = {};
         tabs_.clear();
+        tab_text_metrics_.clear();
+        tab_scroll_pending_ = false;
+        tab_layout_dirty_ = true;
+        tab_navigation_dirty_ = true;
+        tabs_overflow_ = false;
+        can_scroll_tabs_up_ = false;
+        can_scroll_tabs_down_ = false;
         active_tab_.clear();
         if (rml_manager_)
             rml_manager_->releaseCachedVulkanContext(direct_cache_);
@@ -114,15 +143,13 @@ namespace lfs::vis::gui {
         rml_context_ = nullptr;
         document_ = nullptr;
         resize_handle_el_ = nullptr;
-        left_border_el_ = nullptr;
         splitter_el_ = nullptr;
         tab_bar_el_ = nullptr;
+        tooltip_.setHover({}, nullptr);
         tab_strip_viewport_el_ = nullptr;
-        tab_separator_el_ = nullptr;
-        tab_scroll_left_ = 0.0f;
-        tabs_overflow_ = false;
-        can_scroll_tabs_left_ = false;
-        can_scroll_tabs_right_ = false;
+        tab_scroll_top_ = 0.0f;
+        reveal_active_tab_ = true;
+        tab_scroll_dragging_ = false;
         last_blurred_focus_ = nullptr;
         last_hover_element_ = nullptr;
     }
@@ -141,12 +168,15 @@ namespace lfs::vis::gui {
 
         document_ = nullptr;
         resize_handle_el_ = nullptr;
-        left_border_el_ = nullptr;
         splitter_el_ = nullptr;
         tab_bar_el_ = nullptr;
+        tooltip_.setHover({}, nullptr);
         tab_strip_viewport_el_ = nullptr;
-        tab_separator_el_ = nullptr;
         base_rcss_.clear();
+        tab_text_metrics_.assign(tabs_.size(), {});
+        tab_scroll_pending_ = false;
+        tab_layout_dirty_ = true;
+        tab_navigation_dirty_ = true;
         has_theme_signature_ = false;
         wants_input_ = false;
         wants_keyboard_ = false;
@@ -178,17 +208,14 @@ namespace lfs::vis::gui {
         }
 
         resize_handle_el_ = document_->GetElementById("resize-handle");
-        left_border_el_ = document_->GetElementById("left-border");
         splitter_el_ = document_->GetElementById("splitter");
         tab_bar_el_ = document_->GetElementById("tab-bar");
         tab_strip_viewport_el_ = document_->GetElementById("tab-strip-viewport");
-        tab_separator_el_ = document_->GetElementById("tab-separator");
 
         tab_model_.DirtyVariable("tabs");
         tab_model_.DirtyVariable("active_tab");
-        tab_model_.DirtyVariable("tabs_overflow");
-        tab_model_.DirtyVariable("can_scroll_tabs_left");
-        tab_model_.DirtyVariable("can_scroll_tabs_right");
+        reveal_active_tab_ = true;
+        tab_scroll_dragging_ = false;
         updateTheme();
     }
 
@@ -203,12 +230,10 @@ namespace lfs::vis::gui {
         has_theme_signature_ = true;
 
         if (base_rcss_.empty())
-            base_rcss_ = rml_theme::loadBaseRCSS("rmlui/panel_tabs.rcss") + "\n" +
-                         rml_theme::loadBaseRCSS("rmlui/right_panel.rcss");
+            base_rcss_ = rml_theme::loadBaseRCSS("rmlui/right_panel.rcss");
 
         rml_theme::applyTheme(document_, base_rcss_,
-                              rml_theme::loadBaseRCSS("rmlui/panel_tabs.theme.rcss") + "\n" +
-                                  rml_theme::loadBaseRCSS("rmlui/right_panel.theme.rcss"));
+                              rml_theme::loadBaseRCSS("rmlui/right_panel.theme.rcss"));
         return true;
     }
 
@@ -218,12 +243,18 @@ namespace lfs::vis::gui {
 
         if (tabs_ != tabs) {
             tabs_ = tabs;
+            tab_text_metrics_.assign(tabs_.size(), {});
+            tab_layout_dirty_ = true;
+            tab_navigation_dirty_ = true;
+            reveal_active_tab_ = true;
             tab_model_.DirtyVariable("tabs");
             dirty = true;
         }
 
         if (active_tab_ != active_tab) {
             active_tab_ = active_tab;
+            tab_layout_dirty_ = true;
+            reveal_active_tab_ = true;
             tab_model_.DirtyVariable("active_tab");
             dirty = true;
         }
@@ -231,106 +262,180 @@ namespace lfs::vis::gui {
         return dirty;
     }
 
-    void RmlRightPanel::scrollTabs(float delta) {
-        if (!tab_strip_viewport_el_ || !document_ || tabs_.empty() || delta == 0.0f)
-            return;
-
-        const float max_scroll = std::max(
-            0.0f, tab_strip_viewport_el_->GetScrollWidth() - tab_strip_viewport_el_->GetClientWidth());
-        const float current_scroll = std::clamp(tab_scroll_left_, 0.0f, max_scroll);
-        const float viewport_left =
-            tab_strip_viewport_el_->GetAbsoluteOffset(Rml::BoxArea::Border).x;
-        const float epsilon = 0.5f;
-        float next_scroll = current_scroll;
-
-        if (delta > 0.0f) {
-            next_scroll = max_scroll;
-            for (const auto& tab : tabs_) {
-                if (tab.dom_id.empty())
-                    continue;
-                auto* button = document_->GetElementById(tab.dom_id);
-                if (!button)
-                    continue;
-
-                const float tab_left =
-                    current_scroll +
-                    (button->GetAbsoluteOffset(Rml::BoxArea::Border).x - viewport_left);
-                if (tab_left > current_scroll + epsilon) {
-                    next_scroll = tab_left;
-                    break;
-                }
-            }
-        } else {
-            next_scroll = 0.0f;
-            for (auto it = tabs_.rbegin(); it != tabs_.rend(); ++it) {
-                if (it->dom_id.empty())
-                    continue;
-                auto* button = document_->GetElementById(it->dom_id);
-                if (!button)
-                    continue;
-
-                const float tab_left =
-                    current_scroll +
-                    (button->GetAbsoluteOffset(Rml::BoxArea::Border).x - viewport_left);
-                if (tab_left < current_scroll - epsilon) {
-                    next_scroll = tab_left;
-                    break;
-                }
-            }
+    void RmlRightPanel::updateTabs() {
+        rml_context_->Update();
+        if (tab_strip_viewport_el_ && !tab_scroll_pending_ &&
+            tab_strip_viewport_el_->GetScrollTop() != tab_scroll_top_) {
+            tab_scroll_top_ = tab_strip_viewport_el_->GetScrollTop();
+            tab_layout_dirty_ = true;
         }
-
-        next_scroll = std::clamp(next_scroll, 0.0f, max_scroll);
-        if (next_scroll == tab_scroll_left_)
+        if (tab_navigation_dirty_) {
+            syncTabNavigation();
+            tab_navigation_dirty_ = false;
+        }
+        if (!tab_layout_dirty_)
             return;
 
-        tab_scroll_left_ = next_scroll;
+        // Overflow controls change the viewport size; font and scroll changes
+        // can then move labels. Hover redraws need only the context update above.
+        for (int pass = 0; pass < 4; ++pass) {
+            const bool layout_changed = layoutTabs();
+            if (layout_changed)
+                rml_context_->Update();
+            const bool scroll_changed = syncTabScrollState();
+            if (scroll_changed)
+                rml_context_->Update();
+            if (!layout_changed && !scroll_changed)
+                break;
+        }
+        tab_layout_dirty_ = false;
+        tab_scroll_pending_ = false;
+    }
+
+    bool RmlRightPanel::layoutTabs() {
+        bool changed = false;
+        const float dp = rml_context_->GetDensityIndependentPixelRatio();
+        constexpr float text_clearance_dp = 2.0f;
+        const float line_height = std::ceil(20.0f * dp);
+        for (std::size_t i = 0; i < tabs_.size(); ++i) {
+            const auto& tab = tabs_[i];
+            auto* button = document_->GetElementById(tab.dom_id);
+            if (!button)
+                continue;
+            auto* label = button->GetChild(0);
+            if (!label)
+                continue;
+            // Rotation changes drawing and hit testing, but not layout. Reserve
+            // the measured text length on the vertical axis, including plugin labels.
+            auto& metrics = tab_text_metrics_[i];
+            const auto font = label->GetFontFaceHandle();
+            if (metrics.font != font || metrics.dp != dp) {
+                metrics = {font, dp, std::ceil(Rml::ElementUtilities::GetStringWidth(label, tab.label) + text_clearance_dp * dp)};
+            }
+            const float text_width = metrics.width;
+            const float close_height = tab.closeable ? 18.0f * dp : 0.0f;
+            const float height = std::ceil(std::max(28.0f * dp, text_width + 18.0f * dp + close_height));
+            changed |= setPixelProperty(button, Rml::PropertyId::Height, height);
+            // A rotated line box must fit across the tab. Snap its origin and
+            // dimensions in physical pixels so fractional scales do not clip or
+            // blur glyph edges. Keep clearance for the font's ink overhang.
+            const auto origin = button->GetAbsoluteOffset(Rml::BoxArea::Padding);
+            const float content_width = button->GetBox().GetSize(Rml::BoxArea::Padding).x;
+            const float content_height = button->GetBox().GetSize(Rml::BoxArea::Padding).y;
+            const float left = std::round(origin.x + (content_width - line_height) * 0.5f) - origin.x;
+            // Center the rotated text along the tab. Exclude its trailing ink
+            // clearance from the text center.
+            const float top = std::round(origin.y + (content_height - close_height + text_width - text_clearance_dp * dp) * 0.5f) - origin.y;
+            changed |= setPixelProperty(label, Rml::PropertyId::Width, text_width);
+            changed |= setPixelProperty(label, Rml::PropertyId::Height, line_height);
+            changed |= setPixelProperty(label, Rml::PropertyId::LineHeight, line_height);
+            changed |= setPixelProperty(label, Rml::PropertyId::Left, left);
+            changed |= setPixelProperty(label, Rml::PropertyId::Top, top);
+        }
+        return changed;
+    }
+
+    void RmlRightPanel::scrollTabs(float delta) {
+        if (!tab_strip_viewport_el_ || delta == 0.0f)
+            return;
+        if (!tab_scroll_pending_)
+            tab_scroll_top_ = tab_strip_viewport_el_->GetScrollTop();
+        const float max_scroll = std::max(0.0f, tab_strip_viewport_el_->GetScrollHeight() -
+                                                    tab_strip_viewport_el_->GetClientHeight());
+        setTabStripScroll(std::clamp(tab_scroll_top_ + delta, 0.0f, max_scroll));
+    }
+
+    void RmlRightPanel::cycleTab(int direction) {
+        if (tabs_.empty() || !on_tab_changed)
+            return;
+        const auto current = std::find_if(tabs_.begin(), tabs_.end(),
+                                          [this](const auto& tab) { return tab.id == active_tab_; });
+        int index = current == tabs_.end() ? 0 : static_cast<int>(current - tabs_.begin());
+        const int count = static_cast<int>(tabs_.size());
+        index += direction;
+        index = (index + count) % count;
+        selectTab(tabs_[index].id);
+    }
+
+    void RmlRightPanel::selectTab(std::string id) {
+        if (id.empty() || !on_tab_changed)
+            return;
+        syncTabData(tabs_, id);
         render_needed_ = true;
         input_dirty_ = true;
+        on_tab_changed(id);
     }
 
     bool RmlRightPanel::syncTabScrollState() {
-        if (!tab_bar_el_ || !tab_strip_viewport_el_)
+        if (!tab_strip_viewport_el_)
             return false;
-
-        bool dirty = false;
-
-        const float full_bar_width = tab_bar_el_->GetClientWidth();
-        const float content_width = tab_strip_viewport_el_->GetScrollWidth();
-        const bool tabs_overflow = content_width > full_bar_width + 0.5f;
-        if (tabs_overflow_ != tabs_overflow) {
-            tabs_overflow_ = tabs_overflow;
+        const float dp = rml_context_->GetDensityIndependentPixelRatio();
+        const float rail_height = tab_bar_el_ ? tab_bar_el_->GetClientHeight() : tab_strip_viewport_el_->GetClientHeight();
+        const bool overflow = tab_strip_viewport_el_->GetScrollHeight() > rail_height - 6.0f * dp + 0.5f;
+        if (tabs_overflow_ != overflow) {
+            tabs_overflow_ = overflow;
             tab_model_.DirtyVariable("tabs_overflow");
-            dirty = true;
+            return true;
         }
-
-        const float viewport_width = tab_strip_viewport_el_->GetClientWidth();
-        const float max_scroll = tabs_overflow_
-                                     ? std::max(0.0f, content_width - viewport_width)
+        const float viewport_height = tab_strip_viewport_el_->GetClientHeight();
+        const float max_scroll = std::max(0.0f, tab_strip_viewport_el_->GetScrollHeight() - viewport_height);
+        float next_scroll = std::clamp(tab_scroll_top_, 0.0f, max_scroll);
+        const auto active = std::find_if(tabs_.begin(), tabs_.end(),
+                                         [this](const auto& tab) { return tab.id == active_tab_; });
+        auto* button = active != tabs_.end() ? document_->GetElementById(active->dom_id) : nullptr;
+        const float active_top = button
+                                     ? button->GetAbsoluteOffset(Rml::BoxArea::Border).y -
+                                           tab_strip_viewport_el_->GetAbsoluteOffset(Rml::BoxArea::Border).y +
+                                           tab_strip_viewport_el_->GetScrollTop()
                                      : 0.0f;
-        float next_scroll = std::clamp(tab_scroll_left_, 0.0f, max_scroll);
-
-        if (next_scroll != tab_scroll_left_) {
-            tab_scroll_left_ = next_scroll;
-            dirty = true;
+        const float active_height = button ? button->GetBox().GetSize(Rml::BoxArea::Border).y : 0.0f;
+        if (reveal_active_tab_) {
+            if (button) {
+                if (active_top < next_scroll || active_height > viewport_height)
+                    next_scroll = active_top;
+                else if (active_top + active_height > next_scroll + viewport_height)
+                    next_scroll = active_top + active_height - viewport_height;
+            }
+            next_scroll = std::clamp(next_scroll, 0.0f, max_scroll);
+            reveal_active_tab_ = false;
         }
-
-        if (tab_strip_viewport_el_->GetScrollLeft() != tab_scroll_left_)
-            tab_strip_viewport_el_->SetScrollLeft(tab_scroll_left_);
-
-        const bool can_scroll_left = tabs_overflow_ && tab_scroll_left_ > 0.5f;
-        const bool can_scroll_right = tabs_overflow_ && tab_scroll_left_ < max_scroll - 0.5f;
-        if (can_scroll_tabs_left_ != can_scroll_left) {
-            can_scroll_tabs_left_ = can_scroll_left;
-            tab_model_.DirtyVariable("can_scroll_tabs_left");
-            dirty = true;
+        const float previous_scroll = tab_strip_viewport_el_->GetScrollTop();
+        if (previous_scroll != next_scroll)
+            tab_strip_viewport_el_->SetScrollTop(next_scroll);
+        // RmlUi rounds scroll offsets to physical pixels, including at the
+        // fractional-scale scroll limit. Keep the model and rail at that offset.
+        next_scroll = tab_strip_viewport_el_->GetScrollTop();
+        tab_scroll_top_ = next_scroll;
+        bool changed = previous_scroll != next_scroll;
+        const auto set_flag = [&](bool& flag, bool value, const char* name) {
+            if (flag != value) {
+                flag = value;
+                tab_model_.DirtyVariable(name);
+                changed = true;
+            }
+        };
+        set_flag(can_scroll_tabs_up_, next_scroll > 0.5f, "can_scroll_tabs_up");
+        set_flag(can_scroll_tabs_down_, next_scroll < max_scroll - 0.5f, "can_scroll_tabs_down");
+        const float viewport_top = tab_bar_el_
+                                       ? tab_strip_viewport_el_->GetAbsoluteOffset(Rml::BoxArea::Border).y -
+                                             tab_bar_el_->GetAbsoluteOffset(Rml::BoxArea::Border).y
+                                       : 0.0f;
+        float open_top = rail_height;
+        float open_bottom = rail_height;
+        if (button) {
+            open_top = std::clamp(viewport_top + active_top - next_scroll, 0.0f, rail_height);
+            open_bottom = std::clamp(viewport_top + active_top + active_height - next_scroll, 0.0f, rail_height);
         }
-        if (can_scroll_tabs_right_ != can_scroll_right) {
-            can_scroll_tabs_right_ = can_scroll_right;
-            tab_model_.DirtyVariable("can_scroll_tabs_right");
-            dirty = true;
+        if (auto* edge = document_->GetElementById("tab-edge-before")) {
+            changed |= setPixelProperty(edge, Rml::PropertyId::Top, viewport_top);
+            changed |= setPixelProperty(edge, Rml::PropertyId::Height, std::max(0.0f, open_top - viewport_top));
         }
-
-        return dirty;
+        if (auto* edge = document_->GetElementById("tab-edge-after")) {
+            const float edge_top = std::max(viewport_top, open_bottom);
+            changed |= setPixelProperty(edge, Rml::PropertyId::Top, edge_top);
+            changed |= setPixelProperty(edge, Rml::PropertyId::Height, std::max(0.0f, rail_height - edge_top));
+        }
+        return changed;
     }
 
     void RmlRightPanel::syncTabNavigation() {
@@ -347,10 +452,10 @@ namespace lfs::vis::gui {
             if (!button)
                 continue;
 
-            const std::string left_id = "#" + tabs_[(i + count - 1) % count].dom_id;
-            const std::string right_id = "#" + tabs_[(i + 1) % count].dom_id;
-            button->SetProperty("nav-left", left_id);
-            button->SetProperty("nav-right", right_id);
+            const std::string previous_id = "#" + tabs_[(i + count - 1) % count].dom_id;
+            const std::string next_id = "#" + tabs_[(i + 1) % count].dom_id;
+            button->SetProperty("nav-up", previous_id);
+            button->SetProperty("nav-down", next_id);
         }
     }
 
@@ -358,9 +463,11 @@ namespace lfs::vis::gui {
         if (!std::isfinite(value))
             return;
         const float next = std::max(0.0f, value);
-        if (next == tab_scroll_left_)
+        if (next == tab_scroll_top_)
             return;
-        tab_scroll_left_ = next;
+        tab_scroll_top_ = next;
+        tab_scroll_pending_ = true;
+        tab_layout_dirty_ = true;
         render_needed_ = true;
         input_dirty_ = true;
     }
@@ -394,7 +501,7 @@ namespace lfs::vis::gui {
     }
 
     bool RmlRightPanel::needsAnimationFrame() const {
-        return render_needed_ || input_dirty_ || splitter_dragging_ || resize_dragging_;
+        return render_needed_ || input_dirty_ || splitter_dragging_ || resize_dragging_ || tab_scroll_dragging_ || tooltip_.revealDue();
     }
 
     std::string RmlRightPanel::animationDemandDescription() const {
@@ -410,8 +517,59 @@ namespace lfs::vis::gui {
             next_update_delay);
     }
 
+    bool RmlRightPanel::inputOccluded(float x, float y) const {
+        return PanelRegistry::instance().isPositionOverFloatingPanel(x, y) ||
+               (rml_manager_ && rml_manager_->activeOverlayOccludesContext(rml_context_, x, y));
+    }
+
+    bool RmlRightPanel::interceptCategoryInput(const RightPanelLayout& layout, const PanelInputState& input) {
+        if (splitter_dragging_ || resize_dragging_ || tab_scroll_dragging_ ||
+            inputOccluded(input.mouse_x, input.mouse_y))
+            return false;
+        const float dp = rml_context_->GetDensityIndependentPixelRatio();
+        const float x = input.mouse_x - layout.pos.x;
+        const float y = input.mouse_y - layout.pos.y;
+        if (x < 0 || x >= layout.size.x ||
+            y < layout.scene_h + layout.splitter_h + PanelLayoutManager::RIGHT_PANEL_SECTION_GAP * dp || y >= layout.size.y)
+            return false;
+        const auto* controller = InputController::instance();
+        if (!controller || controller->getBindings().isCapturing())
+            return false;
+        const auto& bindings = controller->getBindings();
+        // A focused text field keeps keys that type into it; Ctrl or Cmd chords still switch.
+        // Ctrl+Alt stays with the field because it is AltGr on Windows.
+        const bool typing = guiFocusState().want_text_input || (rml_manager_ && rml_manager_->wantsTextInput());
+        bool handled = false;
+        for (const auto& event : input.input_events) {
+            if (event.kind != FrameInputEventKind::KeyDown ||
+                (event.dispatch && event.dispatch->consumed) || (event.modifiers & SDL_KMOD_MODE))
+                continue;
+            if (typing && (!(event.modifiers & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) || (event.modifiers & SDL_KMOD_ALT)))
+                continue;
+            bool repeats = false;
+            const auto printed = SDL_GetKeyFromScancode(event.scancode, event.modifiers & SDL_KMOD_SHIFT, false);
+            const auto unshifted = SDL_GetKeyFromScancode(event.scancode, SDL_KMOD_NONE, false);
+            const auto action = bindings.getActionForShortcut(
+                input::ToolMode::GLOBAL,
+                input::sdlScancodeToAppKey(event.scancode),
+                input::sdlShortcutKeyToAppKey(event.scancode, event.keycode),
+                input::sdlModsToAppMods(event.modifiers),
+                input::sdlPrintedKeyToAppKey(printed),
+                (event.modifiers & SDL_KMOD_SHIFT) && printed != unshifted, &repeats);
+            if (action != input::Action::NEXT_SIDEBAR_CATEGORY &&
+                action != input::Action::PREVIOUS_SIDEBAR_CATEGORY)
+                continue;
+            if (!event.repeat || repeats)
+                cycleTab(action == input::Action::NEXT_SIDEBAR_CATEGORY ? 1 : -1);
+            if (event.dispatch)
+                event.dispatch->consumed = true;
+            handled = true;
+        }
+        return handled;
+    }
+
     void RmlRightPanel::processInput(const RightPanelLayout& layout, const PanelInputState& input) {
-        if (rml_manager_ && rml_context_ && rml_manager_->routeInput(rml_context_, input, [this, layout](const PanelInputState& event) { processInput(layout, event); }))
+        if (rml_manager_ && rml_context_ && rml_manager_->routeInput(rml_context_, input, [this, layout](const PanelInputState& event) { processInput(layout, event); }, false, [this](float x, float y) { return inputOccluded(x, y); }, [this, layout](const PanelInputState& event) { return interceptCategoryInput(layout, event); }))
             return;
         const CursorRequest previous_cursor_request = cursor_request_;
         wants_input_ = false;
@@ -452,7 +610,7 @@ namespace lfs::vis::gui {
             layout.scene_h != last_scene_h_ ||
             layout.splitter_h != last_splitter_h_;
         if (!mouse_moved && !pointer_event && !pointer_down && !keyboard_event &&
-            !resize_dragging_ && !splitter_dragging_ && !viewport_focus_blurs_panel &&
+            !resize_dragging_ && !splitter_dragging_ && !tab_scroll_dragging_ && !viewport_focus_blurs_panel &&
             !layout_changed) {
             wants_keyboard_ = rml_input::hasFocusedKeyboardTarget(focused_before);
             wants_input_ = wants_keyboard_ || last_over_interactive_ ||
@@ -465,7 +623,8 @@ namespace lfs::vis::gui {
 
         const float mx = input.mouse_x - layout.pos.x;
         const float my = input.mouse_y - layout.pos.y;
-        const float dp_ratio = rml_manager_ ? rml_manager_->getDpRatio() : 1.0f;
+        const float dp_ratio = rml_manager_ ? rml_manager_->getDpRatio()
+                                            : rml_context_->GetDensityIndependentPixelRatio();
         const auto resize_zone = resizeHitZone(layout.pos.x, dp_ratio);
         const auto splitter_zone = resizeHitZone(
             layout.pos.y + layout.scene_h + layout.splitter_h * 0.5f, dp_ratio);
@@ -505,8 +664,7 @@ namespace lfs::vis::gui {
             splitter_zone.contains(input.mouse_y);
         const bool over_interactive = hover && hover->GetTagName() != "body" &&
                                       hover->GetId() != "rp-body" &&
-                                      hover->GetId() != "left-border" &&
-                                      hover->GetId() != "tab-separator";
+                                      hover->GetId() != "left-border";
 
         if (over_interactive != last_over_interactive_) {
             input_dirty_ = true;
@@ -515,6 +673,36 @@ namespace lfs::vis::gui {
             input_dirty_ = true;
         }
         last_hover_element_ = hover;
+        tooltip_.setHover(resolveRmlTooltip(hover), hover);
+
+        const bool over_tabs = tab_bar_el_ &&
+                               mx >= 8.0f && mx < 8.0f + PanelLayoutManager::RIGHT_TAB_BAR_W * dp_ratio && my >= layout.scene_h + layout.splitter_h + PanelLayoutManager::RIGHT_PANEL_SECTION_GAP * dp_ratio &&
+                               my < layout.size.y;
+        const bool cycled = interceptCategoryInput(layout, input);
+        if (cycled) {
+            wants_input_ = true;
+            input_dirty_ = true;
+        } else if (over_tabs && input.mouse_wheel != 0.0f) {
+            scrollTabs(-input.mouse_wheel * 30.0f * dp_ratio);
+            wants_input_ = true;
+        }
+        if (over_tabs && input.mouse_clicked[2]) {
+            if (tab_strip_viewport_el_ && !tab_scroll_pending_)
+                tab_scroll_top_ = tab_strip_viewport_el_->GetScrollTop();
+            tab_scroll_dragging_ = true;
+            tab_drag_start_y_ = input.mouse_y;
+            tab_drag_start_scroll_ = tab_scroll_top_;
+        }
+        if (tab_scroll_dragging_) {
+            wants_input_ = true;
+            input_dirty_ = true;
+            if (input.mouse_down[2]) {
+                setTabStripScroll(std::max(0.0f, tab_drag_start_scroll_ + tab_drag_start_y_ - input.mouse_y));
+            } else {
+                tab_scroll_dragging_ = false;
+            }
+            return;
+        }
 
         if (resize_dragging_) {
             wants_input_ = true;
@@ -582,8 +770,10 @@ namespace lfs::vis::gui {
                     input_dirty_ = true;
                     rml_context_->ProcessMouseButtonDown(0, mods);
                 }
-                if (input.mouse_released[0])
+                if (input.mouse_released[0]) {
                     rml_context_->ProcessMouseButtonUp(0, mods);
+                    tooltip_.setHover(resolveRmlTooltip(hover), hover);
+                }
             }
         } else if (input.mouse_clicked[0]) {
             blurFocus();
@@ -592,7 +782,7 @@ namespace lfs::vis::gui {
         if (input.viewport_keyboard_focus)
             blurFocus();
 
-        if (rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()) &&
+        if (!cycled && rml_input::hasFocusedKeyboardTarget(rml_context_->GetFocusElement()) &&
             !input.viewport_keyboard_focus) {
             for (const auto& event : input.input_events)
                 input_dirty_ |= rml_input::processKeyboardEvent(*rml_context_, event, rml_manager_->getTextInputHandler());
@@ -616,12 +806,6 @@ namespace lfs::vis::gui {
             return;
         if (layout.size.x <= 0 || layout.size.y <= 0)
             return;
-        if (rml_manager_) {
-            rml_manager_->trackContextFrame(rml_context_,
-                                            static_cast<int>(layout.pos.x - screen_x),
-                                            static_cast<int>(layout.pos.y - screen_y));
-        }
-
         const bool theme_changed = updateTheme();
 
         const int w = static_cast<int>(layout.size.x);
@@ -636,46 +820,43 @@ namespace lfs::vis::gui {
                                      layout.splitter_h != last_splitter_h_);
         const bool tabs_changed = syncTabData(tabs, active_tab);
 
+        const bool tooltip_changed = tooltip_.apply(document_,
+                                                    static_cast<int>(prev_mouse_x_ - layout.pos.x),
+                                                    static_cast<int>(prev_mouse_y_ - layout.pos.y), w, h);
+        rml_manager_->setContextNeedsPassiveMouseMoveFrames(rml_context_, tooltip_.hasActiveState());
+        rml_manager_->setContextTooltipRevealDeadline(rml_context_, tooltip_.revealDeadline());
         const bool needs_render = render_needed_ || theme_changed || layout_changed ||
-                                  tabs_changed || dims_changed || input_dirty_;
+                                  tabs_changed || dims_changed || input_dirty_ || tooltip_changed;
 
         if (needs_render) {
-            const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * dp_ratio;
+            const float tab_bar_w = PanelLayoutManager::RIGHT_TAB_BAR_W * dp_ratio;
+            if (dims_changed || layout_changed)
+                reveal_active_tab_ = true;
 
-            if (resize_handle_el_) {
-                resize_handle_el_->SetProperty("top", "0px");
-                resize_handle_el_->SetProperty("height", std::format("{:.0f}px", layout.size.y));
+            const bool geometry_changed = dims_changed || layout_changed || theme_changed;
+            if (theme_changed)
+                tab_text_metrics_.assign(tabs_.size(), {});
+            tab_layout_dirty_ |= geometry_changed;
+            if (geometry_changed) {
+                if (splitter_el_) {
+                    setPixelProperty(splitter_el_, Rml::PropertyId::Top, std::round(layout.scene_h));
+                    setPixelProperty(splitter_el_, Rml::PropertyId::Height, std::round(layout.splitter_h));
+                }
+                if (tab_bar_el_) {
+                    const float tab_top = layout.scene_h + layout.splitter_h +
+                                          PanelLayoutManager::RIGHT_PANEL_SECTION_GAP * dp_ratio;
+                    setPixelProperty(tab_bar_el_, Rml::PropertyId::Top, std::round(tab_top));
+                    setPixelProperty(tab_bar_el_, Rml::PropertyId::Height, std::round(std::max(0.0f, layout.size.y - tab_top - 8.0f)));
+                    setPixelProperty(tab_bar_el_, Rml::PropertyId::Width, std::round(tab_bar_w));
+                }
             }
-            if (left_border_el_) {
-                left_border_el_->SetProperty("top", "0px");
-                left_border_el_->SetProperty("height", std::format("{:.0f}px", layout.size.y));
-            }
-            if (splitter_el_) {
-                splitter_el_->SetProperty("top", std::format("{:.0f}px", layout.scene_h));
-                splitter_el_->SetProperty("height", std::format("{:.0f}px", layout.splitter_h));
-            }
-            if (tab_bar_el_) {
-                const float tab_top = layout.scene_h + layout.splitter_h;
-                tab_bar_el_->SetProperty("top", std::format("{:.0f}px", tab_top));
-                tab_bar_el_->SetProperty("height", std::format("{:.0f}px", tab_bar_h));
-            }
-            if (tab_separator_el_) {
-                const float sep_top = layout.scene_h + layout.splitter_h + tab_bar_h;
-                tab_separator_el_->SetProperty("top", std::format("{:.0f}px", sep_top));
-            }
-
-            rml_context_->SetDimensions(Rml::Vector2i(w, h));
-            for (int pass = 0; pass < 3; ++pass) {
-                rml_context_->Update();
-                syncTabNavigation();
-                if (!syncTabScrollState())
-                    break;
-            }
-            syncTabNavigation();
+            if (dims_changed)
+                rml_context_->SetDimensions(Rml::Vector2i(w, h));
+            updateTabs();
 
             // Data-model and overflow updates can move the tab strip after input was
             // processed for this frame. Re-resolve hover against the settled layout so
-            // a long or closeable tab cannot briefly hover at its previous coordinates
+            // a long tab cannot briefly hover at its previous coordinates
             // and then drop the pseudo-class on the following frame.
             if (rml_pointer_inside_) {
                 const float local_x = prev_mouse_x_ - layout.pos.x;
@@ -699,7 +880,10 @@ namespace lfs::vis::gui {
             input_dirty_ = false;
         }
 
-        if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface())
+        rml_manager_->trackContextFrame(rml_context_,
+                                        static_cast<int>(layout.pos.x - screen_x),
+                                        static_cast<int>(layout.pos.y - screen_y));
+        if (!rml_manager_->getVulkanRenderInterface())
             return;
 
         const float x = layout.pos.x - screen_x;
@@ -715,7 +899,8 @@ namespace lfs::vis::gui {
             .draw_height = static_cast<float>(h),
             .refresh = needs_render || direct_cache_.texture == 0 ||
                        direct_cache_.width != w || direct_cache_.height != h,
-            .foreground = false,
+            // Tooltips may overlap the independently rendered active panel.
+            .foreground = tooltip_.hasActiveState(),
             .clip_enabled = true,
             .clip = {
                 .x1 = x,

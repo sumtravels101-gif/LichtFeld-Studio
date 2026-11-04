@@ -80,6 +80,7 @@ namespace lfs::io::project::detail {
         [[nodiscard]] static lfs::Result<std::shared_ptr<NativeFile>>
         create_new(const std::filesystem::path& path);
 
+        [[nodiscard]] lfs::Result<bool> same_file(const NativeFile& other) const;
         [[nodiscard]] lfs::Result<std::uint64_t> size() const;
         [[nodiscard]] lfs::Result<void>
         read_exact(std::uint64_t offset, std::span<std::byte> destination) const;
@@ -166,6 +167,15 @@ namespace lfs::io::project::detail {
         std::optional<std::filesystem::path> backup_path;
     };
 
+    // Preserve existing artifact names when valid; hash only filenames whose
+    // suffix would exceed a 255-unit native filesystem component. Never truncate UTF-8.
+    [[nodiscard]] std::filesystem::path project_artifact_path(
+        const std::filesystem::path& source, std::string_view suffix);
+    [[nodiscard]] std::filesystem::path project_lock_path(const std::filesystem::path& source);
+    // Shared collision-safe rename logic; the public entry supplies the timestamp suffix.
+    [[nodiscard]] lfs::Result<std::filesystem::path> quarantine_project_artifact_with_suffix(
+        const std::filesystem::path& source, const std::string& suffix);
+
     // Stable short stem for long names; recovery uses the same key to associate
     // artifacts without treating a truncated filename as a different master.
     [[nodiscard]] std::filesystem::path temporary_project_stem(const std::filesystem::path& destination);
@@ -178,6 +188,12 @@ namespace lfs::io::project::detail {
     preflight_disk_space(const std::filesystem::path& path, std::uint64_t required_bytes);
     [[nodiscard]] lfs::Result<void>
     sync_parent_directory(const std::filesystem::path& path);
+#ifndef _WIN32
+    // A single replacing rename preserves the destination across process termination.
+    [[nodiscard]] lfs::Result<AtomicReplaceState>
+    replace_without_backup(const std::filesystem::path& replacement,
+                           const std::filesystem::path& destination);
+#endif
     [[nodiscard]] lfs::Result<AtomicReplaceState>
     atomic_replace(const std::filesystem::path& replacement,
                    const std::filesystem::path& destination);

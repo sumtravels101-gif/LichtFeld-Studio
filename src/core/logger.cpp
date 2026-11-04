@@ -4,6 +4,7 @@
 
 #include "core/logger.hpp"
 #include "core/environment.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include <algorithm>
@@ -32,6 +33,9 @@
 #endif
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/rotating_file_sink.h>
+#ifdef _WIN32
+#include "logger/native_rotating_file_sink.hpp"
+#endif
 #include <spdlog/spdlog.h>
 
 namespace lfs::core {
@@ -63,11 +67,11 @@ namespace lfs::core {
         if (const auto home = environment::value("HOME"))
             return utf8_to_path(*home);
 #endif
-        return std::filesystem::temp_directory_path();
+        return lfs::core::native_fs::temp_directory_path();
     }
 
     namespace {
-        namespace fs = std::filesystem;
+        namespace fs = lfs::core::native_fs;
 
         constexpr const char* ANSI_RESET = "\033[0m";
         constexpr const char* ANSI_PERF = "\033[95m";
@@ -251,10 +255,17 @@ namespace lfs::core {
             void sink_it_(const spdlog::details::log_msg& msg) override {
                 const std::string_view msg_view(msg.payload.data(), msg.payload.size());
 
-                // Apply regex filter if set
-                if (filter_regex_ && !std::regex_search(msg_view.begin(), msg_view.end(), *filter_regex_)) {
+                // Level is a couple of atomics and a compare. Messages below
+                // Capture still reach this sink when the session file wants
+                // them, so reject those before the filter regex or formatting.
+                const bool is_perf = msg_view.find("[PERF]") != std::string_view::npos;
+                const LogLevel entry_level = from_spdlog_level(msg.level, is_perf);
+                const LogLevel display_level =
+                    static_cast<LogLevel>(display_level_.load(std::memory_order_relaxed));
+                if (!passes_display_filter(entry_level, display_level))
                     return;
-                }
+                if (filter_regex_ && !std::regex_search(msg_view.begin(), msg_view.end(), *filter_regex_))
+                    return;
 
                 const auto time_t_val = std::chrono::system_clock::to_time_t(msg.time);
                 std::tm tm{};
@@ -269,12 +280,6 @@ namespace lfs::core {
                                     1000;
 
                 const std::string_view filename = base_filename(msg.source.filename);
-                const bool is_perf = msg_view.find("[PERF]") != std::string_view::npos;
-                const LogLevel entry_level = from_spdlog_level(msg.level, is_perf);
-                const LogLevel display_level =
-                    static_cast<LogLevel>(display_level_.load(std::memory_order_relaxed));
-                if (!passes_display_filter(entry_level, display_level))
-                    return;
 
                 const char* color;
                 const char* level_str;
@@ -440,14 +445,14 @@ namespace lfs::core {
 
                 if (max_entries_.load(std::memory_order_relaxed) == 0)
                     return;
-                if (filter_regex_ && !std::regex_search(msg_view.begin(), msg_view.end(), *filter_regex_))
-                    return;
 
                 const bool is_perf = msg_view.find("[PERF]") != std::string_view::npos;
                 const LogLevel entry_level = from_spdlog_level(msg.level, is_perf);
                 const LogLevel display_level =
                     static_cast<LogLevel>(display_level_.load(std::memory_order_relaxed));
                 if (!passes_display_filter(entry_level, display_level))
+                    return;
+                if (filter_regex_ && !std::regex_search(msg_view.begin(), msg_view.end(), *filter_regex_))
                     return;
 
                 LogEntrySnapshot entry;
@@ -522,10 +527,58 @@ namespace lfs::core {
             return resolve_default_log_directory(user_dir_override) / "lichtfeld.log";
         }
 
-        std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> make_rotating_file_sink(const fs::path& path) {
+        // Keeps a line that passes the startup level or the current Capture
+        // level. Lowering Capture still keeps startup-level lines. Raising
+        // Capture (for example to Debug) adds those lines. Performance uses
+        // the same [PERF] rule as the console and memory sinks.
+        class StartupLevelFileSink final : public spdlog::sinks::sink {
+        public:
+            StartupLevelFileSink(spdlog::sink_ptr inner, const LogLevel file_level,
+                                 const std::atomic<uint8_t>* capture_level)
+                : inner_(std::move(inner)),
+                  file_level_(static_cast<uint8_t>(file_level)),
+                  capture_level_(capture_level) {
+                set_level(spdlog::level::trace);
+            }
+
+            void log(const spdlog::details::log_msg& msg) override {
+                const std::string_view payload(msg.payload.data(), msg.payload.size());
+                const bool is_perf = payload.find("[PERF]") != std::string_view::npos;
+                const LogLevel entry_level = from_spdlog_level(msg.level, is_perf);
+                const LogLevel file_level = static_cast<LogLevel>(file_level_);
+                const LogLevel capture_level = static_cast<LogLevel>(
+                    capture_level_->load(std::memory_order_relaxed));
+                if (!passes_display_filter(entry_level, file_level) &&
+                    !passes_display_filter(entry_level, capture_level))
+                    return;
+                inner_->log(msg);
+            }
+
+            void flush() override { inner_->flush(); }
+
+            void set_pattern(const std::string& pattern) override {
+                inner_->set_pattern(pattern);
+            }
+
+            void set_formatter(std::unique_ptr<spdlog::formatter> sink_formatter) override {
+                inner_->set_formatter(std::move(sink_formatter));
+            }
+
+        private:
+            spdlog::sink_ptr inner_;
+            const uint8_t file_level_;
+            const std::atomic<uint8_t>* capture_level_;
+        };
+
+        spdlog::sink_ptr make_rotating_file_sink(const fs::path& path) {
+#ifdef _WIN32
+            auto sink = std::make_shared<NativeRotatingFileSink>(
+                path, DEFAULT_LOG_ROTATION_MAX_BYTES, DEFAULT_LOG_ROTATION_MAX_FILES);
+#else
             const auto filename = path_to_utf8(path);
             auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
                 filename, DEFAULT_LOG_ROTATION_MAX_BYTES, DEFAULT_LOG_ROTATION_MAX_FILES);
+#endif
             sink->set_level(spdlog::level::trace);
             sink->set_pattern(DEFAULT_LOG_FILE_PATTERN);
             return sink;
@@ -534,9 +587,9 @@ namespace lfs::core {
         // Never throws: startup must not fail because the durable log couldn't be
         // set up. On failure, prints one warning and returns nullptr so init() falls
         // back to console/memory sinks only.
-        std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> make_default_file_sink(const fs::path& path) {
+        spdlog::sink_ptr make_default_file_sink(const fs::path& path) {
             std::error_code ec;
-            fs::create_directories(path.parent_path(), ec);
+            native_fs::create_directories(path.parent_path(), ec);
             if (ec) {
                 std::fprintf(stderr, "lichtfeld: could not create log directory '%s': %s\n",
                              path_to_utf8(path.parent_path()).c_str(), ec.message().c_str());
@@ -553,8 +606,8 @@ namespace lfs::core {
 
         bool same_log_target(const fs::path& a, const fs::path& b) {
             std::error_code ec_a, ec_b;
-            const fs::path resolved_a = fs::weakly_canonical(a, ec_a);
-            const fs::path resolved_b = fs::weakly_canonical(b, ec_b);
+            const fs::path resolved_a = native_fs::weakly_canonical(a, ec_a);
+            const fs::path resolved_b = native_fs::weakly_canonical(b, ec_b);
             if (!ec_a && !ec_b)
                 return resolved_a == resolved_b;
             return a.lexically_normal() == b.lexically_normal();
@@ -637,17 +690,22 @@ namespace lfs::core {
         sinks.push_back(impl_->memory_sink);
 
         const fs::path default_log_path = resolve_default_log_path(default_log_dir_override);
-        bool default_sink_added = false;
+        const bool explicit_log_file = !log_file.empty();
+        const fs::path explicit_path = explicit_log_file ? utf8_to_path(log_file) : fs::path{};
+        bool explicit_uses_default = false;
         if (auto default_sink = make_default_file_sink(default_log_path)) {
-            sinks.push_back(default_sink);
-            default_sink_added = true;
+            // An explicit --log-file that is the session file stays unfiltered.
+            explicit_uses_default =
+                explicit_log_file && same_log_target(default_log_path, explicit_path);
+            if (explicit_uses_default)
+                sinks.push_back(std::move(default_sink));
+            else
+                sinks.push_back(std::make_shared<StartupLevelFileSink>(
+                    std::move(default_sink), console_level, &global_level_));
         }
 
-        if (!log_file.empty()) {
-            const fs::path explicit_path = utf8_to_path(log_file);
-            if (!default_sink_added || !same_log_target(default_log_path, explicit_path)) {
-                sinks.push_back(make_rotating_file_sink(explicit_path));
-            }
+        if (explicit_log_file && !explicit_uses_default) {
+            sinks.push_back(make_rotating_file_sink(explicit_path));
         }
 
         impl_->logger = std::make_shared<spdlog::logger>("lfs", sinks.begin(), sinks.end());
@@ -658,19 +716,25 @@ namespace lfs::core {
         spdlog::set_default_logger(impl_->logger);
         spdlog::flush_every(std::chrono::seconds(2));
 
+        // The session sink reads Capture live. Publish it before the first line.
+        file_level_ = static_cast<uint8_t>(console_level);
+        global_level_ = static_cast<uint8_t>(console_level);
+        capture_all_to_file_ = !log_file.empty();
+
         impl_->logger->log(spdlog::source_loc{__FILE__, __LINE__, __func__},
                            spdlog::level::info, "Log file: {}", path_to_utf8(default_log_path));
 
 #ifdef _WIN32
+        const auto long_paths = fs::process_long_paths_enabled();
+        impl_->logger->log(spdlog::source_loc{__FILE__, __LINE__, __func__}, spdlog::level::info,
+                           "Windows filesystem: long-path opt-in: {}; extended-path I/O adapter: enabled",
+                           long_paths ? (*long_paths ? "enabled" : "disabled") : "unknown");
         // Deliberately keep a small, visible probe near the top of every Windows
         // startup log. It exercises the same UTF-8 -> UTF-16 console path as a
         // real diagnostic without changing the terminal's shared code page.
         impl_->logger->log(spdlog::source_loc{__FILE__, __LINE__, __func__}, spdlog::level::info,
                            "LichtFeld logger initialized \xE2\x80\x94 UTF-8 console: \xE2\x9C\x93");
 #endif
-
-        global_level_ = static_cast<uint8_t>(console_level);
-        capture_all_to_file_ = !log_file.empty();
     }
 
     std::string Logger::default_log_file_path(const std::string& user_dir_override) {
@@ -706,14 +770,8 @@ namespace lfs::core {
     }
 
     void Logger::log(const LogLevel level, const SourceSite& loc, const std::string_view msg) {
-        if (!impl_->logger)
+        if (!impl_->logger || !should_emit(level))
             return;
-
-        if (!capture_all_to_file_.load(std::memory_order_relaxed)) {
-            const auto global_lvl = static_cast<LogLevel>(global_level_.load(std::memory_order_relaxed));
-            if (!passes_display_filter(level, global_lvl))
-                return;
-        }
 
         std::string final_msg(msg);
         if (level == LogLevel::Performance) {
@@ -724,6 +782,11 @@ namespace lfs::core {
             spdlog::source_loc{loc.file_name(), static_cast<int>(loc.line()), loc.function_name()},
             to_spdlog_level(level),
             final_msg);
+
+        // Lines below the Capture level only reach the session file; handlers
+        // see what the console and the in-app log show.
+        if (!passes_display_filter(level, static_cast<LogLevel>(global_level_.load(std::memory_order_relaxed))))
+            return;
 
         std::vector<std::pair<LogHandlerToken, LogHandler>> handlers_snapshot;
         {

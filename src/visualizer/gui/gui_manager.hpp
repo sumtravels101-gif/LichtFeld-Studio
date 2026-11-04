@@ -56,6 +56,7 @@ struct SDL_Cursor;
 namespace lfs::vis {
     class OrthographicZoomTest;
     class WindowInputDispatchTest;
+    class SidebarInputDispatchTest;
     class VisualizerImpl;
     class SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
     class WindowManager;
@@ -133,9 +134,11 @@ namespace lfs::vis {
             void setRmlResizeDeferring(bool defer) { rmlui_manager_.setResizeDeferring(defer); }
             void prepareInput();
             void prepareLayout();
-            RmlUIManager::InputDispatchResult dispatchInputEvent(const SDL_Event& event) {
-                return rmlui_manager_.dispatchInputEvent(event);
+            bool processNativeWindowEvent(const SDL_Event& event) { return rmlui_manager_.processNativeWindowEvent(event); }
+            bool requestNativeWindowCapture(const std::string& panel_id, std::function<void(lfs::Result<VulkanContext::WindowCapture>)> callback) {
+                return rmlui_manager_.requestNativeWindowCapture(panel_id, std::move(callback));
             }
+            RmlUIManager::InputDispatchResult dispatchInputEvent(const SDL_Event& event);
             void ensureCjkFontsLoaded() { rmlui_manager_.ensureCjkFontsLoaded(); }
 
             // Sub-manager access
@@ -149,8 +152,12 @@ namespace lfs::vis {
             void enqueueToast(ToastRequest request);
             [[nodiscard]] GizmoManager& gizmo() { return gizmo_manager_; }
             [[nodiscard]] const GizmoManager& gizmo() const { return gizmo_manager_; }
+            // Runs the overlay's Python document sync on the next frame even when no
+            // store change or UI event would trigger it.
+            void requestViewportOverlaySync() { rml_viewport_overlay_.requestDocumentSync(); }
             [[nodiscard]] PanelLayoutManager& panelLayout() { return panel_layout_; }
             [[nodiscard]] const PanelLayoutManager& panelLayout() const { return panel_layout_; }
+            [[nodiscard]] bool isSequencerVisible() const { return !ui_hidden_ && panel_layout_.isShowSequencer(); }
             void focusMainPanelTab(std::string panel_id) { focus_panel_name_ = std::move(panel_id); }
             [[nodiscard]] GlobalContextMenu& globalContextMenu() { return *global_context_menu_; }
 
@@ -196,9 +203,7 @@ namespace lfs::vis {
             getWindowStates() const {
                 return window_states_;
             }
-            [[nodiscard]] std::string scenePanelActiveTab() const;
             [[nodiscard]] std::unordered_set<int> visibleCameraUids() const;
-            void setScenePanelActiveTab(std::string_view tab);
             [[nodiscard]] bool selectAllSceneNodesIfFocused();
             [[nodiscard]] bool toggleSceneSelectionVisibilityIfFocused();
             [[nodiscard]] bool toggleSceneSelectionTrainingIfFocused();
@@ -261,6 +266,7 @@ namespace lfs::vis {
             std::string import_render_error_;
             std::unique_ptr<VulkanImportErrorScope> import_error_capture_;
             friend class lfs::vis::WindowInputDispatchTest;
+            friend class lfs::vis::SidebarInputDispatchTest;
             friend class lfs::vis::SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoveryDeclineKeepsSidecarSuppressesRepeatAndExplicitSaveDeletesIt_Test;
             friend class lfs::vis::VisualizerImplResetTest_NewProjectClearsRecoveryPromptPendingSoNextOpenProceeds_Test;
@@ -446,6 +452,7 @@ namespace lfs::vis {
             GizmoManager gizmo_manager_;
 
             std::string focus_panel_name_;
+            std::string closed_plugin_tab_;
             bool ui_hidden_ = false;
 
             // Font storage
@@ -549,6 +556,8 @@ namespace lfs::vis {
             RightPanelPointerRegion right_panel_pointer_capture_region_ =
                 RightPanelPointerRegion::None;
             bool right_panel_resize_edge_was_hovered_ = false;
+            // Axis widget hover in the last drawn frame (see GizmoManager::viewportGizmoHover).
+            int drawn_viewport_gizmo_hover_ = -1;
             bool bottom_dock_pointer_live_capture_ = false;
             bool left_dock_pointer_live_capture_ = false;
             bool dock_resize_interaction_active_ = false;

@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/utils/native_file_dialog.hpp"
+#include "core/event_bridge/localization_manager.hpp"
+#include "core/native_fs.hpp"
+#include "gui/editor/document_kind.hpp"
 #include "gui/utils/file_dialog_path.hpp"
 
 #include "core/logger.hpp"
@@ -33,6 +36,18 @@ namespace lfs::vis::gui {
     namespace {
 
         std::atomic_uint native_dialog_block_count{0};
+        std::atomic_uint native_dialog_active_count{0};
+        std::atomic_uint64_t native_dialog_epoch{0};
+        struct NativeDialogActivity {
+            NativeDialogActivity() {
+                ++native_dialog_active_count;
+                ++native_dialog_epoch;
+            }
+            ~NativeDialogActivity() {
+                --native_dialog_active_count;
+                ++native_dialog_epoch;
+            }
+        };
         thread_local bool native_dialog_block_attempted = false;
 
         enum class DialogKind : uint8_t {
@@ -167,7 +182,7 @@ namespace lfs::vis::gui {
         [[nodiscard]] std::filesystem::path absoluteDialogDirectory(
             const std::filesystem::path& directory) {
             std::error_code ec;
-            auto canonical = std::filesystem::weakly_canonical(directory, ec);
+            auto canonical = lfs::core::native_fs::weakly_canonical(directory, ec);
             if (!ec && !canonical.empty()) {
                 return canonical;
             }
@@ -188,16 +203,16 @@ namespace lfs::vis::gui {
             }
 
             std::error_code ec;
-            if (std::filesystem::exists(inputPath, ec)) {
-                if (std::filesystem::is_directory(inputPath, ec)) {
+            if (lfs::core::native_fs::exists(inputPath, ec)) {
+                if (lfs::core::native_fs::is_directory(inputPath, ec)) {
                     return absoluteDialogDirectory(inputPath);
                 }
                 return absoluteDialogDirectory(inputPath.parent_path());
             }
 
             const std::filesystem::path parent = inputPath.parent_path();
-            if (!parent.empty() && std::filesystem::exists(parent, ec) &&
-                std::filesystem::is_directory(parent, ec)) {
+            if (!parent.empty() && lfs::core::native_fs::exists(parent, ec) &&
+                lfs::core::native_fs::is_directory(parent, ec)) {
                 return absoluteDialogDirectory(parent);
             }
             return {};
@@ -336,7 +351,9 @@ namespace lfs::vis::gui {
             return handle;
         }
 
-        bool runDialog(const DialogRequest& request, std::filesystem::path& resultPath) {
+        bool runDialog(const DialogRequest& request, std::filesystem::path& resultPath, bool* overwriteConfirmed = nullptr) {
+            if (overwriteConfirmed)
+                *overwriteConfirmed = false;
             resultPath.clear();
             if (nativeFileDialogsBlocked()) {
                 native_dialog_block_attempted = true;
@@ -347,6 +364,7 @@ namespace lfs::vis::gui {
                 return false;
             }
 
+            const NativeDialogActivity activity;
             const FilterListStorage filters(request.filters);
             const std::filesystem::path defaultDirectory =
                 normalizeDefaultDirectory(request.default_path);
@@ -410,8 +428,68 @@ namespace lfs::vis::gui {
 
             resultPath = lfs::core::utf8_to_path(selectedPath);
             NFD_FreePathU8(selectedPath);
+            const auto selected = resultPath;
             resultPath = detail::appendRequiredExtension(resultPath, request.required_extension);
+            if (overwriteConfirmed) {
+                std::error_code ec;
+                // NFD confirms replacement of the selected file, not a suffix appended afterwards.
+                *overwriteConfirmed = selected == resultPath && core::native_fs::exists(selected, ec) && !ec;
+            }
             return !resultPath.empty();
+        }
+
+        bool runMultiOpenDialog(const DialogRequest& request,
+                                std::vector<std::filesystem::path>& result_paths) {
+            result_paths.clear();
+            if (nativeFileDialogsBlocked()) {
+                native_dialog_block_attempted = true;
+                LOG_WARN("Native file dialog request blocked during an MCP GUI operation");
+                return false;
+            }
+            if (!ensureDialogBackendInitialized())
+                return false;
+
+            const NativeDialogActivity activity;
+            const FilterListStorage filters(request.filters);
+            const std::filesystem::path default_directory = normalizeDefaultDirectory(request.default_path);
+            const std::string default_directory_utf8 =
+                default_directory.empty() ? std::string{} : lfs::core::path_to_utf8(default_directory);
+            const nfdopendialogu8args_t args{
+                filters.data(),
+                filters.size(),
+                default_directory_utf8.empty() ? nullptr : default_directory_utf8.c_str(),
+                currentParentWindowHandle(),
+            };
+            const nfdpathset_t* selected_paths = nullptr;
+            NFD_ClearError();
+            const nfdresult_t result = NFD_OpenDialogMultipleU8_With(&selected_paths, &args);
+            if (result == NFD_CANCEL) {
+                NFD_ClearError();
+                return false;
+            }
+            if (result != NFD_OKAY) {
+                const char* const error = NFD_GetError();
+                LOG_ERROR("Native multi-file dialog failed: {}", error ? error : "unknown error");
+                NFD_ClearError();
+                return false;
+            }
+
+            nfdpathsetsize_t count = 0;
+            if (NFD_PathSet_GetCount(selected_paths, &count) != NFD_OKAY) {
+                NFD_PathSet_Free(selected_paths);
+                LOG_ERROR("Native multi-file dialog returned an unreadable path set");
+                return false;
+            }
+            result_paths.reserve(static_cast<size_t>(count));
+            for (nfdpathsetsize_t i = 0; i < count; ++i) {
+                nfdu8char_t* path = nullptr;
+                if (NFD_PathSet_GetPathU8(selected_paths, i, &path) == NFD_OKAY && path != nullptr) {
+                    result_paths.push_back(lfs::core::utf8_to_path(path));
+                    NFD_PathSet_FreePathU8(path);
+                }
+            }
+            NFD_PathSet_Free(selected_paths);
+            return !result_paths.empty();
         }
 
         [[nodiscard]] std::vector<DialogFilter> imageFilters() {
@@ -430,6 +508,12 @@ namespace lfs::vis::gui {
         [[nodiscard]] std::vector<DialogFilter> meshFilters() {
             return {makeFilter("3D Mesh Files",
                                {".obj", ".fbx", ".gltf", ".glb", ".stl", ".dae", ".3ds", ".ply"})};
+        }
+
+        [[nodiscard]] std::vector<DialogFilter> initFilters() {
+            return {makeFilter("Splat, Point Cloud and Mesh Files",
+                               {".ply", ".sog", ".ssog", ".spz", ".glb", ".rad", ".usd", ".usda", ".usdc", ".usdz",
+                                ".obj", ".fbx", ".gltf", ".stl", ".dae", ".3ds"})};
         }
 
         [[nodiscard]] std::vector<DialogFilter> checkpointFilters() {
@@ -479,8 +563,12 @@ namespace lfs::vis::gui {
             return {makeFilter("Video Files", std::move(extensions))};
         }
 
-        [[nodiscard]] std::vector<DialogFilter> pythonFilters() {
-            return {makeFilter("Python Files", {".py"})};
+        [[nodiscard]] std::vector<DialogFilter> editorFilters(const editor::DocumentKind kind, const bool save) {
+            const bool shader = kind == editor::DocumentKind::Shader;
+            return {makeFilter(!save ? LOC("editor.documents") : shader ? LOC("editor.shader_files")
+                                                                        : LOC("editor.python_files"),
+                               save ? std::vector<std::string>{shader ? ".slang" : ".py"}
+                                    : std::vector<std::string>{".py", ".slang"})};
         }
 
         [[nodiscard]] std::vector<DialogFilter> singleExtensionFilter(
@@ -504,6 +592,7 @@ namespace lfs::vis::gui {
                 return {};
             }
 
+            const NativeDialogActivity activity;
             const char* const acceptLabel =
                 action == GTK_FILE_CHOOSER_ACTION_OPEN ? "_Open" : "_Select";
             GtkWidget* const dialog = gtk_file_chooser_dialog_new(
@@ -559,6 +648,9 @@ namespace lfs::vis::gui {
     void warmupNativeFileDialogBackend() {
         (void)ensureDialogBackendInitialized();
     }
+
+    bool nativeFileDialogActive() noexcept { return native_dialog_active_count.load() != 0; }
+    uint64_t nativeFileDialogEpoch() noexcept { return native_dialog_epoch.load(); }
 
     ScopedNativeFileDialogBlock::ScopedNativeFileDialogBlock() noexcept {
         if (native_dialog_block_count.fetch_add(1, std::memory_order_acq_rel) == 0)
@@ -629,6 +721,12 @@ namespace lfs::vis::gui {
     std::filesystem::path OpenMeshFileDialog(const std::filesystem::path& defaultPath) {
         std::filesystem::path result;
         runDialog(makeOpenFileRequest(meshFilters(), defaultPath), result);
+        return result;
+    }
+
+    std::filesystem::path OpenInitFileDialog(const std::filesystem::path& defaultPath) {
+        std::filesystem::path result;
+        runDialog(makeOpenFileRequest(initFilters(), defaultPath), result);
         return result;
     }
 
@@ -716,9 +814,19 @@ namespace lfs::vis::gui {
         return result;
     }
 
+    std::vector<std::filesystem::path> OpenVideoFilesDialog(const std::filesystem::path& defaultPath) {
+        std::vector<std::filesystem::path> result;
+        runMultiOpenDialog(makeOpenFileRequest(videoFilters(), defaultPath), result);
+        return result;
+    }
+
     std::filesystem::path OpenPythonFileDialog(const std::filesystem::path& defaultPath) {
+        return OpenPythonFileDialog(defaultPath, editor::DocumentKind::Python);
+    }
+
+    std::filesystem::path OpenPythonFileDialog(const std::filesystem::path& defaultPath, const editor::DocumentKind kind) {
         std::filesystem::path result;
-        runDialog(makeOpenFileRequest(pythonFilters(), defaultPath), result);
+        runDialog(makeOpenFileRequest(editorFilters(kind, false), defaultPath), result);
         return result;
     }
 
@@ -735,9 +843,15 @@ namespace lfs::vis::gui {
 
     std::filesystem::path SaveJsonFileDialog(const std::string& defaultName,
                                              const std::filesystem::path& defaultPath) {
+        return SaveJsonFileDialogWithConfirmation(defaultName, defaultPath).first;
+    }
+
+    std::pair<std::filesystem::path, bool> SaveJsonFileDialogWithConfirmation(
+        const std::string& defaultName, const std::filesystem::path& defaultPath) {
         std::filesystem::path result;
-        runDialog(makeSaveFileRequest(jsonFilters(), defaultPath, defaultName, ".json"), result);
-        return result;
+        bool confirmed = false;
+        runDialog(makeSaveFileRequest(jsonFilters(), defaultPath, defaultName, ".json"), result, &confirmed);
+        return {std::move(result), confirmed};
     }
 
     std::filesystem::path SavePngFileDialog(const std::string& defaultName,
@@ -871,10 +985,16 @@ namespace lfs::vis::gui {
         return result;
     }
 
+    std::filesystem::path SavePythonFileDialog(const std::string& defaultName, const std::filesystem::path& defaultPath) {
+        return SavePythonFileDialog(defaultName, defaultPath, editor::DocumentKind::Python);
+    }
+
     std::filesystem::path SavePythonFileDialog(const std::string& defaultName,
-                                               const std::filesystem::path& defaultPath) {
+                                               const std::filesystem::path& defaultPath, const editor::DocumentKind kind) {
         std::filesystem::path result;
-        runDialog(makeSaveFileRequest(pythonFilters(), defaultPath, defaultName, ".py"), result);
+        runDialog(makeSaveFileRequest(editorFilters(kind, true), defaultPath, defaultName,
+                                      kind == editor::DocumentKind::Shader ? ".slang" : ".py"),
+                  result);
         return result;
     }
 

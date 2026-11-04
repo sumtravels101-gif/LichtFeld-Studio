@@ -182,57 +182,57 @@ namespace lfs::rendering {
             const int num_model_transforms,
             const uint8_t* __restrict__ node_visibility,
             const int node_visibility_count) {
-            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n) {
-                return;
-            }
-
-            int transform_idx = transform_indices != nullptr ? transform_indices[idx] : 0;
-            if (node_visibility != nullptr && transform_indices != nullptr) {
-                if (transform_idx < 0 ||
-                    transform_idx >= node_visibility_count ||
-                    node_visibility[transform_idx] == 0) {
-                    writeInvalidScreenPosition(output, idx);
-                    return;
-                }
-            }
-
-            float3 pos = means[idx];
-            if (model_transforms != nullptr && num_model_transforms > 0) {
-                transform_idx = min(max(transform_idx, 0), num_model_transforms - 1);
-                const float* const m = model_transforms + transform_idx * 16;
-                pos = make_float3(
-                    m[0] * pos.x + m[1] * pos.y + m[2] * pos.z + m[3],
-                    m[4] * pos.x + m[5] * pos.y + m[6] * pos.z + m[7],
-                    m[8] * pos.x + m[9] * pos.y + m[10] * pos.z + m[11]);
-            }
-
-            const float dx = pos.x - translation.x;
-            const float dy = pos.y - translation.y;
-            const float dz = pos.z - translation.z;
-            const float view_x = view_row0.x * dx + view_row0.y * dy + view_row0.z * dz;
-            const float view_y = view_row1.x * dx + view_row1.y * dy + view_row1.z * dz;
-            const float view_z = view_row2.x * dx + view_row2.y * dy + view_row2.z * dz;
-            if (!isfinite(view_x) || !isfinite(view_y) || !isfinite(view_z) || view_z >= -1.0e-6f) {
-                writeInvalidScreenPosition(output, idx);
-                return;
-            }
-
+            // The host launch caps the grid at kCountMaxBlocks. Stride across the
+            // whole cloud so splats past the first 4096*256 still get a position.
             const float cx = static_cast<float>(width) * 0.5f;
             const float cy = static_cast<float>(height) * 0.5f;
-            if (orthographic) {
-                if (!isfinite(ortho_scale) || ortho_scale <= 0.0f) {
-                    writeInvalidScreenPosition(output, idx);
-                    return;
+            const int stride = blockDim.x * gridDim.x;
+            for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += stride) {
+                int transform_idx = transform_indices != nullptr ? transform_indices[idx] : 0;
+                if (node_visibility != nullptr && transform_indices != nullptr) {
+                    if (transform_idx < 0 ||
+                        transform_idx >= node_visibility_count ||
+                        node_visibility[transform_idx] == 0) {
+                        writeInvalidScreenPosition(output, idx);
+                        continue;
+                    }
                 }
-                output[idx] = make_float2(cx + view_x * ortho_scale, cy - view_y * ortho_scale);
-                return;
-            }
 
-            const float depth = -view_z;
-            output[idx] = make_float2(
-                cx + view_x * pixel_focal_x / depth,
-                cy - view_y * pixel_focal_y / depth);
+                float3 pos = means[idx];
+                if (model_transforms != nullptr && num_model_transforms > 0) {
+                    transform_idx = min(max(transform_idx, 0), num_model_transforms - 1);
+                    const float* const m = model_transforms + transform_idx * 16;
+                    pos = make_float3(
+                        m[0] * pos.x + m[1] * pos.y + m[2] * pos.z + m[3],
+                        m[4] * pos.x + m[5] * pos.y + m[6] * pos.z + m[7],
+                        m[8] * pos.x + m[9] * pos.y + m[10] * pos.z + m[11]);
+                }
+
+                const float dx = pos.x - translation.x;
+                const float dy = pos.y - translation.y;
+                const float dz = pos.z - translation.z;
+                const float view_x = view_row0.x * dx + view_row0.y * dy + view_row0.z * dz;
+                const float view_y = view_row1.x * dx + view_row1.y * dy + view_row1.z * dz;
+                const float view_z = view_row2.x * dx + view_row2.y * dy + view_row2.z * dz;
+                if (!isfinite(view_x) || !isfinite(view_y) || !isfinite(view_z) || view_z >= -1.0e-6f) {
+                    writeInvalidScreenPosition(output, idx);
+                    continue;
+                }
+
+                if (orthographic) {
+                    if (!isfinite(ortho_scale) || ortho_scale <= 0.0f) {
+                        writeInvalidScreenPosition(output, idx);
+                        continue;
+                    }
+                    output[idx] = make_float2(cx + view_x * ortho_scale, cy - view_y * ortho_scale);
+                    continue;
+                }
+
+                const float depth = -view_z;
+                output[idx] = make_float2(
+                    cx + view_x * pixel_focal_x / depth,
+                    cy - view_y * pixel_focal_y / depth);
+            }
         }
 
         __device__ __forceinline__ bool betterPickCandidate(
@@ -629,6 +629,11 @@ namespace lfs::rendering {
             const float* __restrict__ ellipsoid_transform,
             const float3* ellipsoid_radii,
             const bool ellipsoid_inverse,
+            const float* __restrict__ polygon_transform,
+            const float2* __restrict__ polygon_vertices,
+            const int polygon_vertex_count,
+            const float polygon_half_depth,
+            const bool polygon_inverse,
             const float* __restrict__ model_transforms,
             const int* __restrict__ transform_indices,
             const int num_model_transforms,
@@ -686,6 +691,32 @@ namespace lfs::rendering {
                                    (lz * lz) / (r.z * r.z);
 
                 if ((norm <= 1.0f) == ellipsoid_inverse) {
+                    selection[idx] = false;
+                    return;
+                }
+            }
+
+            if (polygon_transform && polygon_vertices) {
+                const float* const p = polygon_transform;
+                const float lx = p[0] * pos.x + p[4] * pos.y + p[8] * pos.z + p[12];
+                const float ly = p[1] * pos.x + p[5] * pos.y + p[9] * pos.z + p[13];
+                const float lz = p[2] * pos.x + p[6] * pos.y + p[10] * pos.z + p[14];
+
+                // Even-odd rule, as in core::crop_polygon::containsPoint.
+                bool inside = fabsf(lz) <= polygon_half_depth;
+                if (inside) {
+                    bool crossing = false;
+                    for (int i = 0, j = polygon_vertex_count - 1; i < polygon_vertex_count; j = i++) {
+                        const float2 a = polygon_vertices[i];
+                        const float2 b = polygon_vertices[j];
+                        if ((a.y > ly) != (b.y > ly) && lx < (b.x - a.x) * (ly - a.y) / (b.y - a.y) + a.x) {
+                            crossing = !crossing;
+                        }
+                    }
+                    inside = crossing;
+                }
+
+                if (inside == polygon_inverse) {
                     selection[idx] = false;
                 }
             }
@@ -1301,7 +1332,8 @@ namespace lfs::rendering {
         const bool ellipsoid_inverse,
         const Tensor* const model_transforms,
         const Tensor* const transform_indices,
-        const int parent_node_index) {
+        const int parent_node_index,
+        const SelectionCropPolygon* const crop_polygon) {
         if (!selection.is_valid() || !means.is_valid()) {
             return;
         }
@@ -1330,7 +1362,21 @@ namespace lfs::rendering {
             ellip_radii_ptr = reinterpret_cast<const float3*>(ellipsoid_radii->ptr<float>());
         }
 
-        if (!crop_t_ptr && !ellip_t_ptr) {
+        const float* polygon_t_ptr = nullptr;
+        const float2* polygon_vertices_ptr = nullptr;
+        int polygon_vertex_count = 0;
+        if (crop_polygon && crop_polygon->transform && crop_polygon->transform->is_valid() &&
+            crop_polygon->vertices && crop_polygon->vertices->is_valid() &&
+            crop_polygon->vertices->dtype() == lfs::core::DataType::Float32 &&
+            crop_polygon->vertices->ndim() == 2 && crop_polygon->vertices->size(1) == 2 &&
+            crop_polygon->vertices->size(0) >= 3 && crop_polygon->vertices->is_contiguous() &&
+            crop_polygon->half_depth > 0.0f) {
+            polygon_t_ptr = crop_polygon->transform->ptr<float>();
+            polygon_vertices_ptr = reinterpret_cast<const float2*>(crop_polygon->vertices->ptr<float>());
+            polygon_vertex_count = checkedToInt(crop_polygon->vertices->size(0), "polygon size exceeds int range");
+        }
+
+        if (!crop_t_ptr && !ellip_t_ptr && !polygon_t_ptr) {
             return;
         }
 
@@ -1357,6 +1403,11 @@ namespace lfs::rendering {
                 ellip_t_ptr,
                 ellip_radii_ptr,
                 ellipsoid_inverse,
+                polygon_t_ptr,
+                polygon_vertices_ptr,
+                polygon_vertex_count,
+                crop_polygon ? crop_polygon->half_depth : 0.0f,
+                crop_polygon && crop_polygon->inverse,
                 prepared_transforms.ptr,
                 transform_indices_ptr,
                 prepared_transforms.count,

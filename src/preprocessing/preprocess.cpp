@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "preprocessing/preprocess.hpp"
+#include "core/native_fs.hpp"
 #include "preprocessing/lens_priors.hpp"
 
 #include "core/camera.hpp"
@@ -59,7 +60,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace fs = std::filesystem;
+namespace fs = lfs::core::native_fs;
 
 namespace {
 
@@ -73,6 +74,12 @@ namespace {
         "https://github.com/MrNeRF/LichtFeld-Studio/releases/download/model-lpips-v1/lpips-vgg16-v0.1.lfw";
     constexpr std::string_view kLpipsModelSha256 =
         "ea2f01796fbcf9950f9454f19b42e45568f166d879ec141ec100b9897a8cc769";
+
+    constexpr std::string_view kSam2ModelFile = "sam2.1-hiera-base-plus-video.lfw";
+    constexpr std::string_view kSam2ModelUrl =
+        "https://github.com/MrNeRF/LichtFeld-Studio/releases/download/model-sam2-video-v1/sam2.1-hiera-base-plus-video.lfw";
+    constexpr std::string_view kSam2ModelSha256 =
+        "b4a981065f3d64fe98cd882f28e5bd3a076b39f5f0c696c7885dbe404bc18fed";
 
     void remove_file_if_exists(const fs::path& path);
     void replace_file(const fs::path& source, const fs::path& destination);
@@ -144,7 +151,7 @@ namespace {
     }
 
     bool is_image_file(const fs::path& path) {
-        const auto ext = lower_copy(path.extension().string());
+        const auto ext = lower_copy(lfs::core::path_to_utf8(path.extension()));
         return ext == ".jpg" || ext == ".jpeg" || ext == ".png" ||
                ext == ".bmp" || ext == ".tif" || ext == ".tiff" ||
                ext == ".webp";
@@ -274,7 +281,7 @@ namespace {
     };
 
     std::string sha256_file(const fs::path& path) {
-        std::ifstream input(path, std::ios::binary);
+        std::ifstream input(lfs::core::native_fs::native_path(path), std::ios::binary);
         if (!input)
             throw std::runtime_error("Could not open " + path_to_string(path) + " for hashing");
 
@@ -632,15 +639,15 @@ namespace {
             throw std::runtime_error("Images directory does not exist: " + path_to_string(images_dir));
 
         std::vector<fs::path> images;
-        const auto add_if_image = [&images](const fs::directory_entry& entry) {
+        const auto add_if_image = [&images, &images_dir](const std::filesystem::directory_entry& entry) {
             if (entry.is_regular_file() && is_image_file(entry.path()))
-                images.push_back(entry.path());
+                images.push_back(lfs::core::native_fs::entry_path(images_dir, entry.path()));
         };
         if (recursive) {
-            for (fs::recursive_directory_iterator it(images_dir), end; it != end; ++it)
+            for (std::filesystem::recursive_directory_iterator it(lfs::core::native_fs::traversal_path(images_dir)), end; it != end; ++it)
                 add_if_image(*it);
         } else {
-            for (fs::directory_iterator it(images_dir), end; it != end; ++it)
+            for (std::filesystem::directory_iterator it(lfs::core::native_fs::traversal_path(images_dir)), end; it != end; ++it)
                 add_if_image(*it);
         }
         std::sort(images.begin(), images.end());
@@ -1366,6 +1373,11 @@ namespace lfs::preprocessing {
     lfs::Result<std::filesystem::path> ensure_lpips_weights(const bool allow_download) {
         return ensure_cached_model(kLpipsModelFile, kLpipsModelUrl, kLpipsModelSha256,
                                    allow_download, "LPIPS");
+    }
+
+    lfs::Result<std::filesystem::path> ensure_sam2_weights(const bool allow_download) {
+        return ensure_cached_model(kSam2ModelFile, kSam2ModelUrl, kSam2ModelSha256,
+                                   allow_download, "SAM2.1");
     }
 
     PreprocessRunResult run_preprocess_ex(const lfs::core::param::PreprocessParameters& params,

@@ -11,13 +11,16 @@
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "core/resource_messages.hpp"
 #include "diagnostics/vram_ledger_model.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gui/camera_thumbnail_policy.hpp"
 #include "gui/frustum_overlay_key.hpp"
+#include "gui/guide_segment_clipping.hpp"
 #include "gui/import_error.hpp"
+#include "gui/utils/native_drag_scheduler.hpp"
 #include "gui/viewport_gizmo_geometry.hpp"
 #include "gui/volume_guide_visibility.hpp"
 #include "gui/vram_hud_sample_policy.hpp"
@@ -64,6 +67,7 @@
 #include "input/sdl_key_mapping.hpp"
 #include "internal/resource_paths.hpp"
 #include "tools/align_tool.hpp"
+#include "tools/scale_distance_tool.hpp"
 
 #include "core/events.hpp"
 #include "core/parameters.hpp"
@@ -127,6 +131,11 @@
 #endif
 
 namespace lfs::vis::gui {
+    RmlUIManager::InputDispatchResult GuiManager::dispatchInputEvent(const SDL_Event& event) {
+        if (auto* window = rmlui_manager_.mainWindow())
+            rml_menu_bar_.onWindowPointerEvent(event, SDL_GetWindowID(window));
+        return rmlui_manager_.dispatchInputEvent(event);
+    }
 
     namespace {
         std::mutex g_preferences_section_mutex;
@@ -162,6 +171,8 @@ namespace lfs::vis::gui {
         constexpr auto kInteractiveTrainingToggleMinInterval = std::chrono::milliseconds(3000);
 
         void setCursorIfChanged(SDL_Cursor* const cursor) {
+            if (NativeDragScheduler::ownsNativeCursor())
+                return;
             if (SDL_GetCursor() != cursor)
                 SDL_SetCursor(cursor);
         }
@@ -1251,20 +1262,16 @@ namespace lfs::vis::gui {
                 return std::nullopt;
             }
 
-            struct ViewClipPlane {
-                glm::vec3 normal;
-                float offset;
-            };
-            const std::array<ViewClipPlane, 5> clip_planes =
+            const std::array<GuideClipPlane, 5> clip_planes =
                 settings.orthographic
-                    ? std::array<ViewClipPlane, 5>{{
+                    ? std::array<GuideClipPlane, 5>{{
                           {{0.0f, 0.0f, -1.0f}, kMinViewZ},
                           {{ortho_scale, 0.0f, 0.0f}, cx},
                           {{-ortho_scale, 0.0f, 0.0f}, cx},
                           {{0.0f, -ortho_scale, 0.0f}, cy},
                           {{0.0f, ortho_scale, 0.0f}, cy},
                       }}
-                    : std::array<ViewClipPlane, 5>{{
+                    : std::array<GuideClipPlane, 5>{{
                           {{0.0f, 0.0f, -1.0f}, kMinViewZ},
                           {{fx, 0.0f, -cx}, 0.0f},
                           {{-fx, 0.0f, -cx}, 0.0f},
@@ -1272,25 +1279,11 @@ namespace lfs::vis::gui {
                           {{0.0f, fy, -cy}, 0.0f},
                       }};
 
-            float t_enter = 0.0f;
-            float t_exit = 1.0f;
-            for (const auto& plane : clip_planes) {
-                const float distance_a = glm::dot(plane.normal, view_a) + plane.offset;
-                const float distance_b = glm::dot(plane.normal, view_b) + plane.offset;
-                if (distance_a < 0.0f && distance_b < 0.0f) {
-                    return std::nullopt;
-                }
-                if (distance_a < 0.0f) {
-                    t_enter = std::max(t_enter, distance_a / (distance_a - distance_b));
-                } else if (distance_b < 0.0f) {
-                    t_exit = std::min(t_exit, distance_a / (distance_a - distance_b));
-                }
-            }
-            if (t_enter >= t_exit) {
+            const auto clipped = clipGuideSegment(view_a, view_b, clip_planes);
+            if (!clipped) {
                 return std::nullopt;
             }
-            const glm::vec3 clipped_a = glm::mix(view_a, view_b, t_enter);
-            const glm::vec3 clipped_b = glm::mix(view_a, view_b, t_exit);
+            const auto& [clipped_a, clipped_b] = *clipped;
 
             const auto project_view = [&](const glm::vec3& view) -> std::optional<glm::vec2> {
                 if (settings.orthographic) {
@@ -1381,37 +1374,11 @@ namespace lfs::vis::gui {
             out.push_back(overlay);
         }
 
-        struct VulkanViewportGizmoMarker {
-            int encoded_axis = -1;
-            int axis = 0;
-            bool negative = false;
-            glm::vec2 screen_pos{0.0f};
-            float radius = 0.0f;
-            float depth = 0.0f;
-            bool visible = false;
-        };
-
-        struct VulkanViewportGizmoLayout {
-            glm::vec2 top_left{0.0f};
-            glm::vec2 center{0.0f};
-            float size = 0.0f;
-            std::array<VulkanViewportGizmoMarker, 6> markers{};
-        };
-
         constexpr std::array<glm::vec3, 3> kViewportGizmoAxisColors = {
             glm::vec3{0.89f, 0.15f, 0.21f},
             glm::vec3{0.54f, 0.86f, 0.20f},
             glm::vec3{0.17f, 0.48f, 0.87f}};
-        constexpr float kViewportGizmoSize = 95.0f;
-        constexpr float kViewportGizmoMarginX = 10.0f;
-        constexpr float kViewportGizmoMarginY = 10.0f;
-        constexpr float kViewportGizmoDistance = 2.8f;
-        constexpr float kViewportGizmoFovDegrees = 38.0f;
-        constexpr float kViewportGizmoSphereRadius = 0.198f;
-        constexpr float kViewportGizmoLabelDistance = 0.63f;
-        constexpr float kViewportGizmoHoverScale = 1.2f;
         constexpr float kViewportGizmoHoverBrightness = 1.3f;
-        constexpr float kViewportGizmoHitRadiusScale = 2.5f;
         constexpr float kViewportGizmoRingInnerRadius = 0.55f;
 
         [[nodiscard]] glm::vec4 viewportGizmoAxisColor(const int axis,
@@ -1420,80 +1387,6 @@ namespace lfs::vis::gui {
             const glm::vec3 c = glm::clamp(kViewportGizmoAxisColors[static_cast<size_t>(axis)] * brightness,
                                            glm::vec3(0.0f), glm::vec3(1.0f));
             return {c.r, c.g, c.b, std::clamp(alpha, 0.0f, 1.0f)};
-        }
-
-        [[nodiscard]] std::optional<VulkanViewportGizmoLayout> buildViewportGizmoLayout(
-            const VulkanGuidePanelTarget& panel,
-            const float size,
-            const float margin_x,
-            const float margin_y) {
-            if (!panel.valid() || size <= 0.0f ||
-                !viewportGizmoFits(panel.size.x, panel.size.y, size / kViewportGizmoSize)) {
-                return std::nullopt;
-            }
-
-            VulkanViewportGizmoLayout layout;
-            layout.size = size;
-            layout.top_left = {
-                panel.pos.x + panel.size.x - size - margin_x,
-                panel.pos.y + margin_y,
-            };
-            layout.center = layout.top_left + glm::vec2(size * 0.5f);
-
-            glm::mat4 view = lfs::rendering::makeViewMatrix(panel.viewport->getRotationMatrix(), glm::vec3(0.0f));
-            view[3][2] = -kViewportGizmoDistance;
-            const glm::mat4 proj =
-                glm::perspective(glm::radians(kViewportGizmoFovDegrees), 1.0f, 0.1f, 10.0f);
-            const float projected_marker_radius =
-                kViewportGizmoSphereRadius *
-                (1.0f / std::tan(glm::radians(kViewportGizmoFovDegrees) * 0.5f)) /
-                kViewportGizmoDistance *
-                size * 0.5f;
-
-            const auto project_marker = [&](const int axis, const bool negative) {
-                VulkanViewportGizmoMarker marker;
-                marker.axis = axis;
-                marker.negative = negative;
-                marker.encoded_axis = axis + (negative ? 3 : 0);
-
-                glm::vec3 position(0.0f);
-                position[axis] = negative ? -kViewportGizmoLabelDistance : kViewportGizmoLabelDistance;
-
-                const glm::vec4 clip = proj * view * glm::vec4(position, 1.0f);
-                if (clip.w <= 0.0f) {
-                    return marker;
-                }
-
-                const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-                const float local_x = (ndc.x * 0.5f + 0.5f) * size;
-                const float local_y = (1.0f - (ndc.y * 0.5f + 0.5f)) * size;
-                marker.screen_pos = layout.top_left + glm::vec2(local_x, local_y);
-                marker.radius = projected_marker_radius;
-                marker.depth = clip.z / clip.w;
-                marker.visible = true;
-                return marker;
-            };
-
-            for (int axis = 0; axis < 3; ++axis) {
-                layout.markers[static_cast<size_t>(axis)] = project_marker(axis, false);
-                layout.markers[static_cast<size_t>(axis + 3)] = project_marker(axis, true);
-            }
-            return layout;
-        }
-
-        [[nodiscard]] int hitTestViewportGizmoLayout(const VulkanViewportGizmoLayout& layout,
-                                                     const glm::vec2& mouse_pos) {
-            for (const auto& marker : layout.markers) {
-                if (!marker.visible) {
-                    continue;
-                }
-                const glm::vec2 delta = mouse_pos - marker.screen_pos;
-                const float radius = marker.radius * kViewportGizmoHitRadiusScale;
-                if (glm::dot(delta, delta) <= radius * radius) {
-                    return marker.encoded_axis;
-                }
-            }
-            return -1;
         }
 
         void appendViewportGizmoLabel(std::vector<VulkanViewportShapeOverlayVertex>& out,
@@ -1526,12 +1419,12 @@ namespace lfs::vis::gui {
 
         void appendViewportGizmoLayout(std::vector<VulkanViewportShapeOverlayVertex>& out,
                                        const VulkanViewportPassParams& params,
-                                       const VulkanViewportGizmoLayout& layout,
+                                       const ViewportGizmoLayout& layout,
                                        const int hovered_axis) {
             const auto& t = theme();
-            const float ui_scale = std::max(layout.size / kViewportGizmoSize, 0.01f);
+            const float ui_scale = std::max(layout.size / VIEWPORT_AXIS_WIDGET_SIZE, 0.01f);
 
-            std::vector<const VulkanViewportGizmoMarker*> draw_order;
+            std::vector<const ViewportGizmoMarker*> draw_order;
             draw_order.reserve(layout.markers.size());
             for (const auto& marker : layout.markers) {
                 if (marker.visible) {
@@ -1544,22 +1437,22 @@ namespace lfs::vis::gui {
                       });
 
             for (const auto& marker : layout.markers) {
-                if (!marker.visible || marker.negative) {
+                if (!marker.visible || marker.negative()) {
                     continue;
                 }
                 appendShapeOverlayLine(out, params, layout.center, marker.screen_pos,
-                                       viewportGizmoAxisColor(marker.axis, 0.72f), 3.0f * ui_scale);
+                                       viewportGizmoAxisColor(marker.axis(), 0.72f), 3.0f * ui_scale);
             }
 
             for (const auto* const marker_ptr : draw_order) {
                 const auto& marker = *marker_ptr;
                 const bool hovered = hovered_axis == marker.encoded_axis;
-                const float radius = marker.radius * (hovered ? kViewportGizmoHoverScale : 1.0f);
+                const float radius = marker.radius * (hovered ? VIEWPORT_AXIS_MARKER_HOVER_SCALE : 1.0f);
                 const float brightness = hovered ? kViewportGizmoHoverBrightness : 1.0f;
-                const glm::vec4 color = viewportGizmoAxisColor(marker.axis,
-                                                               marker.negative ? 0.88f : 1.0f,
+                const glm::vec4 color = viewportGizmoAxisColor(marker.axis(),
+                                                               marker.negative() ? 0.88f : 1.0f,
                                                                brightness);
-                if (marker.negative) {
+                if (marker.negative()) {
                     const float ring_center_radius =
                         radius * (1.0f + kViewportGizmoRingInnerRadius) * 0.5f;
                     const float ring_thickness =
@@ -1570,7 +1463,7 @@ namespace lfs::vis::gui {
                     appendShapeOverlayCircle(out, params, marker.screen_pos, radius, color);
                     appendShapeOverlayCircleOutline(out, params, marker.screen_pos, radius,
                                                     guideColor(t.palette.background, 0.55f), 1.0f * ui_scale);
-                    appendViewportGizmoLabel(out, params, marker.screen_pos, marker.axis, radius, ui_scale);
+                    appendViewportGizmoLabel(out, params, marker.screen_pos, marker.axis(), radius, ui_scale);
                 }
             }
         }
@@ -1580,64 +1473,47 @@ namespace lfs::vis::gui {
                                               const ViewportLayout& viewport_layout,
                                               RenderingManager& rendering_manager,
                                               const float ui_scale,
-                                              const bool dragging) {
+                                              const std::optional<GizmoManager::ViewportGizmoPress>& press) {
             if (params.viewport_size.x <= 0.0f || params.viewport_size.y <= 0.0f) {
                 return;
             }
 
             const auto panels = collectVulkanGuidePanels(viewer, viewport_layout, rendering_manager);
-            if (panels.empty()) {
-                return;
-            }
-            const float gizmo_scale = std::max(1.0f, ui_scale);
-            const float gizmo_size = kViewportGizmoSize * gizmo_scale;
-            const float gizmo_margin_x = kViewportGizmoMarginX * gizmo_scale;
-            const float gizmo_margin_y = kViewportGizmoMarginY * gizmo_scale;
-
-            int hovered_axis = -1;
-            SplitViewPanelId hovered_panel = SplitViewPanelId::Left;
-            bool has_hovered_panel = false;
-            if (!guiFocusState().want_capture_mouse) {
+            std::optional<glm::vec2> mouse;
+            if (!press && !guiFocusState().want_capture_mouse) {
                 if (auto* const window_manager = viewer.getWindowManager()) {
                     const auto& frame_input = window_manager->frameInput();
-                    const glm::vec2 mouse(frame_input.mouse_x, frame_input.mouse_y);
-                    for (const auto& panel : panels) {
-                        const float gizmo_x = panel.pos.x + panel.size.x -
-                                              gizmo_size - gizmo_margin_x;
-                        const float gizmo_y = panel.pos.y + gizmo_margin_y;
-                        const bool mouse_in_gizmo = mouse.x >= gizmo_x &&
-                                                    mouse.x <= gizmo_x + gizmo_size &&
-                                                    mouse.y >= gizmo_y &&
-                                                    mouse.y <= gizmo_y + gizmo_size;
-                        if (!mouse_in_gizmo) {
-                            continue;
-                        }
-                        if (const auto layout = buildViewportGizmoLayout(
-                                panel, gizmo_size, gizmo_margin_x, gizmo_margin_y)) {
-                            hovered_axis = hitTestViewportGizmoLayout(*layout, mouse);
-                        }
-                        hovered_panel = panel.panel;
-                        has_hovered_panel = true;
-                        break;
-                    }
+                    mouse = glm::vec2(frame_input.mouse_x, frame_input.mouse_y);
                 }
             }
 
+            bool hover_taken = false;
             for (const auto& panel : panels) {
-                if (const auto layout = buildViewportGizmoLayout(
-                        panel, gizmo_size, gizmo_margin_x, gizmo_margin_y)) {
-                    appendViewportGizmoLayout(params.ui_shape_overlay_triangles,
-                                              params,
-                                              *layout,
-                                              has_hovered_panel && hovered_panel == panel.panel ? hovered_axis : -1);
-                    if (dragging && (!has_hovered_panel || hovered_panel == panel.panel)) {
-                        appendShapeOverlayCircle(params.ui_shape_overlay_triangles,
-                                                 params,
-                                                 layout->center,
-                                                 layout->size * 0.46f,
-                                                 guideColor(theme().overlay.text_dim, 0.20f));
-                    }
+                if (!panel.valid()) {
+                    continue;
                 }
+                const auto layout = buildViewportGizmoLayout(panel.viewport->getRotationMatrix(),
+                                                             panel.pos, panel.size, ui_scale);
+                if (!layout) {
+                    continue;
+                }
+                // The sphere shows while the pointer is over it and while it is held,
+                // and a hovered or pressed marker lights up.
+                const bool held = press && press->panel == panel.panel;
+                const bool hovered = !hover_taken && mouse && layout->discContains(*mouse);
+                hover_taken = hover_taken || hovered;
+                if (held || hovered) {
+                    const auto& tone = theme().overlay.text_dim;
+                    appendShapeOverlayCircle(params.ui_shape_overlay_triangles, params, layout->center,
+                                             layout->discRadius(), guideColor(tone, held ? 0.24f : 0.16f));
+                    appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params, layout->center,
+                                                    layout->discRadius(), guideColor(tone, held ? 0.55f : 0.40f),
+                                                    std::max(ui_scale, 1.0f));
+                }
+                const int highlighted_axis = held      ? press->axis
+                                             : hovered ? hitTestViewportGizmoMarkers(layout->markers, *mouse)
+                                                       : -1;
+                appendViewportGizmoLayout(params.ui_shape_overlay_triangles, params, *layout, highlighted_axis);
             }
         }
 
@@ -3315,6 +3191,27 @@ namespace lfs::vis::gui {
             }
         }
 
+        // Prism outline: the polygon at both caps plus one edge per vertex.
+        void appendProjectedCropPolygon(VulkanViewportPassParams& params,
+                                        const VulkanGuidePanelTarget& panel,
+                                        const RenderSettings& settings,
+                                        const std::vector<glm::vec2>& vertices,
+                                        const float half_depth,
+                                        const glm::mat4& polygon_to_world,
+                                        const glm::vec4& color,
+                                        const float thickness) {
+            const auto point = [&](const glm::vec2& vertex, const float z) {
+                return glm::vec3(polygon_to_world * glm::vec4(vertex, z, 1.0f));
+            };
+            for (size_t i = 0; i < vertices.size(); ++i) {
+                const glm::vec2& a = vertices[i];
+                const glm::vec2& b = vertices[(i + 1) % vertices.size()];
+                addProjectedOverlayLine(params, panel, settings, point(a, -half_depth), point(b, -half_depth), color, thickness);
+                addProjectedOverlayLine(params, panel, settings, point(a, half_depth), point(b, half_depth), color, thickness);
+                addProjectedOverlayLine(params, panel, settings, point(a, -half_depth), point(a, half_depth), color, thickness);
+            }
+        }
+
         void appendCropAndFilterOverlays(VulkanViewportPassParams& params,
                                          const VulkanGuidePanelTarget& panel,
                                          const RenderSettings& settings,
@@ -3373,6 +3270,30 @@ namespace lfs::vis::gui {
                                          2.0f);
             }
 
+            const auto selected_polygon_id = scene_manager ? scene_manager->getSelectedNodeCropPolygonId()
+                                                           : core::NULL_NODE;
+            if (gizmo.crop_polygon_active &&
+                (!scene_state || activeVolumeGuideVisible(gizmo.crop_polygon_affects_render, selected_polygon_id,
+                                                          scene_state->crop_polygons))) {
+                appendProjectedCropPolygon(params, panel, settings,
+                                           gizmo.crop_polygon_vertices,
+                                           gizmo.crop_polygon_half_depth,
+                                           gizmo.crop_polygon_transform,
+                                           cropGuideColor(glm::vec3(1.0f, 1.0f, 0.0f), false, 0.0f),
+                                           2.0f);
+            }
+
+            // Outline being drawn: placed vertices and a rubber band to the cursor on the plane.
+            if (!gizmo.crop_polygon_draft.empty()) {
+                const glm::vec4 draft_color = cropGuideColor(glm::vec3(1.0f, 1.0f, 0.0f), false, 0.0f);
+                const auto& draft = gizmo.crop_polygon_draft;
+                for (size_t i = 0; i + 1 < draft.size(); ++i)
+                    addProjectedOverlayLine(params, panel, settings, draft[i], draft[i + 1], draft_color, 2.0f);
+                if (gizmo.crop_polygon_draft_cursor)
+                    addProjectedOverlayLine(params, panel, settings, draft.back(), *gizmo.crop_polygon_draft_cursor,
+                                            glm::vec4(glm::vec3(draft_color), 0.6f), 1.5f);
+            }
+
             if (!scene_state || !scene_manager) {
                 return;
             }
@@ -3409,6 +3330,20 @@ namespace lfs::vis::gui {
                                          world_transform,
                                          cropGuideColor(el.data->color, el.data->inverse, flash),
                                          el.data->line_width + flash * 4.0f);
+            }
+
+            for (const auto& polygon : scene_state->crop_polygons) {
+                if (!polygon.data || !polygon.effectively_visible || polygon.node_id != selected_polygon_id) {
+                    continue;
+                }
+                const float flash = std::clamp(polygon.data->flash_intensity, 0.0f, 1.0f);
+                appendProjectedCropPolygon(params, panel, settings,
+                                           polygon.data->vertices,
+                                           polygon.data->half_depth,
+                                           gizmo.crop_polygon_active ? gizmo.crop_polygon_transform
+                                                                     : polygon.world_transform,
+                                           cropGuideColor(polygon.data->color, polygon.data->inverse, flash),
+                                           polygon.data->line_width + flash * 4.0f);
             }
         }
 
@@ -3734,7 +3669,7 @@ namespace lfs::vis::gui {
                 return std::nullopt;
             }
             std::error_code filesystem_error;
-            if (!std::filesystem::is_regular_file(paths->windowStateFile(), filesystem_error)) {
+            if (!lfs::core::native_fs::is_regular_file(paths->windowStateFile(), filesystem_error)) {
                 if (filesystem_error == std::make_error_code(std::errc::no_such_file_or_directory))
                     LOG_DEBUG("Unable to inspect window state: {}", filesystem_error.message());
                 else if (filesystem_error)
@@ -3784,7 +3719,7 @@ namespace lfs::vis::gui {
             try {
                 const auto path = paths->windowStateFile();
                 std::error_code error;
-                if (std::filesystem::exists(path, error)) {
+                if (lfs::core::native_fs::exists(path, error)) {
                     std::optional<nlohmann::json> old;
                     try {
                         old = lfs::core::persisted_settings::readObject(path);
@@ -3879,6 +3814,7 @@ namespace lfs::vis::gui {
         state.load();
         if (state.file_association == "declined")
             return;
+        ensureProjectFileAssociation();
         if (areFileAssociationsRegistered())
             return;
 
@@ -3914,18 +3850,6 @@ namespace lfs::vis::gui {
 
     GuiManager::~GuiManager() {
         SDL_ShowCursor();
-    }
-
-    std::string GuiManager::scenePanelActiveTab() const {
-        return native_scene_panel_
-                   ? native_scene_panel_->projectActiveTab()
-                   : "scene";
-    }
-
-    void GuiManager::setScenePanelActiveTab(
-        const std::string_view tab) {
-        if (native_scene_panel_)
-            native_scene_panel_->setProjectActiveTab(tab);
     }
 
     std::unordered_set<int> GuiManager::visibleCameraUids() const {
@@ -4567,8 +4491,8 @@ namespace lfs::vis::gui {
 #ifdef LFS_DEV_LOCALE_SOURCE_DIR
         {
             const auto source_locale_dir = lfs::core::utf8_to_path(LFS_DEV_LOCALE_SOURCE_DIR);
-            if (std::filesystem::exists(source_locale_dir) &&
-                std::filesystem::is_directory(source_locale_dir)) {
+            if (lfs::core::native_fs::exists(source_locale_dir) &&
+                lfs::core::native_fs::is_directory(source_locale_dir)) {
                 locale_dir = source_locale_dir;
             }
         }
@@ -4644,7 +4568,7 @@ namespace lfs::vis::gui {
 
         {
             auto* rml_vulkan_context = viewer_->getWindowManager()->getVulkanContext();
-            if (!rml_vulkan_context || !rmlui_manager_.initVulkan(viewer_->getWindow(), *rml_vulkan_context, current_ui_scale_)) {
+            if (!rml_vulkan_context || !rmlui_manager_.initVulkan(viewer_->getWindow(), *rml_vulkan_context, current_ui_scale_, viewer_->options_.safe_mode)) {
                 throw std::runtime_error("Failed to initialize RmlUI Vulkan backend");
             }
         }
@@ -4674,16 +4598,7 @@ namespace lfs::vis::gui {
             panel_layout_.setActiveTab(id);
         };
         rml_right_panel_.on_tab_closed = [this](const std::string& id) {
-            if (id.empty())
-                return;
-            if (viewer_) {
-                viewer_->projectMarkSessionChapterCommitted("GUIL");
-            }
-            PanelRegistry::instance().set_panel_enabled(id, false);
-            if (panel_layout_.getActiveTab() == id)
-                panel_layout_.setActiveTab({});
-            if (focus_panel_name_ == id)
-                focus_panel_name_.clear();
+            closed_plugin_tab_ = id;
         };
         rml_right_panel_.on_splitter_height = [this](float height, float panel_height) {
             viewer_->getRenderingManager()->setViewportResizeActive(true);
@@ -4832,6 +4747,17 @@ namespace lfs::vis::gui {
         ops.set_floating = [](void* host, bool floating) {
             static_cast<RmlPanelHost*>(host)->setFloating(floating);
         };
+        ops.native_window = [](void* host) -> void* {
+            return static_cast<RmlPanelHost*>(host)->nativeWindow();
+        };
+        ops.native_graphics = [](void* host) -> void* {
+            return static_cast<RmlPanelHost*>(host)->nativeGraphics();
+        };
+        ops.external_allowed = [](void* host) { return static_cast<RmlPanelHost*>(host)->externalAllowed(); };
+        ops.restored_external_bounds = [](void* host, float* bounds) { return static_cast<RmlPanelHost*>(host)->restoredExternalBounds(bounds); };
+        ops.configure_external = [](void* host, float x, float y, float w, float h, bool desktop) {
+            return static_cast<RmlPanelHost*>(host)->configureExternal(x, y, w, h, desktop);
+        };
         ops.mark_content_dirty = [](void* host) {
             static_cast<RmlPanelHost*>(host)->markContentDirty();
         };
@@ -4877,14 +4803,14 @@ namespace lfs::vis::gui {
 #ifdef LFS_DEV_RMLUI_SOURCE_DIR
         {
             const auto dir = lfs::core::utf8_to_path(LFS_DEV_RMLUI_SOURCE_DIR);
-            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir))
+            if (lfs::core::native_fs::exists(dir) && lfs::core::native_fs::is_directory(dir))
                 dev_resource_watch_.rml_dir = dir;
         }
 #endif
 #ifdef LFS_DEV_LOCALE_SOURCE_DIR
         {
             const auto dir = lfs::core::utf8_to_path(LFS_DEV_LOCALE_SOURCE_DIR);
-            if (std::filesystem::exists(dir) && std::filesystem::is_directory(dir))
+            if (lfs::core::native_fs::exists(dir) && lfs::core::native_fs::is_directory(dir))
                 dev_resource_watch_.locale_dir = dir;
         }
 #endif
@@ -4916,16 +4842,15 @@ namespace lfs::vis::gui {
                     return;
 
                 std::error_code ec;
-                if (!std::filesystem::exists(dir, ec) || ec ||
-                    !std::filesystem::is_directory(dir, ec) || ec) {
+                if (!lfs::core::native_fs::exists(dir, ec) || ec ||
+                    !lfs::core::native_fs::is_directory(dir, ec) || ec) {
                     if (ec)
                         result.scan_failed = true;
                     return;
                 }
 
                 try {
-                    std::filesystem::recursive_directory_iterator it(
-                        dir, std::filesystem::directory_options::skip_permission_denied, ec);
+                    std::filesystem::recursive_directory_iterator it(lfs::core::native_fs::traversal_path(dir), std::filesystem::directory_options::skip_permission_denied, ec);
                     const std::filesystem::recursive_directory_iterator end;
                     if (ec) {
                         result.scan_failed = true;
@@ -4943,11 +4868,11 @@ namespace lfs::vis::gui {
                         if (!watched)
                             continue;
 
-                        const auto mtime = std::filesystem::last_write_time(it->path(), entry_ec);
+                        const auto mtime = lfs::core::native_fs::last_write_time(it->path(), entry_ec);
                         if (entry_ec)
                             continue;
 
-                        const std::string key = lfs::core::path_to_utf8(it->path().lexically_normal());
+                        const std::string key = lfs::core::path_to_utf8(lfs::core::native_fs::entry_path(dir, it->path()).lexically_normal());
                         next_times[key] = mtime;
 
                         if (!detect_changes)
@@ -5392,6 +5317,7 @@ namespace lfs::vis::gui {
                     grid.projection = proj;
                     grid.view_projection = proj * view;
                     grid.view_position = panel.viewport->getTranslation();
+                    grid.pivot = panel.viewport->camera.getPivot();
                     grid.plane = rendering_manager->getGridPlaneForPanel(panel.panel);
                     grid.opacity = params.grid_opacity;
                     grid.orthographic = settings.orthographic;
@@ -5404,6 +5330,7 @@ namespace lfs::vis::gui {
                     params.grid_projection = first_grid.projection;
                     params.grid_view_projection = first_grid.view_projection;
                     params.grid_view_position = first_grid.view_position;
+                    params.grid_pivot = first_grid.pivot;
                     params.grid_orthographic = first_grid.orthographic;
                 }
             }
@@ -5411,7 +5338,9 @@ namespace lfs::vis::gui {
             if (viewer_) {
                 SceneManager* const scene_manager = viewer_->getSceneManager();
                 std::optional<SceneRenderState> overlay_scene_state;
-                if (scene_manager && (settings.show_crop_box || settings.show_ellipsoid)) {
+                // Polygons have no render setting; their outline follows the selection.
+                if (scene_manager && (settings.show_crop_box || settings.show_ellipsoid ||
+                                      scene_manager->getSelectedNodeCropPolygonId() != core::NULL_NODE)) {
                     overlay_scene_state =
                         scene_manager->buildRenderState({.metadata_only = true});
                 }
@@ -5429,7 +5358,7 @@ namespace lfs::vis::gui {
                                                  viewport_layout_,
                                                  *rendering_manager,
                                                  current_ui_scale_,
-                                                 gizmo_manager_.isViewportGizmoDragging());
+                                                 gizmo_manager_.viewportGizmoPress());
             }
         }
 
@@ -6461,7 +6390,7 @@ namespace lfs::vis::gui {
             const float rpw = panel_layout_.getRightPanelWidth();
             const float ph = screen.work_size.y;
             const float splitter_h = PanelLayoutManager::SPLITTER_H * current_ui_scale_;
-            const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * current_ui_scale_;
+            const float tab_bar_w = PanelLayoutManager::RIGHT_TAB_BAR_W * current_ui_scale_;
             const float avail_h = ph - 16.0f;
             const float scene_h = panel_layout_.scenePanelHeight(avail_h, current_ui_scale_);
 
@@ -6495,7 +6424,8 @@ namespace lfs::vis::gui {
             const float content_x = rp_layout.pos.x + RIGHT_PANEL_PAD;
             const float content_top = screen.work_pos.y + RIGHT_PANEL_PAD;
             const float content_w = rpw - 2.0f * RIGHT_PANEL_PAD;
-            const float tab_content_y = content_top + scene_h + splitter_h + tab_bar_h;
+            const float tab_content_y = content_top + scene_h + splitter_h +
+                                        PanelLayoutManager::RIGHT_PANEL_SECTION_GAP * current_ui_scale_;
             const float tab_content_h = std::max(0.0f, content_top + avail_h - tab_content_y);
             right_panel_pointer_over_scene_header =
                 !pointer_over_right_panel_edge &&
@@ -6505,8 +6435,8 @@ namespace lfs::vis::gui {
             right_panel_pointer_over_active_tab =
                 !pointer_over_right_panel_edge &&
                 pointInRect(panel_input.mouse_x, panel_input.mouse_y,
-                            glm::vec2{content_x, tab_content_y},
-                            glm::vec2{content_w, tab_content_h});
+                            glm::vec2{content_x + tab_bar_w, tab_content_y},
+                            glm::vec2{std::max(0.0f, content_w - tab_bar_w), tab_content_h});
 
             if ((float_blocks_rp || viewport_pointer_captured) &&
                 !rml_right_panel_.isResizeInteractionActive()) {
@@ -6525,6 +6455,19 @@ namespace lfs::vis::gui {
                 rml_right_panel_.processInput(rp_layout, masked_input);
             } else {
                 rml_right_panel_.processInput(rp_layout, panel_input);
+            }
+
+            // Unload after the click dispatch returns: unloading unregisters the plugin's panels.
+            if (const auto id = std::exchange(closed_plugin_tab_, {}); !id.empty()) {
+                if (viewer_)
+                    viewer_->projectMarkSessionChapterCommitted("GUIL");
+                if (panel_layout_.getActiveTab() == id)
+                    panel_layout_.setActiveTab({});
+                if (focus_panel_name_ == id)
+                    focus_panel_name_.clear();
+                const auto unload = python::bridge().unload_panel_plugin;
+                if (!unload || !unload(id.c_str()))
+                    LOG_WARN("Closing sidebar tab '{}' did not unload its plugin", id);
             }
 
             if (rml_right_panel_.wantsInput() && !float_blocks_rp && !viewport_pointer_captured)
@@ -6896,6 +6839,18 @@ namespace lfs::vis::gui {
                 split_divider_state.y = content_bounds.y;
                 split_divider_state.width = divider_width;
                 split_divider_state.height = content_bounds.height;
+                const auto info = rendering->getSplitViewInfo();
+                if (splitViewUsesPLYComparison(rendering->getSettings().split_view_mode)) {
+                    const float inset = 10.0f * current_ui_scale_;
+                    split_divider_state.left_name = info.left_name;
+                    split_divider_state.right_name = info.right_name;
+                    split_divider_state.left_name_right = *divider_x - screen.work_pos.x - inset;
+                    split_divider_state.right_name_right = viewport_content_offset + content_bounds.x + content_bounds.width - inset;
+                    split_divider_state.name_bottom = content_bounds.y + content_bounds.height - inset;
+                    const float left_width = *divider_x - viewport_layout_.pos.x - content_bounds.x;
+                    const float right_width = content_bounds.width - left_width;
+                    split_divider_state.name_max_width = std::max(0.0f, std::min(left_width, right_width) - 2.0f * inset);
+                }
             }
         }
         rml_viewport_overlay_.setSplitDividerOverlay(split_divider_state);
@@ -7235,7 +7190,10 @@ namespace lfs::vis::gui {
             viewer_->getWindowManager() &&
             viewer_->getWindowManager()->manualResizeEdgeMask() != 0;
         if (!window_resize_active) {
-            const auto rml_cursor = rmlui_manager_.consumeCursorRequest();
+            auto rml_cursor = rmlui_manager_.consumeCursorRequest();
+            if (const auto overlay_cursor = rml_viewport_overlay_.cursorRequest();
+                !block_underlay_input && overlay_cursor != RmlCursorRequest::None)
+                rml_cursor = overlay_cursor;
             const bool floating_resize_applied =
                 !floating_panel_cursor_hidden_ && has_floating_panels &&
                 reg.apply_floating_resize_cursor();
@@ -7466,6 +7424,12 @@ namespace lfs::vis::gui {
                     LOG_TIMER_THRESHOLD("gui_render.buildVulkanViewportParams", 0.25);
                     viewport_params = buildVulkanViewportParams(frame.extent, frame.frame_slot);
                 }
+                if (auto* const window_manager = viewer_ ? viewer_->getWindowManager() : nullptr) {
+                    const auto& input = window_manager->frameInput();
+                    drawn_viewport_gizmo_hover_ = gizmo_manager_.viewportGizmoPress()
+                                                      ? -1
+                                                      : gizmo_manager_.viewportGizmoHover(input.mouse_x, input.mouse_y);
+                }
                 bool viewport_pass_ready = false;
                 if (!vulkan_viewport_pass_) {
                     vulkan_viewport_pass_ = std::make_unique<VulkanViewportPass>();
@@ -7524,7 +7488,7 @@ namespace lfs::vis::gui {
                         renderFloatingPanelDragCursor();
                         rmlui_manager_.endVulkanFrame();
                     } else {
-                        rmlui_manager_.clearVulkanQueue();
+                        rmlui_manager_.clearVulkanQueue(false);
                     }
                 }
                 if (viewer_) {
@@ -7541,7 +7505,7 @@ namespace lfs::vis::gui {
                     }
                 }
             } else if (vulkan_context) {
-                rmlui_manager_.clearVulkanQueue();
+                rmlui_manager_.clearVulkanQueue(false);
                 clearLineRendererCommands();
                 if (vulkan_context->rendererTerminalState() == RendererTerminalState::Running &&
                     !vulkan_context->lastError().empty()) {
@@ -7568,6 +7532,7 @@ namespace lfs::vis::gui {
                 if (auto* const overlay_rendering = viewer_ ? viewer_->getRenderingManager() : nullptr)
                     overlay_rendering->markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
             }
+            rmlui_manager_.renderNativeWindows();
             return presented;
         }
 
@@ -7938,6 +7903,10 @@ namespace lfs::vis::gui {
         auto* align_tool = ctx.viewer->getAlignTool();
         if (align_tool && align_tool->isEnabled() && !ui_hidden_) {
             align_tool->renderUI(ctx, nullptr);
+        }
+        auto* scale_distance_tool = ctx.viewer->getScaleDistanceTool();
+        if (scale_distance_tool && scale_distance_tool->isEnabled() && !ui_hidden_) {
+            scale_distance_tool->renderUI(ctx, nullptr);
         }
     }
 
@@ -8349,7 +8318,7 @@ namespace lfs::vis::gui {
             size_t available_bytes = e.available_bytes;
             if (project_save) {
                 std::error_code space_error;
-                const auto space = std::filesystem::space(path.parent_path(), space_error);
+                const auto space = lfs::core::native_fs::space(path.parent_path(), space_error);
                 if (!space_error)
                     available_bytes = static_cast<size_t>(space.available);
             }
@@ -8517,6 +8486,10 @@ namespace lfs::vis::gui {
         // Gizmo hover is refreshed only when the gizmo is drawn. Without a frame,
         // a pointer that left the gizmo keeps claiming the next viewport press.
         if (isTransformGizmoOverOrUsing())
+            return true;
+
+        // The axis widget shows its sphere and marker under the pointer at once.
+        if (gizmo_manager_.viewportGizmoHover(mouse_x, mouse_y) != drawn_viewport_gizmo_hover_)
             return true;
 
         if (!guiFocusState().want_capture_mouse && isPositionInViewport(mouse_x, mouse_y)) {
@@ -8731,17 +8704,17 @@ namespace lfs::vis::gui {
 
         constexpr float kPanelPad = 8.0f;
         constexpr float kPreloadMaxHeight = 100000.0f;
-        const float content_w = panel_layout_.getRightPanelWidth() - 2.0f * kPanelPad;
+        const float content_w = panel_layout_.getRightPanelWidth() - 2.0f * kPanelPad -
+                                PanelLayoutManager::RIGHT_TAB_BAR_W * dpi;
         if (content_w <= 0.0f) {
             return;
         }
 
         const float splitter_h = PanelLayoutManager::SPLITTER_H * dpi;
-        const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * dpi;
         const float avail_h = panel_h - 2.0f * kPanelPad;
         const float scene_h = panel_layout_.scenePanelHeight(avail_h, dpi);
         const float content_top = kPanelPad;
-        const float tab_content_y = content_top + scene_h + splitter_h + tab_bar_h;
+        const float tab_content_y = content_top + scene_h + splitter_h + PanelLayoutManager::RIGHT_PANEL_SECTION_GAP * dpi;
         const float tab_content_h =
             std::max(0.0f, content_top + avail_h - tab_content_y);
         const float clip_y_min = tab_content_y;
@@ -8929,6 +8902,8 @@ namespace lfs::vis::gui {
         std::optional<double> result;
         const auto now = std::chrono::steady_clock::now();
 
+        result = min_delay(result, rmlui_manager_.secondsUntilNativeGeometryFlush(), "external_window_geometry");
+
         if (!python::is_plugin_preload_running()) {
             result = min_delay(result,
                                PanelRegistry::instance().nextScheduledAnimationDelayForVisiblePanels(
@@ -8960,7 +8935,7 @@ namespace lfs::vis::gui {
     }
 
     bool GuiManager::isViewportExportLocked() const {
-        return async_tasks_.isExporting() || async_tasks_.isExportingVideo();
+        return (async_tasks_.isExporting() && !async_tasks_.isDragExport()) || async_tasks_.isExportingVideo();
     }
 
     void GuiManager::setStartupPluginLoadState(const bool started,
@@ -9000,6 +8975,7 @@ namespace lfs::vis::gui {
             return std::unexpected(lfs::format_for_developer(paths.error()));
         if (const auto backup = paths->resetLayout(); !backup)
             return std::unexpected(lfs::format_for_developer(backup.error()));
+        rmlui_manager_.resetNativeWindowGeometry();
 
         panel_layout_.applyProjectState(PanelLayoutProjectState{});
         auto& registry = PanelRegistry::instance();
@@ -9007,7 +8983,6 @@ namespace lfs::vis::gui {
         registry.apply_panel_payloads({});
         registry.set_panel_enabled("lfs.preferences", true);
         resetSceneTreeChrome();
-        setScenePanelActiveTab("scene");
         setTabStripScroll(0.0f);
 
         applyDefaultWindowStates(window_states_);
@@ -9041,6 +9016,7 @@ namespace lfs::vis::gui {
             return std::unexpected(std::string(LOC("preferences.window_manager_unavailable")));
         if (!window_manager->resetPersistentWindowState())
             return std::unexpected(std::string(LOC("preferences.window_state_reset_failed")));
+        rmlui_manager_.resetNativeWindowGeometry();
         return {};
     }
 

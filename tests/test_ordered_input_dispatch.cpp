@@ -3,7 +3,6 @@
 #include "core/camera.hpp"
 #include "core/event_bridge/event_bridge.hpp"
 #include "core/event_bridge/localization_manager.hpp"
-#include "core/event_bus.hpp"
 #include "core/events.hpp"
 #include "core/point_cloud.hpp"
 #include "core/services.hpp"
@@ -18,6 +17,7 @@
 #include "gui/panel_layout.hpp"
 #include "gui/rml_menu_bar.hpp"
 #include "gui/rml_modal_overlay.hpp"
+#include "gui/rml_right_panel.hpp"
 #include "gui/rml_sequencer_overlay.hpp"
 #include "gui/rmlui/elements/python_editor_element.hpp"
 #include "gui/rmlui/elements/scene_graph_element.hpp"
@@ -30,6 +30,7 @@
 #include "gui/scale_gizmo.hpp"
 #include "gui/scene_panel_native.hpp"
 #include "gui/translation_gizmo.hpp"
+#include "gui/viewport_gizmo_geometry.hpp"
 #include "input/frame_input_buffer.hpp"
 #include "input/input_controller.hpp"
 #include "input/key_codes.hpp"
@@ -38,9 +39,11 @@
 #include "operator/operator_registry.hpp"
 #include "rendering/coordinate_conventions.hpp"
 #include "rendering/passes/vulkan_viewport_pass.hpp"
+#include "rendering/render_constants.hpp"
 #include "sequencer/sequencer_controller.hpp"
 #include "tools/unified_tool_registry.hpp"
 #include "visualizer/app_store.hpp"
+#include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer_impl.hpp"
 #include "window/window_manager.hpp"
 #include <RmlUi/Core.h>
@@ -142,6 +145,7 @@ namespace lfs::vis {
                 Rml::RemoveContext(context_->GetName());
             context_ = nullptr;
             document_ = nullptr;
+            gui::guiFocusState().reset();
         }
 
         static inline NullRenderInterface* render_interface_ = nullptr;
@@ -523,6 +527,38 @@ namespace lfs::vis {
         view->setEditor(nullptr);
     }
 
+    TEST_F(RmlPointerReplayTest, ShaderDocumentRendersEditsAndUndoesWithoutPythonAnalysis) {
+        static Rml::ElementInstancerGeneric<gui::PythonEditorElement> instancer;
+        Rml::Factory::RegisterElementInstancer("python-editor", &instancer);
+        editor::PythonEditor editor;
+        editor.setDocumentKind(editor::DocumentKind::Shader);
+        editor.setText("import lfs;\n");
+        auto element = document_->CreateElement("python-editor");
+        auto* view = dynamic_cast<gui::PythonEditorElement*>(element.get());
+        ASSERT_NE(view, nullptr);
+        view->setEditor(&editor);
+        document_->AppendChild(std::move(element));
+        context_->Update();
+        ASSERT_TRUE(view->Focus());
+        gui::rml_input::processKeyboardEvent(*context_, {.kind = FrameInputEventKind::Text, .text = "x"});
+        editor.renderRml(*view, 200.0f, 80.0f, 14.0f);
+        EXPECT_FALSE(editor.pythonAnalysisActive());
+        EXPECT_FALSE(editor.hasActiveCompletion());
+        EXPECT_TRUE(editor.syntaxSymbols().empty());
+        const auto edited = editor.getText();
+        editor.setDocumentKind(editor::DocumentKind::Python);
+        editor.setDocumentKind(editor::DocumentKind::Shader);
+        EXPECT_EQ(editor.getText(), edited);
+        gui::rml_input::processKeyboardEvent(*context_, {.scancode = SDL_SCANCODE_Z, .modifiers = SDL_KMOD_CTRL});
+        EXPECT_EQ(editor.getText(), "import lfs;\n");
+        gui::rml_input::processKeyboardEvent(*context_, {.scancode = SDL_SCANCODE_SPACE, .modifiers = SDL_KMOD_CTRL});
+        editor.refreshSyntaxDiagnostics();
+        editor.renderRml(*view, 200.0f, 80.0f, 14.0f);
+        EXPECT_FALSE(editor.pythonAnalysisActive());
+        EXPECT_FALSE(editor.hasActiveCompletion());
+        view->setEditor(nullptr);
+    }
+
     TEST_F(RmlPointerReplayTest, DotOffersCompletionAfterThePanelConsumesTheEdit) {
 #ifdef _WIN32
         GTEST_SKIP() << "Mock language server fixture is POSIX-only.";
@@ -551,6 +587,8 @@ namespace lfs::vis {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         EXPECT_TRUE(editor.hasActiveCompletion());
+        editor.renderRml(*view, 200.0f, 80.0f, 14.0f);
+        EXPECT_TRUE(gui::guiFocusState().want_text_input);
         view->setEditor(nullptr);
         unsetenv("LFS_PYTHON_LSP");
         unsetenv("LFS_PYTHON_LSP_WORKSPACE");
@@ -572,7 +610,6 @@ namespace lfs::vis {
             gui_ = viewer_->getGuiManager();
             if (!keepSceneHandlers()) {
                 lfs::event::EventBridge::instance().clear_all();
-                lfs::core::event::bus().clear_all();
             }
             window_->window_ = SDL_CreateWindow("Input dispatch", 400, 300, SDL_WINDOW_HIDDEN);
             ASSERT_NE(window_->window_, nullptr);
@@ -628,6 +665,21 @@ namespace lfs::vis {
             gui::guiFocusState().reset();
         }
         gui::RmlUIManager& manager() { return gui_->rmlui_manager_; }
+        bool hasDesktopHost(const Rml::Context* context) { return manager().native_windows_.contains(context); }
+        void failExternalGraphics(int& attempts) {
+            manager().native_windows_enabled_ = true;
+            manager().create_native_graphics_ = [&attempts]() -> std::unique_ptr<VulkanContext> {
+                ++attempts;
+                return nullptr;
+            };
+        }
+        void setKeyboardContext(Rml::Context* context, bool external_enabled) {
+            manager().keyboard_context_ = context;
+            manager().native_windows_enabled_ = external_enabled;
+        }
+        void mapContextWindow(Rml::Context* context, SDL_Window* window) {
+            manager().context_windows_[context] = window;
+        }
         void attachInputHost(gui::RmlPanelHost& host, int width, int height, const char* markup) {
             // Input uses the real host and null geometry renderer, without a GPU frame.
             manager().vulkan_render_interface_ = &input_renderer_;
@@ -641,13 +693,12 @@ namespace lfs::vis {
             host.last_fbo_w_ = width;
             host.last_fbo_h_ = height;
         }
-        void forwardHost(gui::RmlPanelHost& host, float x, float y) {
-            gui::PanelInputState input;
+        void forwardHost(gui::RmlPanelHost& host, float x, float y, gui::PanelInputState input = {}) {
             host.setInput(&input);
             host.forwardInput(x, y);
             host.setInput(nullptr);
         }
-        void registerInputFloat() {
+        void registerInputFloat(float x = 100.f) {
             class Panel final : public gui::IPanel {
                 void draw(const gui::PanelDrawContext&) override {}
                 gui::PanelRenderCapabilities renderCapabilities() const override { return {.direct = true}; }
@@ -662,17 +713,17 @@ namespace lfs::vis {
                 .id = "test.input_float",
                 .space = gui::PanelSpace::Floating,
                 .enabled = true,
-                .float_x = 100.f,
+                .float_x = x,
                 .float_y = 60.f,
                 .float_user_height = 100.f,
                 .float_last_bounds_valid = true,
-                .float_last_x = 100.f,
+                .float_last_x = x,
                 .float_last_y = 60.f,
                 .float_last_w = 180.f,
                 .float_last_h = 100.f,
                 .float_auto_center = false,
             }});
-            ASSERT_TRUE(gui::PanelRegistry::instance().isPositionOverFloatingPanel(140, 100));
+            ASSERT_TRUE(gui::PanelRegistry::instance().isPositionOverFloatingPanel(x + 40, 100));
         }
         RenderInterface_VK input_renderer_;
         // GuiManager keeps these listeners alive until their Rml context is shut down.
@@ -1202,8 +1253,11 @@ namespace lfs::vis {
             const size_t undo_before = op::undoHistory().undoCount();
             frame.mouse_x += 18.0f;
             frame.mouse_y += 11.0f;
+            frame.mouse_dx = 18.0f;
+            frame.mouse_dy = 11.0f;
             frame.mouse_down[0] = true;
             gizmo.renderViewportGizmo(layout);
+            frame.mouse_dx = frame.mouse_dy = 0.0f;
             EXPECT_FALSE(sameMatrixBits(before_rotation, glm::mat4(camera.R)));
 
             controller_->handleKey(input::KEY_ESCAPE, input::ACTION_PRESS, input::KEYMOD_NONE);
@@ -1221,6 +1275,117 @@ namespace lfs::vis {
             EXPECT_FALSE(gizmo.isViewportGizmoDragging());
         }
 
+        // The axis widget as drawn for the 400x300 test viewport, looking down -Z.
+        gui::ViewportGizmoLayout prepareViewportGizmo() {
+            auto& camera = viewer_->getViewport().camera;
+            camera.t = {0.0f, 0.0f, 12.0f};
+            camera.pivot = {0.0f, 0.0f, 0.0f};
+            camera.R = rendering::makeVisualizerLookAtRotation(camera.t, camera.pivot);
+            controller_->setViewer(viewer_.get());
+            controller_->updateViewportBounds(0.0f, 0.0f, 400.0f, 300.0f);
+            auto& frame = frameInput();
+            frame.mouse_down[0] = frame.mouse_clicked[0] = frame.mouse_released[0] = false;
+            frame.mouse_dx = frame.mouse_dy = 0.0f;
+            gui::guiFocusState().want_capture_mouse = false;
+            return *gui::buildViewportGizmoLayout(viewer_->getViewport().getRotationMatrix(), {0.0f, 0.0f},
+                                                  {400.0f, 300.0f}, 1.0f);
+        }
+
+        void pressViewportGizmo(const gui::ViewportLayout& layout, const glm::vec2& point) {
+            auto& frame = frameInput();
+            frame.mouse_x = point.x;
+            frame.mouse_y = point.y;
+            frame.mouse_down[0] = frame.mouse_clicked[0] = true;
+            gui_->gizmo().renderViewportGizmo(layout);
+            frame.mouse_clicked[0] = false;
+        }
+
+        // A point on the sphere outside every marker.
+        static glm::vec2 viewportGizmoSpherePoint(const gui::ViewportGizmoLayout& gizmo_layout) {
+            for (float y = gizmo_layout.top_left.y; y < gizmo_layout.top_left.y + gizmo_layout.size; y += 2.0f)
+                for (float x = gizmo_layout.top_left.x; x < gizmo_layout.top_left.x + gizmo_layout.size; x += 2.0f)
+                    if (gizmo_layout.discContains({x, y}) && gui::hitTestViewportGizmoMarkers(gizmo_layout.markers, {x, y}) < 0)
+                        return {x, y};
+            ADD_FAILURE() << "no free point on the axis widget sphere";
+            return gizmo_layout.center;
+        }
+
+        void exerciseViewportGizmoEdgeDrag() {
+            auto& gizmo = gui_->gizmo();
+            auto& camera = viewer_->getViewport().camera;
+            const auto gizmo_layout = prepareViewportGizmo();
+            const gui::ViewportLayout layout{.pos = {0.0f, 0.0f}, .size = {400.0f, 300.0f}};
+            auto& frame = frameInput();
+            pressViewportGizmo(layout, viewportGizmoSpherePoint(gizmo_layout));
+            ASSERT_TRUE(gizmo.isViewportGizmoDragging());
+
+            // At the window edge SDL clamps the position, so only relative motion moves on.
+            // Panels claiming the pointer must not stall the drag either.
+            for (const bool ui_wants_mouse : {false, true}) {
+                gui::guiFocusState().want_capture_mouse = ui_wants_mouse;
+                const glm::mat4 before(camera.R);
+                frame.mouse_dx = 25.0f;
+                gizmo.renderViewportGizmo(layout);
+                EXPECT_FALSE(sameMatrixBits(before, glm::mat4(camera.R))) << ui_wants_mouse;
+            }
+            frame.mouse_dx = 0.0f;
+            frame.mouse_down[0] = false;
+            gizmo.renderViewportGizmo(layout);
+            EXPECT_FALSE(gizmo.isViewportGizmoDragging());
+            gui::guiFocusState().want_capture_mouse = false;
+        }
+
+        void exerciseViewportGizmoMarkerPress() {
+            auto& gizmo = gui_->gizmo();
+            auto& camera = viewer_->getViewport().camera;
+            const auto gizmo_layout = prepareViewportGizmo();
+            const glm::vec2 x_marker = gizmo_layout.markers[0].screen_pos;
+            ASSERT_EQ(gui::hitTestViewportGizmoMarkers(gizmo_layout.markers, x_marker), 0);
+            const glm::mat4 before(camera.R);
+            auto x_view = camera;
+            x_view.setAxisAlignedView(0, false);
+            const gui::ViewportLayout layout{.pos = {0.0f, 0.0f}, .size = {400.0f, 300.0f}};
+            auto& frame = frameInput();
+
+            // A click views along the axis on release.
+            pressViewportGizmo(layout, x_marker);
+            EXPECT_TRUE(sameMatrixBits(before, glm::mat4(camera.R)));
+            frame.mouse_down[0] = false;
+            gizmo.renderViewportGizmo(layout);
+            EXPECT_TRUE(sameMatrixBits(glm::mat4(x_view.R), glm::mat4(camera.R)));
+
+            // Pressing a marker and moving orbits like the sphere.
+            prepareViewportGizmo();
+            pressViewportGizmo(layout, x_marker);
+            frame.mouse_x += 12.0f;
+            frame.mouse_dx = 12.0f;
+            gizmo.renderViewportGizmo(layout);
+            frame.mouse_dx = 0.0f;
+            EXPECT_TRUE(gizmo.isViewportGizmoDragging());
+            EXPECT_FALSE(sameMatrixBits(before, glm::mat4(camera.R)));
+            EXPECT_FALSE(sameMatrixBits(glm::mat4(x_view.R), glm::mat4(camera.R)));
+            frame.mouse_down[0] = false;
+            gizmo.renderViewportGizmo(layout);
+            EXPECT_FALSE(gizmo.isViewportGizmoDragging());
+        }
+
+        // Each change of what the widget shows under the pointer wakes one frame.
+        void exerciseViewportGizmoHoverDemand() {
+            const auto gizmo_layout = prepareViewportGizmo();
+            gui_->viewport_layout_ = {.pos = {0.0f, 0.0f}, .size = {400.0f, 300.0f}};
+            auto& gizmo = gui_->gizmo();
+            const glm::vec2 away(200.0f, 200.0f);
+            context_->ProcessMouseMove(static_cast<int>(away.x), static_cast<int>(away.y), 0);
+            gui_->drawn_viewport_gizmo_hover_ = gizmo.viewportGizmoHover(away.x, away.y);
+            ASSERT_FALSE(gui_->passiveMouseMoveNeedsRender(away.x, away.y));
+            for (const glm::vec2 point : {viewportGizmoSpherePoint(gizmo_layout), gizmo_layout.markers[0].screen_pos, away}) {
+                context_->ProcessMouseMove(static_cast<int>(point.x), static_cast<int>(point.y), 0);
+                EXPECT_TRUE(gui_->passiveMouseMoveNeedsRender(point.x, point.y)) << point.x << "," << point.y;
+                gui_->drawn_viewport_gizmo_hover_ = gizmo.viewportGizmoHover(point.x, point.y);
+                EXPECT_FALSE(gui_->passiveMouseMoveNeedsRender(point.x, point.y)) << point.x << "," << point.y;
+            }
+        }
+
         Viewport viewport_{400, 300};
         std::unique_ptr<VisualizerImpl> viewer_;
         WindowManager* window_ = nullptr;
@@ -1232,6 +1397,141 @@ namespace lfs::vis {
         uint64_t timestamp_ = 0;
         gui::rml_input::TextInputEscapeRevertController revert_;
     };
+
+    TEST_F(WindowInputDispatchTest, MainWindowFocusLossPreservesFocusedFieldWithExternalWindowsOnOrOff) {
+        for (const bool enabled : {false, true}) {
+            SCOPED_TRACE(enabled);
+            ASSERT_TRUE(field_->Focus());
+            field_->SetValue("half-typed");
+            setKeyboardContext(context_, enabled);
+            SDL_Event event{};
+            event.type = SDL_EVENT_WINDOW_FOCUS_LOST;
+            event.window.windowID = SDL_GetWindowID(window_->getWindow());
+            manager().dispatchInputEvent(event);
+            EXPECT_EQ(context_->GetFocusElement(), field_);
+            EXPECT_EQ(field_->GetValue(), "half-typed");
+        }
+    }
+
+    TEST_F(WindowInputDispatchTest, UnvalidatedPanelsCannotCreateExternalHosts) {
+        int attempts = 0;
+        failExternalGraphics(attempts);
+        for (const auto* name : {"lfs.asset_manager", "lfs.histogram", "plugin.custom", "modal"}) {
+            auto* context = manager().createContext(name, 400, 300, true);
+            ASSERT_NE(context, nullptr);
+            EXPECT_FALSE(hasDesktopHost(context));
+            EXPECT_TRUE(manager().externalWindowsAllowed());
+            manager().destroyContext(name);
+        }
+        EXPECT_EQ(attempts, 0);
+        EXPECT_TRUE(gui::RmlUIManager::validatedExternalPanel("lfs.preferences"));
+        EXPECT_TRUE(gui::RmlUIManager::validatedExternalPanel("lfs.plugin_marketplace"));
+        EXPECT_TRUE(gui::RmlUIManager::validatedExternalPanel("video_extractor"));
+    }
+
+    TEST_F(WindowInputDispatchTest, FailedExternalHostDisablesFurtherAttemptsForTheSession) {
+        int attempts = 0;
+        failExternalGraphics(attempts);
+        auto* first = manager().createContext("video_extractor", 400, 300, true);
+        ASSERT_NE(first, nullptr);
+        EXPECT_FALSE(hasDesktopHost(first));
+        EXPECT_FALSE(manager().externalWindowsAllowed());
+        for (int frame = 0; frame < 10; ++frame) {
+            const std::string name = "lfs.preferences";
+            auto* fallback = manager().createContext(name, 400, 300, true);
+            ASSERT_NE(fallback, nullptr);
+            EXPECT_FALSE(hasDesktopHost(fallback));
+            EXPECT_FALSE(manager().externalWindowsAllowed());
+            manager().destroyContext(name);
+        }
+        EXPECT_EQ(attempts, 1);
+        manager().destroyContext("video_extractor");
+    }
+
+    TEST_F(WindowInputDispatchTest, SecondaryWindowMouseDoesNotReachMainWindowContext) {
+        auto* secondary = SDL_CreateWindow("Secondary input", 400, 300, SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        ASSERT_NE(secondary, nullptr);
+        auto* context = manager().createContext("secondary-input", 400, 300);
+        ASSERT_NE(context, nullptr);
+        mapContextWindow(context, secondary);
+        int main_presses = 0;
+        int secondary_presses = 0;
+        float secondary_x = 0.0f;
+        float press_x = 0.0f;
+        manager().routeInput(context_, {}, [&](const gui::PanelInputState& input) {
+            main_presses += static_cast<int>(input.mouse_button_events.size());
+        });
+        manager().routeInput(context, {}, [&](const gui::PanelInputState& input) {
+            secondary_presses += static_cast<int>(input.mouse_button_events.size());
+            if (!input.mouse_button_events.empty()) {
+                secondary_x = input.mouse_x;
+                press_x = input.mouse_button_events.front().x;
+            }
+        });
+        SDL_Event event{};
+        event.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+        event.button.windowID = SDL_GetWindowID(secondary);
+        event.button.button = SDL_BUTTON_LEFT;
+        event.button.x = event.button.y = 20;
+        manager().dispatchInputEvent(event);
+        EXPECT_EQ(main_presses, 0);
+        EXPECT_EQ(secondary_presses, 1);
+        const auto scale = input::windowPixelScale(secondary);
+        EXPECT_FLOAT_EQ(secondary_x, 20 * scale.x);
+        EXPECT_FLOAT_EQ(press_x, 20 * scale.x);
+        manager().destroyContext("secondary-input");
+        SDL_DestroyWindow(secondary);
+    }
+
+    TEST_F(WindowInputDispatchTest, MainWindowTextCannotReachSecondaryExclusiveContext) {
+        auto* secondary = SDL_CreateWindow("Secondary keyboard", 400, 300, SDL_WINDOW_HIDDEN);
+        ASSERT_NE(secondary, nullptr);
+        auto* context = manager().createContext("secondary-keyboard", 400, 300);
+        ASSERT_NE(context, nullptr);
+        mapContextWindow(context, secondary);
+        int text_events = 0;
+        manager().activateInput(context, [&](const gui::PanelInputState& input) {
+            text_events += static_cast<int>(input.input_events.size());
+        });
+        SDL_Event event{};
+        event.type = SDL_EVENT_TEXT_INPUT;
+        event.text.windowID = SDL_GetWindowID(window_->getWindow());
+        event.text.text = "main only";
+        manager().dispatchInputEvent(event);
+        EXPECT_EQ(text_events, 0);
+        event.text.windowID = SDL_GetWindowID(secondary);
+        manager().dispatchInputEvent(event);
+        EXPECT_EQ(text_events, 1);
+        manager().destroyContext("secondary-keyboard");
+        SDL_DestroyWindow(secondary);
+    }
+
+    TEST_F(WindowInputDispatchTest, EmbeddedPointerCoordinatesConvertToPixelsOnlyOnce) {
+        context_->SetDensityIndependentPixelRatio(2.0f);
+        float move_x = -1, press_x = -1;
+        manager().routeInput(context_, {}, [&](const gui::PanelInputState& input) {
+            move_x = input.mouse_x;
+            if (!input.mouse_button_events.empty())
+                press_x = input.mouse_button_events.front().x;
+        });
+        SDL_Event event{};
+        event.type = SDL_EVENT_MOUSE_MOTION;
+        event.motion.windowID = SDL_GetWindowID(window_->getWindow());
+        event.motion.x = 37;
+        event.motion.y = 23;
+        manager().dispatchInputEvent(event);
+        const auto scale = input::windowPixelScale(window_->getWindow());
+        EXPECT_FLOAT_EQ(move_x, 37 * scale.x);
+        event = {};
+        event.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+        event.button.windowID = SDL_GetWindowID(window_->getWindow());
+        event.button.button = SDL_BUTTON_LEFT;
+        event.button.x = 37;
+        event.button.y = 23;
+        manager().dispatchInputEvent(event);
+        EXPECT_FLOAT_EQ(move_x, 37 * scale.x);
+        EXPECT_FLOAT_EQ(press_x, 37 * scale.x);
+    }
 
     TEST_F(WindowInputDispatchTest, NodeDeletionPreservesTransformToolThroughReselectionAndHistory) {
         auto& sm = *viewer_->getSceneManager();
@@ -1363,8 +1663,176 @@ namespace lfs::vis {
         exerciseCropToolGizmoEscape(true, false);
     }
 
+    // The polygon crop tool edits its outline from vertex handles on the cap facing the
+    // camera: a primary drag moves a vertex, winning over the bounds corner under it, and
+    // the key map's insert and remove clicks add a vertex on an edge and delete one. Each
+    // is one undo step, and the other vertices keep their world positions.
+    TEST_F(WindowInputDispatchTest, CropPolygonVertexHandlesMoveInsertAndRemoveVertices) {
+        auto& sm = *viewer_->getSceneManager();
+        auto& scene = sm.getScene();
+        auto& gizmo = gui_->gizmo();
+        auto& camera = viewer_->getViewport().camera;
+        camera.t = {0.0f, 0.0f, 12.0f};
+        camera.pivot = {0.0f, 0.0f, 0.0f};
+        camera.R = rendering::makeVisualizerLookAtRotation(camera.t, camera.pivot);
+
+        const auto parent = scene.addSplat("Polygon parent", lfs::test::licht::make_splat(3));
+        core::CropPolygonData data;
+        data.vertices = {{-3.0f, -2.0f}, {3.0f, -2.0f}, {3.0f, 2.0f}, {-3.0f, 2.0f}};
+        data.half_depth = 0.5f;
+        const auto polygon = scene.addCropPolygon("Polygon", parent, data);
+        ASSERT_NE(polygon, core::NULL_NODE);
+        sm.changeContentType(SceneManager::ContentType::SplatFiles);
+        sm.selectNode(polygon);
+        viewer_->getEditorContext().update(&sm, viewer_->getTrainerManager());
+        UnifiedToolRegistry::instance().setActiveTool("builtin.cropbox");
+        gizmo.setCropToolShape("polygon");
+        gizmo.setOperation(gui::GizmoOperation::Scale);
+        const gui::UIContext ui{.viewer = viewer_.get(), .editor = &viewer_->getEditorContext()};
+        gizmo.updateToolState(ui, false);
+        controller_->setViewer(viewer_.get());
+        controller_->updateViewportBounds(0.0f, 0.0f, 400.0f, 300.0f);
+        const gui::ViewportLayout layout{.pos = {0.0f, 0.0f}, .size = {400.0f, 300.0f}};
+
+        auto& frame = frameInput();
+        frame.mouse_down[0] = frame.mouse_clicked[0] = frame.mouse_released[0] = false;
+        frame.mouse_button_events.clear();
+        frame.key_mods = SDL_KMOD_NONE;
+        const auto render = [&] {
+            gui::guiFocusState().want_capture_mouse = false;
+            gizmo.renderEllipsoidGizmo(ui, layout);
+        };
+        // The handles as the tool projects them, on the cap facing the camera.
+        const auto handles = [&] {
+            const auto settings = viewer_->getRenderingManager()->getSettings();
+            const auto& viewport = viewer_->getViewport();
+            const glm::mat4 view = viewport.getViewMatrix();
+            const glm::mat4 view_projection =
+                rendering::createProjectionMatrixFromFocal(
+                    glm::ivec2(400, 300), settings.focal_length_mm, settings.orthographic,
+                    viewport.ortho_scale_override.value_or(settings.ortho_scale)) *
+                view;
+            const glm::mat4 to_world = scene_coords::nodeVisualizerWorldTransform(scene, polygon);
+            const glm::vec3 eye(glm::inverse(view)[3]);
+            const auto* const outline = scene.getCropPolygonData(polygon);
+            const float z = glm::dot(glm::vec3(to_world[2]), eye - glm::vec3(to_world[3])) >= 0.0f
+                                ? outline->half_depth
+                                : -outline->half_depth;
+            std::vector<glm::vec2> points;
+            for (const glm::vec2& vertex : outline->vertices) {
+                const glm::vec4 clip = view_projection * to_world * glm::vec4(vertex, z, 1.0f);
+                points.emplace_back((clip.x / clip.w * 0.5f + 0.5f) * 400.0f, (0.5f - clip.y / clip.w * 0.5f) * 300.0f);
+            }
+            return points;
+        };
+        const auto world = [&] {
+            std::vector<glm::vec3> points;
+            for (const glm::vec2& vertex : scene.getCropPolygonData(polygon)->vertices)
+                points.emplace_back(scene.getWorldTransform(polygon) * glm::vec4(vertex, 0.0f, 1.0f));
+            return points;
+        };
+        const auto expectSamePoint = [](const glm::vec3& actual, const glm::vec3& expected) {
+            EXPECT_NEAR(glm::distance(actual, expected), 0.0f, 1e-4f);
+        };
+        // Hover first, as a pointer does, then press with the given modifiers.
+        const auto press = [&](const glm::vec2 point, const SDL_Keymod mods) {
+            frame.mouse_x = point.x;
+            frame.mouse_y = point.y;
+            frame.key_mods = mods;
+            render();
+            frame.mouse_down[0] = frame.mouse_clicked[0] = true;
+            frame.mouse_button_events = {{.button = 0, .down = true, .x = point.x, .y = point.y}};
+            render();
+            frame.mouse_clicked[0] = false;
+            frame.mouse_button_events.clear();
+        };
+        const auto release = [&] {
+            frame.mouse_down[0] = false;
+            frame.mouse_released[0] = true;
+            frame.mouse_button_events = {{.button = 0, .down = false, .x = frame.mouse_x, .y = frame.mouse_y}};
+            render();
+            frame.mouse_released[0] = false;
+            frame.mouse_button_events.clear();
+            frame.key_mods = SDL_KMOD_NONE;
+        };
+
+        render();
+        op::undoHistory().clear();
+        const auto start = handles();
+        ASSERT_EQ(start.size(), 4u);
+        for (const glm::vec2& point : start) {
+            ASSERT_GT(point.x, 20.0f);
+            ASSERT_LT(point.x, 380.0f);
+            ASSERT_GT(point.y, 20.0f);
+            ASSERT_LT(point.y, 280.0f);
+        }
+        const auto drawn = world();
+
+        // A primary drag on vertex 0 moves it with the pointer, not the bounds corner.
+        press(start[0], SDL_KMOD_NONE);
+        EXPECT_FALSE(gui::isBoundsGizmoActive());
+        frame.mouse_x = start[0].x - 30.0f;
+        frame.mouse_y = start[0].y + 20.0f;
+        render();
+        release();
+        const auto moved = handles();
+        ASSERT_EQ(moved.size(), 4u);
+        EXPECT_NEAR(moved[0].x, start[0].x - 30.0f, 0.5f);
+        EXPECT_NEAR(moved[0].y, start[0].y + 20.0f, 0.5f);
+        const auto after_move = world();
+        for (size_t i = 1; i < 4; ++i)
+            expectSamePoint(after_move[i], drawn[i]);
+        const glm::mat4 transform = scene.getNodeById(polygon)->local_transform.get();
+        for (int axis = 0; axis < 3; ++axis)
+            EXPECT_NEAR(glm::length(glm::vec3(transform[axis])), 1.0f, 1e-5f);
+        EXPECT_EQ(op::undoHistory().undoCount(), 1u);
+
+        // The insert click puts a vertex on the edge from vertex 1 to vertex 2, under the pointer.
+        const glm::vec2 on_edge = glm::mix(moved[1], moved[2], 0.25f);
+        press(on_edge, SDL_KMOD_SHIFT);
+        release();
+        const auto inserted = handles();
+        ASSERT_EQ(inserted.size(), 5u);
+        EXPECT_NEAR(inserted[2].x, on_edge.x, 0.5f);
+        EXPECT_NEAR(inserted[2].y, on_edge.y, 0.5f);
+        const auto after_insert = world();
+        for (size_t i = 0; i < 5; ++i) {
+            if (i != 2)
+                expectSamePoint(after_insert[i], after_move[i < 2 ? i : i - 1]);
+        }
+        EXPECT_EQ(op::undoHistory().undoCount(), 2u);
+
+        // The remove click deletes it again.
+        press(inserted[2], SDL_KMOD_CTRL);
+        release();
+        ASSERT_EQ(handles().size(), 4u);
+        const auto after_remove = world();
+        for (size_t i = 0; i < 4; ++i)
+            expectSamePoint(after_remove[i], after_move[i]);
+        EXPECT_EQ(op::undoHistory().undoCount(), 3u);
+
+        for (int step = 0; step < 3; ++step)
+            ASSERT_TRUE(op::undoHistory().undo().success);
+        EXPECT_EQ(scene.getCropPolygonData(polygon)->vertices, data.vertices);
+        EXPECT_EQ(scene.getNodeById(polygon)->local_transform.get(), glm::mat4(1.0f));
+        gizmo.deactivateAllTools();
+        op::undoHistory().clear();
+    }
+
     TEST_F(WindowInputDispatchTest, EscapeCancelsViewportGizmoDragAndRestoresCamera) {
         exerciseViewportGizmoEscape();
+    }
+
+    TEST_F(WindowInputDispatchTest, ViewportGizmoOrbitKeepsTurningAtTheWindowEdgeAndOverUi) {
+        exerciseViewportGizmoEdgeDrag();
+    }
+
+    TEST_F(WindowInputDispatchTest, ViewportGizmoMarkerClickSnapsAndMarkerDragOrbits) {
+        exerciseViewportGizmoMarkerPress();
+    }
+
+    TEST_F(WindowInputDispatchTest, ViewportGizmoHoverChangesRequestAFrame) {
+        exerciseViewportGizmoHoverDemand();
     }
 
     TEST_F(WindowInputDispatchTest, SameFrameReleaseAppliesFinalTranslatePosition) {
@@ -1393,7 +1861,7 @@ namespace lfs::vis {
 
 #undef TRANSFORM_DRAG_CANCEL_TEST
 
-    TEST_F(WindowInputDispatchTest, CropScaleHandleKeepsLocalMinimumUnderNestedParents) {
+    TEST_F(WindowInputDispatchTest, CropScaleHandleChangesTransformAndPreservesExtentsUnderNestedParents) {
         auto& sm = *viewer_->getSceneManager();
         auto& scene = sm.getScene();
         auto& gizmo = gui_->gizmo();
@@ -1432,59 +1900,205 @@ namespace lfs::vis {
             gizmo.setOperation(gui::GizmoOperation::Scale);
             gizmo.setTransformSpace(TransformSpace::World);
             gizmo.updateToolState(ui, false);
-            for (int drag = 0; drag < 3; ++drag) {
-                frame.mouse_down[0] = frame.mouse_clicked[0] = frame.mouse_released[0] = false;
-                bool found = false;
-                for (int y = 105; y <= 195 && !found; ++y) {
-                    frame.mouse_x = 290.0f;
-                    frame.mouse_y = static_cast<float>(y);
-                    gizmo.renderCropBoxGizmo(ui, layout);
-                    found = gui::isScaleGizmoHovered();
-                }
-                ASSERT_TRUE(found);
-                const glm::vec2 start(frame.mouse_x, frame.mouse_y);
-                const auto drag_to = [&](const glm::vec2 end, const bool reverse = false) {
-                    frame.mouse_x = start.x;
-                    frame.mouse_y = start.y;
-                    frame.mouse_down[0] = frame.mouse_clicked[0] = true;
-                    gizmo.renderCropBoxGizmo(ui, layout);
-                    EXPECT_TRUE(gui::isScaleGizmoActive());
-                    frame.mouse_clicked[0] = false;
-                    if (reverse) {
-                        frame.mouse_x = start.x - 200.0f;
-                        gizmo.renderCropBoxGizmo(ui, layout);
-                    }
-                    frame.mouse_x = end.x;
-                    frame.mouse_y = end.y;
-                    gizmo.renderCropBoxGizmo(ui, layout);
-                    frame.mouse_down[0] = false;
-                    frame.mouse_released[0] = true;
-                    gizmo.renderCropBoxGizmo(ui, layout);
-                    frame.mouse_released[0] = false;
-                };
-                if (drag == 0 && !nested) {
-                    op::undoHistory().clear();
-                    drag_to(start + glm::vec2(24.0f, 0.0f), true);
-                    const auto grown = *scene.getNodeById(volume)->cropbox;
-                    EXPECT_EQ(grown.min, glm::vec3(-0.05f * 1.25f, data.min.y, data.min.z));
-                    EXPECT_EQ(grown.max, glm::vec3(0.05f * 1.25f, data.max.y, data.max.z));
-                    ASSERT_TRUE(op::undoHistory().undo().success);
-                    EXPECT_EQ(scene.getNodeById(volume)->cropbox->min, data.min);
-                    ASSERT_TRUE(op::undoHistory().redo().success);
-                    EXPECT_EQ(scene.getNodeById(volume)->cropbox->min, grown.min);
-                    ASSERT_TRUE(op::undoHistory().undo().success);
-                }
-                drag_to(start - glm::normalize(start - glm::vec2(200.0f, 150.0f)) * 200.0f);
-                const auto* node = scene.getNodeById(volume);
-                ASSERT_NE(node, nullptr);
-                const glm::vec3 half = (node->cropbox->max - node->cropbox->min) * 0.5f;
-                EXPECT_NEAR(half.x, 0.0005f, 1e-8f);
-                EXPECT_NEAR(half.y, nested ? 0.0005f : data.max.y, 1e-8f);
-                EXPECT_EQ(half.z, 0.05f);
+            frame.mouse_down[0] = frame.mouse_clicked[0] = frame.mouse_released[0] = false;
+            bool found = false;
+            for (int y = 105; y <= 195 && !found; ++y) {
+                frame.mouse_x = 290.0f;
+                frame.mouse_y = static_cast<float>(y);
+                gizmo.renderCropBoxGizmo(ui, layout);
+                found = gui::isScaleGizmoHovered();
             }
+            ASSERT_TRUE(found);
+            const glm::vec2 start(frame.mouse_x, frame.mouse_y);
+            const auto drag_to = [&](const glm::vec2 end, const bool reverse = false) {
+                frame.mouse_x = start.x;
+                frame.mouse_y = start.y;
+                frame.mouse_down[0] = frame.mouse_clicked[0] = true;
+                gizmo.renderCropBoxGizmo(ui, layout);
+                EXPECT_TRUE(gui::isScaleGizmoActive());
+                frame.mouse_clicked[0] = false;
+                if (reverse) {
+                    frame.mouse_x = start.x - 200.0f;
+                    gizmo.renderCropBoxGizmo(ui, layout);
+                }
+                frame.mouse_x = end.x;
+                frame.mouse_y = end.y;
+                gizmo.renderCropBoxGizmo(ui, layout);
+                frame.mouse_down[0] = false;
+                frame.mouse_released[0] = true;
+                gizmo.renderCropBoxGizmo(ui, layout);
+                frame.mouse_released[0] = false;
+            };
+            if (!nested) {
+                op::undoHistory().clear();
+                drag_to(start + glm::vec2(24.0f, 0.0f), true);
+                const auto grown = *scene.getNodeById(volume)->cropbox;
+                EXPECT_EQ(grown.min, data.min);
+                EXPECT_EQ(grown.max, data.max);
+                // The numeric scale field multiplies these same basis columns.
+                const auto scaled_transform = sm.getNodeTransform(scene.getNodeById(volume)->name);
+                EXPECT_NEAR(glm::length(glm::vec3(scaled_transform[0])), 1.25f, 1e-5f);
+                EXPECT_NEAR(glm::length(glm::vec3(scaled_transform[1])), 1.0f, 1e-5f);
+                ASSERT_TRUE(op::undoHistory().undo().success);
+                EXPECT_EQ(scene.getNodeById(volume)->cropbox->min, data.min);
+                EXPECT_NEAR(glm::length(glm::vec3(sm.getNodeTransform(scene.getNodeById(volume)->name)[0])), 1.0f, 1e-5f);
+                ASSERT_TRUE(op::undoHistory().redo().success);
+                EXPECT_EQ(scene.getNodeById(volume)->cropbox->min, grown.min);
+                EXPECT_EQ(sm.getNodeTransform(scene.getNodeById(volume)->name), scaled_transform);
+                ASSERT_TRUE(op::undoHistory().undo().success);
+            }
+            const auto world_scale = [&] {
+                const glm::mat4 world = scene.getWorldTransform(volume);
+                return glm::vec3(glm::length(glm::vec3(world[0])), glm::length(glm::vec3(world[1])),
+                                 glm::length(glm::vec3(world[2])));
+            };
+            const glm::vec3 scale_before = world_scale();
+            // Each drag can shrink to 1 %, so three drags fall far below the floor without the clamp.
+            for (int drag = 0; drag < 3; ++drag)
+                drag_to(start - glm::normalize(start - glm::vec2(200.0f, 150.0f)) * 200.0f);
+            const auto* node = scene.getNodeById(volume);
+            ASSERT_NE(node, nullptr);
+            EXPECT_EQ(node->cropbox->min, data.min);
+            EXPECT_EQ(node->cropbox->max, data.max);
+            const glm::vec3 scale = world_scale();
+            EXPECT_NEAR(scale.x, gui::gizmo_ops::MIN_VOLUME_AXIS_SCALE, 1e-6f);
+            EXPECT_NEAR(scale.y, nested ? gui::gizmo_ops::MIN_VOLUME_AXIS_SCALE : scale_before.y, 1e-5f);
+            EXPECT_NEAR(scale.z, scale_before.z, 1e-5f);
             gizmo.deactivateAllTools();
             op::undoHistory().clear();
         }
+    }
+
+    TEST_F(WindowInputDispatchTest, CropScaleHandleFloorIsReversibleWithinOneDrag) {
+        auto& sm = *viewer_->getSceneManager();
+        auto& scene = sm.getScene();
+        auto& gizmo = gui_->gizmo();
+        auto& camera = viewer_->getViewport().camera;
+        camera.t = {0.0f, 0.0f, 12.0f};
+        camera.pivot = {0.0f, 0.0f, 0.0f};
+        camera.R = rendering::makeVisualizerLookAtRotation(camera.t, camera.pivot);
+        const auto model = scene.addSplat("Floor model", lfs::test::licht::make_splat(3));
+        const auto volume = scene.addCropBox("Floor box", model);
+        core::CropBoxData data;
+        data.min = glm::vec3(-0.5f);
+        data.max = glm::vec3(0.5f);
+        scene.setCropBoxData(volume, data);
+        scene.setNodeTransform(volume, glm::scale(glm::mat4(1.0f), glm::vec3(0.05f, 1.0f, 1.0f)));
+        sm.changeContentType(SceneManager::ContentType::SplatFiles);
+        sm.selectNode(volume);
+        viewer_->getEditorContext().update(&sm, viewer_->getTrainerManager());
+        UnifiedToolRegistry::instance().setActiveTool("builtin.cropbox");
+        gizmo.setCropToolShape("box");
+        gizmo.setOperation(gui::GizmoOperation::Scale);
+        gizmo.setTransformSpace(TransformSpace::World);
+        gui::UIContext ui{.viewer = viewer_.get(), .editor = &viewer_->getEditorContext()};
+        const gui::ViewportLayout layout{.pos = {0.0f, 0.0f}, .size = {400.0f, 300.0f}};
+        gizmo.updateToolState(ui, false);
+        auto& frame = frameInput();
+        bool found = false;
+        for (int y = 105; y <= 195 && !found; ++y) {
+            frame.mouse_x = 290.0f;
+            frame.mouse_y = static_cast<float>(y);
+            gizmo.renderCropBoxGizmo(ui, layout);
+            found = gui::isScaleGizmoHovered();
+        }
+        ASSERT_TRUE(found);
+        const glm::vec2 start(frame.mouse_x, frame.mouse_y);
+        const auto x_scale = [&] { return glm::length(glm::vec3(scene.getWorldTransform(volume)[0])); };
+        frame.mouse_down[0] = frame.mouse_clicked[0] = true;
+        gizmo.renderCropBoxGizmo(ui, layout);
+        ASSERT_TRUE(gui::isScaleGizmoActive());
+        frame.mouse_clicked[0] = false;
+        // Past the centre the gizmo factor bottoms out at 1 %, far below the 0.001 floor here.
+        const glm::vec2 past_center = start - glm::normalize(start - glm::vec2(200.0f, 150.0f)) * 200.0f;
+        frame.mouse_x = past_center.x;
+        frame.mouse_y = past_center.y;
+        gizmo.renderCropBoxGizmo(ui, layout);
+        frame.mouse_x = start.x;
+        frame.mouse_y = start.y;
+        gizmo.renderCropBoxGizmo(ui, layout);
+        frame.mouse_down[0] = false;
+        frame.mouse_released[0] = true;
+        gizmo.renderCropBoxGizmo(ui, layout);
+        frame.mouse_released[0] = false;
+        // Chaining per-frame deltas onto the clamped transform would end at 0.1 instead.
+        EXPECT_NEAR(x_scale(), 0.05f, 1e-5f);
+        gizmo.deactivateAllTools();
+        op::undoHistory().clear();
+    }
+
+    TEST_F(WindowInputDispatchTest, EllipsoidScaleHandleMatchesNumericTransformScale) {
+        auto& sm = *viewer_->getSceneManager();
+        auto& scene = sm.getScene();
+        auto& gizmo = gui_->gizmo();
+        auto& camera = viewer_->getViewport().camera;
+        camera.t = {0.0f, 0.0f, 12.0f};
+        camera.pivot = {0.0f, 0.0f, 0.0f};
+        camera.R = rendering::makeVisualizerLookAtRotation(camera.t, camera.pivot);
+        const auto model = scene.addSplat("Scale model", lfs::test::licht::make_splat(3));
+        const auto volume = scene.addEllipsoid("Scale ellipsoid", model);
+        core::EllipsoidData data;
+        data.radii = glm::vec3(0.05f);
+        scene.setEllipsoidData(volume, data);
+        sm.changeContentType(SceneManager::ContentType::SplatFiles);
+        sm.selectNode(volume);
+        viewer_->getEditorContext().update(&sm, viewer_->getTrainerManager());
+        UnifiedToolRegistry::instance().setActiveTool("builtin.cropbox");
+        gizmo.setCropToolShape("ellipsoid");
+        gizmo.setOperation(gui::GizmoOperation::Scale);
+        gui::UIContext ui{.viewer = viewer_.get(), .editor = &viewer_->getEditorContext()};
+        const gui::ViewportLayout layout{.pos = {0.0f, 0.0f}, .size = {400.0f, 300.0f}};
+        gizmo.updateToolState(ui, false);
+        const auto original = sm.getNodeTransform(scene.getNodeById(volume)->name);
+        auto& frame = frameInput();
+        bool found = false;
+        for (int y = 105; y <= 195 && !found; ++y) {
+            frame.mouse_x = 290.0f;
+            frame.mouse_y = static_cast<float>(y);
+            gizmo.renderEllipsoidGizmo(ui, layout);
+            found = gui::isScaleGizmoHovered();
+        }
+        ASSERT_TRUE(found);
+        frame.mouse_down[0] = frame.mouse_clicked[0] = true;
+        gizmo.renderEllipsoidGizmo(ui, layout);
+        ASSERT_TRUE(gui::isScaleGizmoActive());
+        frame.mouse_clicked[0] = false;
+        frame.mouse_x += 24.0f;
+        gizmo.renderEllipsoidGizmo(ui, layout);
+        frame.mouse_down[0] = false;
+        frame.mouse_released[0] = true;
+        gizmo.renderEllipsoidGizmo(ui, layout);
+        frame.mouse_released[0] = false;
+        const auto* node = scene.getNodeById(volume);
+        EXPECT_EQ(node->ellipsoid->radii, data.radii);
+        const auto expected = glm::scale(original, glm::vec3(1.25f, 1.0f, 1.0f));
+        const auto actual = sm.getNodeTransform(node->name);
+        for (int column = 0; column < 4; ++column)
+            for (int row = 0; row < 4; ++row)
+                EXPECT_NEAR(actual[column][row], expected[column][row], 1e-5f);
+
+        const glm::vec2 start(290.0f, frame.mouse_y);
+        const glm::vec2 end = start - glm::normalize(start - glm::vec2(200.0f, 150.0f)) * 200.0f;
+        for (int drag = 0; drag < 3; ++drag) {
+            frame.mouse_x = start.x;
+            frame.mouse_y = start.y;
+            frame.mouse_down[0] = frame.mouse_clicked[0] = true;
+            gizmo.renderEllipsoidGizmo(ui, layout);
+            ASSERT_TRUE(gui::isScaleGizmoActive());
+            frame.mouse_clicked[0] = false;
+            frame.mouse_x = end.x;
+            frame.mouse_y = end.y;
+            gizmo.renderEllipsoidGizmo(ui, layout);
+            frame.mouse_down[0] = false;
+            frame.mouse_released[0] = true;
+            gizmo.renderEllipsoidGizmo(ui, layout);
+            frame.mouse_released[0] = false;
+        }
+        const glm::mat4 world = scene.getWorldTransform(volume);
+        EXPECT_NEAR(glm::length(glm::vec3(world[0])), gui::gizmo_ops::MIN_VOLUME_AXIS_SCALE, 1e-6f);
+        EXPECT_EQ(scene.getNodeById(volume)->ellipsoid->radii, data.radii);
+        gizmo.deactivateAllTools();
+        op::undoHistory().clear();
     }
 
     TEST_F(WindowInputDispatchTest, CropToolGizmoDrawsInEveryIndependentSplitPanel) {
@@ -1957,6 +2571,32 @@ namespace lfs::vis {
         chart->RemoveEventListener("click", &recorder);
     }
 
+    TEST_F(WindowInputDispatchTest, FloatingCloseButtonDisablesItsPanel) {
+        gui::RmlPanelHost host(&manager(), "test.input_float", "");
+        attachInputHost(host, 180, 100,
+                        "<rml><head><style>body { width:180px; height:100px; }</style></head>"
+                        "<body id='window-frame'><div id='title-bar'><span id='close-btn'>x</span></div>"
+                        "<div id='body'>log</div></body></rml>");
+        host.setFloating(true);
+        host.getContext()->Update();
+        registerInputFloat();
+        forwardHost(host, 100, 60);
+        ASSERT_TRUE(gui::PanelRegistry::instance().is_panel_enabled("test.input_float"));
+
+        click(120, 140);
+        EXPECT_TRUE(gui::PanelRegistry::instance().is_panel_enabled("test.input_float"));
+
+        auto* button = host.getDocument()->GetElementById("close-btn");
+        ASSERT_NE(button, nullptr);
+        const auto origin = button->GetAbsoluteOffset(Rml::BoxArea::Border);
+        const auto size = button->GetBox().GetSize(Rml::BoxArea::Border);
+        ASSERT_GT(size.x, 0.f);
+        ASSERT_GT(size.y, 0.f);
+        click(100 + static_cast<int>(origin.x + size.x * 0.5f),
+              60 + static_cast<int>(origin.y + size.y * 0.5f));
+        EXPECT_FALSE(gui::PanelRegistry::instance().is_panel_enabled("test.input_float"));
+    }
+
     TEST_F(WindowInputDispatchTest, FloatingOcclusionPreservesDockedGestureOwnership) {
         gui::RmlPanelHost docked(&manager(), "test-input-drag", "");
         attachInputHost(docked, 400, 300,
@@ -2000,6 +2640,110 @@ namespace lfs::vis {
         EXPECT_EQ(docked.getContext()->GetHoverElement(), chart);
         chart->RemoveEventListener("mousedown", &recorder);
         chart->RemoveEventListener("mouseup", &recorder);
+    }
+
+    TEST_F(WindowInputDispatchTest, EnterThatOpensATextInputLeavesItFocused) {
+        // ScrubFieldController opens its text input from the field's Enter key-down.
+        struct OpenEditor final : Rml::EventListener {
+            Rml::Element* editor = nullptr;
+            void ProcessEvent(Rml::Event& event) override {
+                if (event.GetParameter<int>("key_identifier", 0) == Rml::Input::KI_RETURN)
+                    editor->Focus();
+            }
+        } open_editor;
+        gui::RmlPanelHost host(&manager(), "test-input-enter", "");
+        attachInputHost(host, 200, 100,
+                        "<rml><head><style>body { width:200px; height:100px; }</style></head>"
+                        "<body><div id='field' class='scrub-field'>1</div>"
+                        "<input id='editor' type='text'/></body></rml>");
+        auto* const field = host.getDocument()->GetElementById("field");
+        auto* const editor = host.getDocument()->GetElementById("editor");
+        open_editor.editor = editor;
+        field->AddEventListener(Rml::EventId::Keydown, &open_editor);
+        setKeyboardContext(host.getContext(), false);
+        const auto press_enter = [&] {
+            forwardHost(host, 0, 0);
+            key(SDL_SCANCODE_RETURN);
+        };
+        ASSERT_TRUE(field->Focus());
+        press_enter();
+        EXPECT_EQ(host.getContext()->GetFocusElement(), editor);
+        // Enter in an input that already had focus still ends the edit.
+        press_enter();
+        EXPECT_NE(host.getContext()->GetFocusElement(), editor);
+        field->RemoveEventListener(Rml::EventId::Keydown, &open_editor);
+    }
+
+    TEST_F(WindowInputDispatchTest, CapturedReleaseOutsidePanelEndsScrubDrag) {
+        // Body listeners match ScrubFieldController: press the field, move and release on the body.
+        struct Scrub final : Rml::EventListener {
+            bool active = false;
+            float value = 1.f, x = 0.f;
+            int ups = 0, clicks = 0;
+            void ProcessEvent(Rml::Event& event) override {
+                const float mx = event.GetParameter("mouse_x", 0.f);
+                if (event.GetId() == Rml::EventId::Mousedown) {
+                    active = true;
+                    x = mx;
+                } else if (event.GetId() == Rml::EventId::Mousemove && active) {
+                    value += (mx - x) * 0.01f;
+                    x = mx;
+                } else if (event.GetId() == Rml::EventId::Mouseup && active) {
+                    active = false;
+                    ++ups;
+                } else if (event.GetId() == Rml::EventId::Click) {
+                    ++clicks;
+                }
+            }
+        } scrub;
+        gui::RmlPanelHost host(&manager(), "test-scrub-release", "");
+        attachInputHost(host, 200, 160,
+                        "<rml><head><style>body{width:200px;height:160px;}"
+                        "#field{position:absolute;left:20px;top:40px;width:100px;height:28px;}"
+                        "</style></head><body id='body'><div id='field'/></body></rml>");
+        forwardHost(host, 0, 0);
+        auto* field = host.getDocument()->GetElementById("field");
+        auto* body = host.getDocument()->GetElementById("body");
+        ASSERT_NE(field, nullptr);
+        ASSERT_NE(body, nullptr);
+        field->AddEventListener(Rml::EventId::Mousedown, &scrub);
+        field->AddEventListener(Rml::EventId::Click, &scrub);
+        body->AddEventListener(Rml::EventId::Mousemove, &scrub);
+        body->AddEventListener(Rml::EventId::Mouseup, &scrub);
+        const auto at = [&](uint32_t type, float x, float y) {
+            SDL_Event event{};
+            event.type = type;
+            if (type == SDL_EVENT_MOUSE_MOTION) {
+                event.motion.x = x;
+                event.motion.y = y;
+            } else {
+                event.button.button = SDL_BUTTON_LEFT;
+                event.button.x = x;
+                event.button.y = y;
+            }
+            dispatch(event);
+        };
+        at(SDL_EVENT_MOUSE_BUTTON_DOWN, 70, 54);
+        at(SDL_EVENT_MOUSE_MOTION, 150, 54);
+        const float dragged = scrub.value;
+        ASSERT_GT(dragged, 1.f);
+        ASSERT_TRUE(scrub.active);
+        at(SDL_EVENT_MOUSE_MOTION, 320, 200);
+        ASSERT_FLOAT_EQ(scrub.value, dragged);
+        at(SDL_EVENT_MOUSE_BUTTON_UP, 320, 200);
+        at(SDL_EVENT_MOUSE_MOTION, 70, 54);
+        EXPECT_FALSE(scrub.active);
+        EXPECT_EQ(scrub.ups, 1);
+        EXPECT_FLOAT_EQ(scrub.value, dragged);
+        EXPECT_EQ(scrub.clicks, 0);
+        at(SDL_EVENT_MOUSE_BUTTON_DOWN, 70, 54);
+        at(SDL_EVENT_MOUSE_BUTTON_UP, 70, 54);
+        EXPECT_EQ(scrub.clicks, 1);
+        EXPECT_FALSE(scrub.active);
+        field->RemoveEventListener(Rml::EventId::Mousedown, &scrub);
+        field->RemoveEventListener(Rml::EventId::Click, &scrub);
+        body->RemoveEventListener(Rml::EventId::Mousemove, &scrub);
+        body->RemoveEventListener(Rml::EventId::Mouseup, &scrub);
     }
 
     TEST_F(WindowInputDispatchTest, DispatchReusesEventStorage) {
@@ -2270,6 +3014,36 @@ namespace lfs::vis {
         EXPECT_NE(overlay_context->GetFocusElement(), overlay_select);
         click(60, 180);
         EXPECT_FALSE(overlay_select->IsSelectBoxVisible());
+    }
+
+    // Fails if a tab picked while the strip overflows stays scrolled out of view.
+    TEST_F(WindowInputDispatchTest, ActiveTabScrollsIntoTheOverflowingStrip) {
+        gui::RmlRightPanel right_panel;
+        right_panel.init(&manager());
+        struct Shutdown {
+            gui::RmlRightPanel& panel;
+            ~Shutdown() { panel.shutdown(); }
+        } shutdown{right_panel};
+        gui::RightPanelLayout layout;
+        // The four tabs overflow the strip, but each one fits inside it.
+        layout.size = {150.0f, 160.0f};
+        std::vector<gui::TabSnapshot> tabs;
+        for (const char* id : {"first", "second", "third", "fourth"})
+            tabs.push_back({.id = id, .label = id, .dom_id = std::string("rp-tab-") + id});
+        auto* const document = Rml::GetContext("right_panel")->GetDocument(0);
+        auto* const strip = document->GetElementById("tab-strip-viewport");
+        ASSERT_NE(strip, nullptr);
+        for (const char* active : {"first", "fourth", "second"}) {
+            SCOPED_TRACE(active);
+            right_panel.render(layout, tabs, active, 0.0f, 0.0f, 400, 300);
+            auto* const tab = document->GetElementById(std::string("rp-tab-") + active);
+            ASSERT_NE(tab, nullptr);
+            EXPECT_GT(strip->GetScrollHeight(), strip->GetClientHeight());
+            ASSERT_LE(tab->GetOffsetHeight(), strip->GetClientHeight());
+            const float top = tab->GetAbsoluteTop() - strip->GetAbsoluteTop();
+            EXPECT_GE(top, -0.5f);
+            EXPECT_LE(top + tab->GetOffsetHeight(), strip->GetClientHeight() + 0.5f);
+        }
     }
 
     TEST_F(WindowInputDispatchTest, SequencerEditShortcutsRespectTextFocusAndVisibility) {

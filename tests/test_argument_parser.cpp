@@ -15,6 +15,7 @@
 using lfs::core::param::apply_explicit_training_overrides;
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -58,6 +59,49 @@ TEST(ArgumentParserTest, DataPathLichtWithoutOutputPathBindsProject) {
     EXPECT_TRUE((*parsed)->dataset.data_path.empty());
     EXPECT_TRUE((*parsed)->dataset.output_path.empty());
     EXPECT_FALSE((*parsed)->dataset.output_path_explicit);
+}
+
+// Catches input paths stored as typed: a project trained from paths relative to the launch folder could not find its
+// images or initial splats when evaluated or resumed from another folder.
+TEST(ArgumentParserTest, RelativeInputPathsAreStoredAbsolute) {
+    const auto launch = std::filesystem::path(make_test_path("lfs_arg_parser_relative_inputs"));
+    std::filesystem::create_directories(launch / "scene");
+    std::ofstream(launch / "scene" / "init.ply").put('\n');
+    std::ofstream(launch / "scene" / "extra.ply").put('\n');
+    const auto output = make_test_path("lfs_arg_parser_relative_inputs_output");
+
+    const auto previous = std::filesystem::current_path();
+    std::filesystem::current_path(launch);
+    const auto cwd = std::filesystem::current_path();
+    const char* argv[] = {
+        "LichtFeld-Studio", "--headless", "-d", "scene", "-o", output.c_str(),
+        "--init", "./scene/init.ply", "--add-splat", "scene/../scene/extra.ply"};
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    std::filesystem::current_path(previous);
+
+    ASSERT_TRUE(parsed) << parsed.error();
+    EXPECT_EQ((*parsed)->dataset.data_path, cwd / "scene");
+    ASSERT_TRUE((*parsed)->init_path);
+    EXPECT_EQ(lfs::core::utf8_to_path(*(*parsed)->init_path), cwd / "scene" / "init.ply");
+    ASSERT_EQ((*parsed)->add_splat_paths.size(), 1u);
+    EXPECT_EQ((*parsed)->add_splat_paths[0], cwd / "scene" / "extra.ply");
+}
+
+// Catches the flag not reaching the optimization parameters or values the converter cannot allocate passing parse.
+TEST(ArgumentParserTest, InitMeshResolutionIsParsedAndBounded) {
+    const auto data_path = make_test_path("lfs_arg_parser_mesh_resolution_data");
+    const auto output_path = make_test_path("lfs_arg_parser_mesh_resolution_output");
+    for (const auto& [value, accepted] : {std::pair{"512", true}, std::pair{"15", false}, std::pair{"2049", false}}) {
+        const char* argv[] = {
+            "LichtFeld-Studio", "--headless", "--data-path", data_path.c_str(),
+            "--output-path", output_path.c_str(), "--init-mesh-resolution", value};
+        const auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+        ASSERT_EQ(parsed.has_value(), accepted) << value;
+        if (accepted)
+            EXPECT_EQ((*parsed)->optimization.init_mesh_resolution, 512);
+        else
+            EXPECT_NE(parsed.error().find("init_mesh_resolution"), std::string::npos) << parsed.error();
+    }
 }
 
 TEST(ArgumentParserTest, RejectsUnknownLogLevels) {
@@ -169,7 +213,6 @@ TEST(ArgumentParserTest, CompareSubcommandParsesAndRejectsTrainedModelMasks) {
              {"LichtFeld-Studio", "compare", reference.c_str(), test.c_str(), "--eval-mask", "points:2,3"},
              {"LichtFeld-Studio", "compare", reference.c_str(), test.c_str(), "--eval-mask", splat_spec.c_str(),
               "--eval-mask-opacity", "1.5"},
-             {"LichtFeld-Studio", "compare", reference.c_str(), test.c_str(), "--eval-mask-invert"},
              {"LichtFeld-Studio", "compare", reference.c_str(), splat.c_str()}}) {
         EXPECT_FALSE(lfs::core::args::parse_args(static_cast<int>(bad.size()), bad.data())) << bad.back();
     }
@@ -1116,6 +1159,63 @@ TEST(ArgumentParserTest, LichtRejectsMissingArgumentsAndAcceptsHelp) {
     }
 }
 
+TEST(ArgumentParserTest, LichtParsesCheckpointActions) {
+    const auto root = std::filesystem::path(
+        make_test_path("lfs_arg_parser_licht_checkpoints"));
+    const auto project = root / "project.licht";
+    std::ofstream(project).put('\n');
+    const auto project_text = project.string();
+    using Action = lfs::core::args::LichtMode::Action;
+    const auto parse = [&](std::vector<const char*> arguments) {
+        arguments.insert(arguments.begin(), {"LichtFeld-Studio", "licht", project_text.c_str()});
+        return lfs::core::args::parse_args(static_cast<int>(arguments.size()), arguments.data());
+    };
+    const auto mode = [](const auto& parsed) {
+        return std::get_if<lfs::core::args::LichtMode>(&*parsed);
+    };
+    {
+        const auto parsed = parse({"--checkpoints"});
+        ASSERT_TRUE(parsed) << parsed.error();
+        ASSERT_NE(mode(parsed), nullptr);
+        EXPECT_EQ(mode(parsed)->action, Action::LIST_CHECKPOINTS);
+    }
+    {
+        const auto parsed = parse({"--prune-checkpoints"});
+        ASSERT_TRUE(parsed) << parsed.error();
+        ASSERT_NE(mode(parsed), nullptr);
+        EXPECT_EQ(mode(parsed)->action, Action::PRUNE_CHECKPOINTS);
+        EXPECT_EQ(mode(parsed)->keep_checkpoints, 0u);
+    }
+    {
+        const auto parsed = parse({"--prune-checkpoints", "--keep", "2"});
+        ASSERT_TRUE(parsed) << parsed.error();
+        ASSERT_NE(mode(parsed), nullptr);
+        EXPECT_EQ(mode(parsed)->keep_checkpoints, 2u);
+    }
+    {
+        const auto parsed = parse({"--remove-checkpoints", "15000,7000,15000"});
+        ASSERT_TRUE(parsed) << parsed.error();
+        ASSERT_NE(mode(parsed), nullptr);
+        EXPECT_EQ(mode(parsed)->action, Action::REMOVE_CHECKPOINTS);
+        EXPECT_EQ(mode(parsed)->checkpoint_iterations, (std::vector<std::int32_t>{7000, 15000}));
+    }
+    for (const auto& arguments : std::vector<std::vector<const char*>>{
+             {"--prune-checkpoints", "--keep"},
+             {"--prune-checkpoints", "--keep", "-1"},
+             {"--prune-checkpoints", "--keep", "two"},
+             {"--prune-checkpoints", "--keep", "1", "extra"},
+             {"--prune-checkpoints", "7000"},
+             {"--remove-checkpoints"},
+             {"--remove-checkpoints", "7000,,15000"},
+             {"--remove-checkpoints", "7000x"},
+             {"--checkpoints", "extra"},
+             {"--compact"},
+         }) {
+        const auto parsed = parse(arguments);
+        EXPECT_FALSE(parsed) << arguments.front();
+    }
+}
+
 TEST(ArgumentParserTest, Mesh2SplatRejectsOutputSuffixThatConflictsWithFormat) {
     const auto directory = std::filesystem::path(
         make_test_path("lfs_arg_parser_mesh2splat_suffix"));
@@ -1391,6 +1491,166 @@ TEST(ArgumentParserTest, TrainingParsesCropBoxLossWeight) {
     EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_loss_weight, 0.4f);
 }
 
+// Catches the color variance flags not reaching the training parameters, also beside the
+// exposure correction MRNF turns on by default.
+TEST(ArgumentParserTest, TrainingParsesColorVarianceLoss) {
+    const auto data_path = make_test_path("lfs_arg_parser_color_variance_data");
+    const auto output_path = make_test_path("lfs_arg_parser_color_variance_output");
+    const auto parse = [&](const char* warmup) {
+        const char* argv[] = {
+            "LichtFeld-Studio", "--headless", "--data-path", data_path.c_str(), "--output-path", output_path.c_str(),
+            "--color-variance-weight", "0.5", warmup};
+        return lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    };
+
+    auto parsed = parse("--color-variance-warmup-iters=15000");
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_TRUE((*parsed)->optimization.use_exposure_correction);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.color_variance_weight, 0.5f);
+    EXPECT_EQ((*parsed)->optimization.color_variance_warmup_iters, 15000u);
+    EXPECT_TRUE((*parsed)->cli_step_values_set);
+    EXPECT_FALSE(parse("--color-variance-warmup-iters=-1").has_value());
+}
+
+TEST(ArgumentParserTest, TrainingParsesCropBoxRegionOfInterest) {
+    const auto data_path = make_test_path("lfs_arg_parser_cropbox_data");
+    const auto output_path = make_test_path("lfs_arg_parser_cropbox_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--cropbox",
+        "-0.5, -0.25,0,0.5,0.25 ,1.75",
+        "--cropbox-loss-weight",
+        "0"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    ASSERT_TRUE((*parsed)->cropbox.has_value());
+    EXPECT_EQ(*(*parsed)->cropbox, (std::array<float, 6>{-0.5f, -0.25f, 0.f, 0.5f, 0.25f, 1.75f}));
+    EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_loss_weight, 0.f);
+}
+
+// Catches --crop not reaching the training parameters, or being on without the flag.
+TEST(ArgumentParserTest, TrainingParsesCropAtTheEnd) {
+    const auto data_path = make_test_path("lfs_arg_parser_crop_data");
+    const auto output_path = make_test_path("lfs_arg_parser_crop_output");
+    const auto parse = [&](const bool crop) {
+        std::vector<const char*> argv{"LichtFeld-Studio", "--headless", "--data-path", data_path.c_str(),
+                                      "--output-path", output_path.c_str(), "--cropbox", "-1,-1,-1,1,1,1"};
+        if (crop)
+            argv.push_back("--crop");
+        return lfs::core::args::parse_args_and_params(static_cast<int>(argv.size()), argv.data());
+    };
+
+    const auto cropped = parse(true);
+    ASSERT_TRUE(cropped.has_value()) << cropped.error();
+    EXPECT_TRUE((*cropped)->optimization.crop_to_cropbox);
+
+    const auto kept = parse(false);
+    ASSERT_TRUE(kept.has_value()) << kept.error();
+    EXPECT_FALSE((*kept)->optimization.crop_to_cropbox);
+}
+
+// Catches --crop accepted without a region of interest to crop to.
+TEST(ArgumentParserTest, TrainingRejectsCropWithoutCropBox) {
+    const auto data_path = make_test_path("lfs_arg_parser_crop_without_box_data");
+    const auto output_path = make_test_path("lfs_arg_parser_crop_without_box_output");
+    const char* argv[] = {"LichtFeld-Studio", "--headless", "--data-path", data_path.c_str(),
+                          "--output-path", output_path.c_str(), "--crop"};
+
+    const auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_NE(parsed.error().find("--cropbox"), std::string::npos);
+}
+
+TEST(ArgumentParserTest, TrainingRejectsCropBoxWithoutVolume) {
+    const auto data_path = make_test_path("lfs_arg_parser_invalid_cropbox_data");
+    const auto output_path = make_test_path("lfs_arg_parser_invalid_cropbox_output");
+
+    for (const char* box : {"0,0,0,1,1", "0,0,0,1,1,1,1", "0,0,1,1,1,1", "a,0,0,1,1,1"}) {
+        SCOPED_TRACE(box);
+        const char* argv[] = {
+            "LichtFeld-Studio",
+            "--headless",
+            "--data-path",
+            data_path.c_str(),
+            "--output-path",
+            output_path.c_str(),
+            "--cropbox",
+            box};
+
+        auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_NE(parsed.error().find("Invalid --cropbox"), std::string::npos) << parsed.error();
+    }
+}
+
+// Catches --cropbox-rotation not reaching the parameters or training_config.json, or set without the flag.
+TEST(ArgumentParserTest, TrainingParsesCropBoxRotation) {
+    const auto data_path = make_test_path("lfs_arg_parser_cropbox_rotation_data");
+    const auto output_path = make_test_path("lfs_arg_parser_cropbox_rotation_output");
+    const auto parse = [&](const char* rotation) {
+        std::vector<const char*> argv{"LichtFeld-Studio", "--headless", "--data-path", data_path.c_str(),
+                                      "--output-path", output_path.c_str(), "--cropbox", "-1,-2,-3,1,2,3"};
+        if (rotation) {
+            argv.push_back("--cropbox-rotation");
+            argv.push_back(rotation);
+        }
+        return lfs::core::args::parse_args_and_params(static_cast<int>(argv.size()), argv.data());
+    };
+
+    const auto rotated = parse("-30, 45.5 ,400");
+    ASSERT_TRUE(rotated.has_value()) << rotated.error();
+    ASSERT_TRUE((*rotated)->cropbox_rotation.has_value());
+    EXPECT_EQ(*(*rotated)->cropbox_rotation, (std::array<float, 3>{-30.f, 45.5f, 400.f}));
+
+    const auto config_path = std::filesystem::path(make_test_path("lfs_arg_parser_cropbox_rotation_config")) /
+                             "training_config.json";
+    const auto saved = lfs::core::param::save_training_parameters_to_json(**rotated, config_path);
+    ASSERT_TRUE(saved.has_value()) << saved.error();
+    std::ifstream config_file(config_path);
+    const auto config = nlohmann::json::parse(config_file);
+    EXPECT_EQ(config.at("cropbox"), nlohmann::json::parse("[-1, -2, -3, 1, 2, 3]"));
+    EXPECT_EQ(config.at("cropbox_rotation"), nlohmann::json::parse("[-30, 45.5, 400]"));
+
+    const auto unrotated = parse(nullptr);
+    ASSERT_TRUE(unrotated.has_value()) << unrotated.error();
+    EXPECT_FALSE((*unrotated)->cropbox_rotation.has_value());
+}
+
+TEST(ArgumentParserTest, TrainingRejectsCropBoxRotationWithoutCropBox) {
+    const auto data_path = make_test_path("lfs_arg_parser_cropbox_rotation_without_box_data");
+    const auto output_path = make_test_path("lfs_arg_parser_cropbox_rotation_without_box_output");
+    const char* argv[] = {"LichtFeld-Studio", "--headless", "--data-path", data_path.c_str(),
+                          "--output-path", output_path.c_str(), "--cropbox-rotation", "0,0,30"};
+
+    const auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_NE(parsed.error().find("--cropbox-rotation"), std::string::npos) << parsed.error();
+    EXPECT_NE(parsed.error().find("needs --cropbox"), std::string::npos) << parsed.error();
+}
+
+TEST(ArgumentParserTest, TrainingRejectsCropBoxRotationWithoutThreeFiniteNumbers) {
+    const auto data_path = make_test_path("lfs_arg_parser_invalid_cropbox_rotation_data");
+    const auto output_path = make_test_path("lfs_arg_parser_invalid_cropbox_rotation_output");
+
+    for (const char* rotation : {"0,30", "0,0,30,0", "0,,30", "a,0,0", "nan,0,0", "0,inf,0", "0,0,1e40"}) {
+        SCOPED_TRACE(rotation);
+        const char* argv[] = {"LichtFeld-Studio", "--headless", "--data-path", data_path.c_str(),
+                              "--output-path", output_path.c_str(), "--cropbox", "-1,-1,-1,1,1,1",
+                              "--cropbox-rotation", rotation};
+
+        const auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_NE(parsed.error().find("Invalid --cropbox-rotation"), std::string::npos) << parsed.error();
+    }
+}
+
 TEST(ArgumentParserTest, TrainingRejectsCropBoxLossWeightOutsideUnitInterval) {
     const auto data_path = make_test_path("lfs_arg_parser_invalid_cropbox_loss_weight_data");
     const auto output_path = make_test_path("lfs_arg_parser_invalid_cropbox_loss_weight_output");
@@ -1569,6 +1829,41 @@ TEST(ArgumentParserTest, TrainingRejectsOutOfRangeNumericFlags) {
         static_cast<int>(zero_warmup_argv.size()), zero_warmup_argv.data());
     ASSERT_TRUE(parsed.has_value()) << parsed.error();
     EXPECT_EQ((*parsed)->optimization.perf_bench_warmup, 0);
+}
+
+// Sharpen flags reach LoadingParams and the --resume overlay; out-of-range values and unknown kernels are rejected.
+TEST(ArgumentParserTest, SharpenFlagsLandInLoadingParamsAndRejectOutOfRangeValues) {
+    const auto data_path = make_test_path("lfs_arg_parser_sharpen_data");
+    const auto output_path = make_test_path("lfs_arg_parser_sharpen_output");
+    const auto parse = [&](const std::vector<std::string>& extra) {
+        std::vector<std::string> args{"LichtFeld-Studio", "--headless", "--data-path", data_path, "--output-path", output_path};
+        args.insert(args.end(), extra.begin(), extra.end());
+        std::vector<const char*> argv;
+        for (const auto& arg : args)
+            argv.push_back(arg.c_str());
+        return lfs::core::args::parse_args_and_params(static_cast<int>(argv.size()), argv.data());
+    };
+
+    auto parsed = parse({"--sharpen-kernel", "laplacian8", "--sharpen-amount", "1.5", "--sharpen-threshold", "0.02"});
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    const auto& sharpen = (*parsed)->dataset.loading_params.sharpen;
+    EXPECT_EQ(sharpen.kernel, lfs::core::SharpenKernel::Laplacian8);
+    EXPECT_FLOAT_EQ(sharpen.amount, 1.5f);
+    EXPECT_FLOAT_EQ(sharpen.radius, 1.0f);
+    EXPECT_FLOAT_EQ(sharpen.threshold, 0.02f);
+    const auto overlay = nlohmann::json::parse((*parsed)->overrides.dataset_json);
+    EXPECT_EQ(overlay["loading_params"]["sharpen_kernel"], "laplacian8");
+    EXPECT_FLOAT_EQ(overlay["loading_params"]["sharpen_amount"].get<float>(), 1.5f);
+    EXPECT_FALSE(overlay["loading_params"].contains("sharpen_radius"));
+
+    for (const auto& [flag, value, field] : {std::array<std::string, 3>{"--sharpen-amount", "5.5", "sharpen_amount"},
+                                             std::array<std::string, 3>{"--sharpen-radius", "0.1", "sharpen_radius"},
+                                             std::array<std::string, 3>{"--sharpen-threshold", "1.5", "sharpen_threshold"},
+                                             std::array<std::string, 3>{"--sharpen-kernel", "box", "'box'"}}) {
+        const auto rejected = parse({flag, value});
+        ASSERT_FALSE(rejected.has_value()) << flag;
+        EXPECT_NE(rejected.error().find(field), std::string::npos) << rejected.error();
+    }
 }
 
 TEST(ArgumentParserTest, NegativeShDegreeIntervalReportsSuppliedValue) {
@@ -2563,7 +2858,6 @@ TEST(ArgumentParserTest, EvalMeshMaskStoresAbsolutePathAndSurvivesResume) {
         "--eval",
         "--eval-mask",
         spec.c_str(),
-        "--eval-mask-invert",
     };
     const auto parsed = lfs::core::args::parse_args_and_params(
         static_cast<int>(std::size(argv)), argv);
@@ -2571,21 +2865,16 @@ TEST(ArgumentParserTest, EvalMeshMaskStoresAbsolutePathAndSurvivesResume) {
     const auto expected = lfs::core::path_to_utf8(
         std::filesystem::weakly_canonical(mesh));
     EXPECT_EQ((*parsed)->optimization.eval_mask, expected);
-    EXPECT_TRUE((*parsed)->optimization.eval_mask_invert);
     EXPECT_TRUE((*parsed)->overrides.has_optimization_key("eval_mask"));
-    EXPECT_TRUE((*parsed)->overrides.has_optimization_key("eval_mask_invert"));
 
     const auto round_trip = lfs::core::param::OptimizationParameters::from_json(
         (*parsed)->optimization.to_json());
     EXPECT_EQ(round_trip.eval_mask, expected);
-    EXPECT_TRUE(round_trip.eval_mask_invert);
 
     lfs::core::param::TrainingParameters restored;
     restored.optimization.eval_mask.clear();
-    restored.optimization.eval_mask_invert = false;
     apply_explicit_training_overrides(restored, (*parsed)->overrides);
     EXPECT_EQ(restored.optimization.eval_mask, expected);
-    EXPECT_TRUE(restored.optimization.eval_mask_invert);
 }
 
 // Catches a box spec that is stored unnormalized, lost on resume, or accepted when malformed.
@@ -2608,6 +2897,59 @@ TEST(ArgumentParserTest, EvalBoxMaskNormalizesSurvivesResumeAndRejectsMalformedB
         params.eval_mask = spec;
         EXPECT_FALSE(params.validate().empty()) << spec;
     }
+}
+
+// Catches report lists that lose their order, are not stored in the project and the explicit overrides, accept an
+// entry they cannot score or turn on without an evaluation or a mask; and compare ignoring the option.
+TEST(ArgumentParserTest, EvalMaskReportKeepsTheOrderSurvivesResumeAndRejectsBadLists) {
+    const auto parse = [](const char* report) {
+        const char* argv[] = {"LichtFeld-Studio", "--eval", "--eval-mask", "bbox:-1,-1,-1,1,1,1", report};
+        return lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    };
+    for (const auto& [report, stored] : {std::pair{"--eval-mask-report=mask", "mask"},
+                                         std::pair{"--eval-mask-report=inverted, mask", "inverted,mask"},
+                                         std::pair{"--eval-mask-report=unmasked,inverted,mask", "unmasked,inverted,mask"}}) {
+        SCOPED_TRACE(report);
+        const auto parsed = parse(report);
+        ASSERT_TRUE(parsed) << parsed.error();
+        EXPECT_EQ((*parsed)->optimization.eval_mask_report, stored);
+        EXPECT_EQ(lfs::core::param::OptimizationParameters::from_json((*parsed)->optimization.to_json()).eval_mask_report,
+                  stored);
+        lfs::core::param::TrainingParameters restored;
+        apply_explicit_training_overrides(restored, (*parsed)->overrides);
+        EXPECT_EQ(restored.optimization.eval_mask_report, stored);
+    }
+
+    for (const char* bad : {"--eval-mask-report=mask,background", "--eval-mask-report=mask,mask",
+                            "--eval-mask-report=mask,", "--eval-mask-report="}) {
+        const auto parsed = parse(bad);
+        ASSERT_FALSE(parsed) << bad;
+        EXPECT_NE(parsed.error().find("--eval-mask-report"), std::string::npos) << parsed.error();
+    }
+    const char* without_eval[] = {"LichtFeld-Studio", "--eval-mask-report=mask,unmasked"};
+    EXPECT_FALSE(lfs::core::args::parse_args_and_params(static_cast<int>(std::size(without_eval)), without_eval));
+    const char* without_mask[] = {"LichtFeld-Studio", "--eval", "--eval-mask-report=inverted"};
+    const auto unmasked_run = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(without_mask)), without_mask);
+    ASSERT_FALSE(unmasked_run);
+    EXPECT_NE(unmasked_run.error().find("needs --eval-mask"), std::string::npos) << unmasked_run.error();
+
+    const auto directory = std::filesystem::path(make_test_path("lfs_arg_parser_compare_report"));
+    std::filesystem::create_directories(directory / "reference");
+    std::filesystem::create_directories(directory / "test");
+    std::filesystem::create_directories(directory / "masks");
+    const auto reference = (directory / "reference").string();
+    const auto test = (directory / "test").string();
+    const auto masks = "masks:" + (directory / "masks").string();
+    const char* compare_argv[] = {"LichtFeld-Studio", "compare", reference.c_str(), test.c_str(),
+                                  "--eval-mask", masks.c_str(), "--eval-mask-report=inverted,unmasked"};
+    const auto compared = lfs::core::args::parse_args(static_cast<int>(std::size(compare_argv)), compare_argv);
+    ASSERT_TRUE(compared) << compared.error();
+    const auto* mode = std::get_if<lfs::core::args::CompareMode>(&*compared);
+    ASSERT_NE(mode, nullptr);
+    EXPECT_EQ(mode->params.evaluation.eval_mask_report, "inverted,unmasked");
+    const char* compare_bad[] = {"LichtFeld-Studio", "compare", reference.c_str(), test.c_str(),
+                                 "--eval-mask-report=inverted"};
+    EXPECT_FALSE(lfs::core::args::parse_args(static_cast<int>(std::size(compare_bad)), compare_bad));
 }
 
 // Catches a folder, depth or crop box source that is stored unnormalized or accepted when malformed, and
@@ -2637,10 +2979,10 @@ TEST(ArgumentParserTest, EvalFolderDepthAndCropBoxMasksParseAndValidate) {
     ASSERT_TRUE(parsed_none) << parsed_none.error();
     lfs::core::param::TrainingParameters resumed;
     resumed.optimization.eval_mask = "points:2,3";
-    resumed.optimization.eval_mask_invert = true;
+    resumed.optimization.eval_mask_report = "inverted";
     apply_explicit_training_overrides(resumed, (*parsed_none)->overrides);
     EXPECT_TRUE(resumed.optimization.eval_mask.empty());
-    EXPECT_FALSE(resumed.optimization.eval_mask_invert);
+    EXPECT_TRUE(resumed.optimization.eval_mask_report.empty());
 
     const char* cropbox[] = {"LichtFeld-Studio", "--eval", "--eval-mask", "cropbox"};
     const auto parsed_cropbox = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(cropbox)), cropbox);
@@ -2732,9 +3074,7 @@ TEST(ArgumentParserTest, EvalMeshMaskRejectsInvalidSourceFileAndFlagCombinations
         {{"LichtFeld-Studio", "--eval", "--eval-mask", missing_spec.c_str()},
          "does not exist"},
         {{"LichtFeld-Studio", "--eval-mask", mesh_spec.c_str()},
-         "need --eval"},
-        {{"LichtFeld-Studio", "--eval", "--eval-mask-invert"},
-         "needs --eval-mask"},
+         "needs --eval"},
     };
     for (const auto& [arguments, expected] : cases) {
         const auto parsed = lfs::core::args::parse_args_and_params(

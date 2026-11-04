@@ -40,8 +40,14 @@ namespace fast_lfs::rasterization {
         size_t per_primitive_buffers_size = 0;
         size_t per_tile_buffers_size = 0;
         size_t sorted_primitive_indices_size = 0;
+        unsigned char* contributor_masks = nullptr;
+        uint* contributor_positions = nullptr;
+        uint* primitive_touched = nullptr;
+        size_t contributor_storage_size = 0;
         size_t per_instance_sort_scratch_size = 0;
         size_t per_instance_sort_total_size = 0;
+        size_t visible_sort_scratch_size = 0;
+        unsigned tile_sort_key_bytes = 0;
         int n_instances = 0;
         int n_visible = 0;
         int sh_layout_bases = 1;
@@ -106,6 +112,14 @@ namespace fast_lfs::rasterization {
 
     void release_forward_context(const ForwardContext& forward_ctx);
 
+    // Read-only device buffers for correctness captures. Their lifetime is the
+    // context lifetime; callers synchronize its stream before reading them.
+    struct ForwardCaptureView {
+        const uint2* tile_ranges;
+        const uint* last_contributors;
+    };
+    ForwardCaptureView forward_capture_view(const ForwardContext& context, int width, int height);
+
     struct BackwardOutputs {
         bool success;
         const char* error_message;
@@ -151,7 +165,10 @@ namespace fast_lfs::rasterization {
         unsigned shN_value_n_cells = 0u,
         unsigned shN_value_bits = 0u,
         const float* edge_weight_map = nullptr,
-        float* edge_score_out = nullptr);
+        float* edge_score_out = nullptr,
+        float* impact_sum_out = nullptr,
+        float* impact_peak_out = nullptr,
+        const ColorVarianceLoss& color_variance = {});
 
     // Pre-compile all CUDA kernels to avoid JIT delays during rendering
     void warmup_kernels();

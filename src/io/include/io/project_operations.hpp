@@ -94,7 +94,7 @@ namespace lfs::io::project {
     // Explicit Contents actions append removals. Legacy reduction still compacts.
     struct ProjectReduceSelection {
         bool compact = true;
-        std::optional<lfs::core::Uuid> checkpoint;
+        std::vector<lfs::core::Uuid> checkpoints;
         std::uint64_t save_generation = 0;
         bool thumbnail = false;
         bool metrics = false;
@@ -178,6 +178,22 @@ namespace lfs::io::project {
     set_dataset_reference(const std::filesystem::path& path,
                           const std::filesystem::path& dataset_dir,
                           bool accept_content_change = false);
+
+    // Write a new untrained project that trains from the file alone: the
+    // parameters, and the dataset folder embedded as embed_dataset_file
+    // embeds it. It has no scene, checkpoint or session state. Files
+    // outside the dataset (background image, PPISP sidecar, the training
+    // initialization file) are referenced like a save references
+    // them, not embedded. The destination must not exist. Its writer lock is
+    // held from the first save until the dataset is embedded; a failed or
+    // canceled embed removes the file again.
+    [[nodiscard]] LFS_IO_API lfs::Result<DatasetEmbedResult>
+    write_training_project(const std::filesystem::path& destination,
+                           ParameterManagerSnapshot parameters,
+                           const std::filesystem::path& dataset_root,
+                           const std::optional<TrainingProjectInitialization>& initialization = std::nullopt,
+                           ProjectOperationProgress progress = {},
+                           ProjectOperationCancel cancel = {});
 
     [[nodiscard]] LFS_IO_API lfs::Result<ProjectExportResult>
     export_project_as(const std::filesystem::path& path,

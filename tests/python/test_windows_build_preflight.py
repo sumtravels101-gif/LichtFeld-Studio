@@ -131,6 +131,26 @@ class WindowsBuildPreflightTests(unittest.TestCase):
         )
         self.assertEqual([], preflight.check_visualizer_test_exports(self.root))
 
+    def test_calls_inside_inline_bodies_are_not_declarations(self) -> None:
+        self.write(
+            "src/visualizer/gui/widget.hpp",
+            "namespace lfs::vis::gui {\n"
+            "inline int wrapper(int size) {\n"
+            "    int area = 0;\n"
+            "    if (!makeWidget(size))\n"
+            "        return 0;\n"
+            "    const bool again = makeWidget(size + 1);\n"
+            "    return again ? area : 1;\n"
+            "}\n"
+            "}\n",
+        )
+        self.write(
+            "tests/test_widget.cpp",
+            '#include "gui/widget.hpp"\n'
+            "void test() { (void)lfs::vis::gui::makeWidget(3); }\n",
+        )
+        self.assertEqual([], preflight.check_visualizer_test_exports(self.root))
+
     def test_inline_definition_is_available_without_dll_export(self) -> None:
         self.write(
             "src/visualizer/gui/widget.hpp",
@@ -266,6 +286,21 @@ class WindowsBuildPreflightTests(unittest.TestCase):
         ]
         selected = preflight.select_compile_commands(
             self.root, commands, {deleted.resolve()}, False
+        )
+        self.assertEqual([source.resolve()], [item.file for item in selected])
+
+    def test_enclosing_repository_does_not_hide_fixture_sources(self) -> None:
+        enclosing = self.root / "enclosing"
+        root = enclosing / "fixture"
+        (root / ".git").mkdir(parents=True)
+        subprocess.run(["git", "init", "--quiet", str(enclosing)], check=True, capture_output=True)
+        (enclosing / ".gitignore").write_text("fixture/\n", encoding="utf-8")
+        source = root / "src" / "visualizer" / "widget.cpp"
+        source.parent.mkdir(parents=True)
+        source.write_text('#include "deleted.hpp"\n', encoding="utf-8")
+        commands = [preflight.CompileCommand(source.resolve(), root, "cl.exe /c widget.cpp")]
+        selected = preflight.select_compile_commands(
+            root, commands, {(source.parent / "deleted.hpp").resolve()}, False
         )
         self.assertEqual([source.resolve()], [item.file for item in selected])
 

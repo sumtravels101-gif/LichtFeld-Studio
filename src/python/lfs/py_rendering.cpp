@@ -6,8 +6,10 @@
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/mesh_data.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
+#include "core/property_defaults.hpp"
 #include "core/property_registry.hpp"
 #include "core/provenance.hpp"
 #include "core/scene.hpp"
@@ -15,6 +17,7 @@
 #include "core/splat_data_transform.hpp"
 #include "core/tensor.hpp"
 #include "io/loader.hpp"
+#include "py_error.hpp"
 #include "py_scene.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
@@ -23,6 +26,7 @@
 #include "rendering/rendering.hpp"
 #include "scene/scene_render_state.hpp"
 #include "visualizer/internal/viewport.hpp"
+#include "visualizer/ipc/render_settings_convert.hpp"
 #include "visualizer/ipc/view_context.hpp"
 #include "visualizer/post_work_utils.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
@@ -272,8 +276,8 @@ namespace lfs::python {
 
                 const auto asset_path = core::utf8_to_path(path);
                 std::error_code file_size_error;
-                if (std::filesystem::is_regular_file(asset_path, file_size_error)) {
-                    const auto file_size = std::filesystem::file_size(asset_path, file_size_error);
+                if (lfs::core::native_fs::is_regular_file(asset_path, file_size_error)) {
+                    const auto file_size = lfs::core::native_fs::file_size(asset_path, file_size_error);
                     if (!file_size_error && file_size > MAX_RENDERED_ASSET_PREVIEW_BYTES) {
                         LOG_DEBUG("Skipping rendered asset preview for '{}' ({} MB exceeds {} MB budget)",
                                   path,
@@ -282,7 +286,7 @@ namespace lfs::python {
                         return std::nullopt;
                     }
                 }
-                auto ext = asset_path.extension().string();
+                auto ext = lfs::core::path_to_utf8(asset_path.extension());
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                 if (ext == ".ckpt" || ext == ".resume") {
                     auto checkpoint_result = core::load_checkpoint_splat_data(
@@ -439,6 +443,32 @@ namespace lfs::python {
             return std::nullopt;
         }
 
+        // Runs `draw` on the viewer thread with the shaders the viewport binds:
+        // an export freezes them and throws when they cannot draw, a live render
+        // draws what the viewport would; see RenderingManager::drawWithShaders.
+        // `frame` describes what `draw` renders. `cancelled` when the viewer takes no work or drops it.
+        template <class Draw, class Drawn = std::invoke_result_t<Draw&>>
+        [[nodiscard]] Drawn drawWithViewportShaders(std::type_identity_t<Drawn> cancelled,
+                                                    const std::function<vis::RenderingManager::ExportFrame()>& frame,
+                                                    Draw draw, const bool exporting = false) {
+            auto* const viewer = get_visualizer();
+            auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
+            if (!rendering_manager)
+                return draw();
+            const auto shaded = [&]() -> Result<Drawn> { return draw(); };
+            if (viewer->isOnViewerThread())
+                return unwrap(rendering_manager->drawWithShaders(exporting, [](auto run) { return run(); }, shaded, frame));
+            if (!viewer->acceptsPostedWork())
+                return cancelled;
+            nb::gil_scoped_release release;
+            const auto post = [viewer, cancelled](auto run) {
+                return vis::post_work_and_wait(
+                    [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                    std::move(run), [cancelled] { return Result<Drawn>(cancelled); });
+            };
+            return unwrap(rendering_manager->drawWithShaders(exporting, post, shaded, frame));
+        }
+
         [[nodiscard]] std::optional<core::Tensor> renderViewOnViewerThread(
             const glm::mat3& rotation,
             const glm::vec3& translation,
@@ -506,7 +536,8 @@ namespace lfs::python {
             const std::optional<bool> orthographic_override = std::nullopt,
             const std::optional<float> ortho_scale_override = std::nullopt,
             const int reference_height = 0) {
-            auto invoke_render = [&]() -> std::optional<core::Tensor> {
+            const auto frame = [width, height] { return vis::RenderingManager::ExportFrame{.width = width, .height = height}; };
+            return drawWithViewportShaders(std::nullopt, frame, [&] {
                 return renderViewOnViewerThread(
                     rotation,
                     translation,
@@ -518,21 +549,7 @@ namespace lfs::python {
                     orthographic_override,
                     ortho_scale_override,
                     reference_height);
-            };
-
-            auto* const viewer = get_visualizer();
-            if (!viewer || viewer->isOnViewerThread()) {
-                return invoke_render();
-            }
-            if (!viewer->acceptsPostedWork()) {
-                return std::nullopt;
-            }
-
-            nb::gil_scoped_release release;
-            return vis::post_work_and_wait(
-                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
-                invoke_render,
-                []() -> std::optional<core::Tensor> { return std::nullopt; });
+            });
         }
 
         [[nodiscard]] std::optional<std::pair<core::Tensor, core::Tensor>> renderViewAndDepthOnViewerThread(
@@ -581,24 +598,10 @@ namespace lfs::python {
             const int height,
             const float fov_degrees,
             const bool expected_depth) {
-            auto invoke_render = [&]() {
+            const auto frame = [width, height] { return vis::RenderingManager::ExportFrame{.width = width, .height = height, .depth = true}; };
+            return drawWithViewportShaders(std::nullopt, frame, [&] {
                 return renderViewAndDepthOnViewerThread(rotation, translation, width, height, fov_degrees, expected_depth);
-            };
-
-            auto* const viewer = get_visualizer();
-            if (!viewer || viewer->isOnViewerThread()) {
-                return invoke_render();
-            }
-            if (!viewer->acceptsPostedWork()) {
-                return std::nullopt;
-            }
-
-            nb::gil_scoped_release release;
-            using Result = std::optional<std::pair<core::Tensor, core::Tensor>>;
-            return vis::post_work_and_wait(
-                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
-                invoke_render,
-                []() -> Result { return std::nullopt; });
+            });
         }
     } // namespace
 
@@ -677,15 +680,35 @@ namespace lfs::python {
             group.properties.push_back(std::move(meta));
         };
 
+        auto add_int = [&](int Proxy::*member, const std::string& id, const std::string& name,
+                           const std::string& desc, int default_value, int min_value, int max_value) {
+            PropertyMeta meta;
+            meta.id = id;
+            meta.name = name;
+            meta.description = desc;
+            meta.type = PropType::Int;
+            meta.default_value = static_cast<int64_t>(default_value);
+            meta.min_value = min_value;
+            meta.max_value = max_value;
+            meta.step = 1.0;
+            meta.getter = [member](const PropertyObjectRef& ref) -> std::any {
+                return static_cast<const Proxy*>(ref.ptr)->*member;
+            };
+            meta.setter = [member](PropertyObjectRef& ref, const std::any& value) {
+                static_cast<Proxy*>(ref.ptr)->*member = std::any_cast<int>(value);
+            };
+            group.properties.push_back(std::move(meta));
+        };
+
         auto add_int_enum = [&](int Proxy::*member, const std::string& id, const std::string& name,
-                                const std::string& desc, std::vector<EnumItem> items, int default_idx) {
+                                const std::string& desc, std::vector<EnumItem> items, int default_value) {
             PropertyMeta meta;
             meta.id = id;
             meta.name = name;
             meta.description = desc;
             meta.type = PropType::Enum;
             meta.enum_items = items;
-            meta.default_value = static_cast<int64_t>(default_idx);
+            meta.default_value = static_cast<int64_t>(default_value);
             meta.getter = [member, items](const PropertyObjectRef& ref) -> std::any {
                 int val = static_cast<const Proxy*>(ref.ptr)->*member;
                 for (const auto& item : items) {
@@ -759,6 +782,7 @@ namespace lfs::python {
         add_bool(&Proxy::show_grid, "show_grid", "Show Grid", "Display grid in viewport", true);
         add_int_enum(&Proxy::grid_plane, "grid_plane", "Plane", "Grid orientation",
                      {{"YZ (Right)", "0", 0}, {"XZ (Top)", "1", 1}, {"XY (Front)", "2", 2}}, 1);
+        add_float(&Proxy::collision_preview_opacity, "collision_preview_opacity", "Collision Opacity", "Collision preview face opacity; edges remain stronger", 0.4, 0.0, 1.0);
         add_float(&Proxy::grid_opacity, "grid_opacity", "Grid Opacity", "Grid transparency", 0.5, 0.0, 1.0);
 
         // Camera Frustums
@@ -779,6 +803,13 @@ namespace lfs::python {
                    "Selection center marker color", {0.0, 0.604, 0.733});
 
         // Desaturation
+        add_color3(&Proxy::selection_outline_color, "selection_outline_color", "Outline color", "Selected object outline color", {0.0, 0.604, 0.733});
+        add_bool(&Proxy::selection_outline_holes, "selection_outline_holes", "Interior contours", "Include contours of fully enclosed holes", true);
+        add_float(&Proxy::selection_outline_opacity, "selection_outline_opacity", "Opacity", "Outline appearance", 1.0, 0, 1);
+        add_float(&Proxy::selection_outline_width, "selection_outline_width", "Width", "Outline appearance", 2.0, 1, 12);
+        add_float(&Proxy::selection_outline_threshold, "selection_outline_threshold", "Threshold", "Outline appearance", 0.5, 0.05, 0.95);
+        add_bool(&Proxy::selection_outline, "selection_outline", "Selection Outline",
+                 "Outline selected splat objects using precise per-pixel rendering", false);
         add_bool(&Proxy::desaturate_unselected, "desaturate_unselected", "Desaturate Unselected",
                  "Desaturate unselected PLYs when one is selected", false);
         add_bool(&Proxy::desaturate_cropping, "desaturate_cropping", "Desaturate Cropping",
@@ -796,6 +827,14 @@ namespace lfs::python {
                      {{"3DGS", "3dgs", 2},
                       {"3DGUT", "3dgut", 3}},
                      2);
+        add_int_enum(&Proxy::transparency_mode, "transparency_mode", "Transparency", "3DGS transparency mode",
+                     {{"Alpha blend", "alpha_blend", 0},
+                      {"Stochastic", "stochastic", 1},
+                      {"SteadySplats", "steady_splats", 2}},
+                     0);
+        add_int(&Proxy::stochastic_max_frames, "stochastic_max_frames", "Refinement Frames",
+                "Maximum new samples after the view or scene changes",
+                lfs::rendering::DEFAULT_STOCHASTIC_REFINEMENT_FRAMES, 1, 1024);
         add_bool(&Proxy::mip_filter, "mip_filter", "Mip Filter", "Enable mip-map filtering", false);
         add_float(&Proxy::render_scale, "render_scale", "Render Scale", "Render resolution scale", 1.0, 0.25, 1.0);
         add_string(&Proxy::scene_upscaler,
@@ -926,7 +965,7 @@ namespace lfs::python {
                       {"1024", "1024", 1024},
                       {"2048", "2048", 2048},
                       {"4096", "4096", 4096}},
-                     2);
+                     2048);
 
         PropertyRegistry::instance().register_group(std::move(group));
     }
@@ -934,6 +973,26 @@ namespace lfs::python {
     PyRenderSettings::PyRenderSettings(vis::RenderSettingsProxy settings)
         : settings_(std::move(settings)),
           prop_(&settings_, "render_settings") {}
+
+    nb::dict PyRenderSettings::prop_info(const std::string& name) const {
+        auto info = prop_.prop_info(name);
+        const auto meta = core::prop::PropertyRegistry::instance().get_property("render_settings", name);
+        if (meta && meta->type == core::prop::PropType::Enum) {
+            // Descriptors and label resets share the value-based enum contract.
+            // Never offer a raw numeric default to a string-valued control.
+            const auto identifier = core::prop::enum_default_identifier(*meta);
+            info["builtin_default"] = identifier ? nb::cast(*identifier) : nb::none();
+            if (identifier)
+                info["default_identifier"] = *identifier;
+        } else if (meta && meta->getter) {
+            // Resolve scalar/color defaults through the same getter as the
+            // live value, preserving proxy conversions and canonical defaults.
+            auto defaults = vis::to_proxy(vis::RenderSettings{});
+            const auto ref = core::prop::PropertyObjectRef::cpp(&defaults);
+            info["builtin_default"] = any_to_python(meta->getter(ref), meta->type);
+        }
+        return info;
+    }
 
     void PyRenderSettings::set(const std::string& name, nb::object value) {
         set_impl(name, std::move(value), true);
@@ -1040,17 +1099,15 @@ namespace lfs::python {
             case core::prop::PropType::Enum: {
                 nb::object cls = props_module.attr("EnumProperty");
                 nb::list items;
-                std::string default_id;
-                for (size_t i = 0; i < meta.enum_items.size(); ++i) {
-                    const auto& item = meta.enum_items[i];
+                const auto default_id = core::prop::enum_default_identifier(meta);
+                if (!default_id)
+                    continue;
+                for (const auto& item : meta.enum_items) {
                     items.append(nb::make_tuple(item.identifier, item.name, ""));
-                    if (static_cast<int>(i) == std::get<int64_t>(meta.default_value.value())) {
-                        default_id = item.identifier;
-                    }
                 }
                 prop_obj = cls(
                     nb::arg("items") = items,
-                    nb::arg("default") = default_id,
+                    nb::arg("default") = *default_id,
                     nb::arg("name") = meta.name,
                     nb::arg("description") = meta.description);
                 break;
@@ -1103,7 +1160,7 @@ namespace lfs::python {
         [[nodiscard]] std::string normalizeExportImageFormat(std::string format,
                                                              const std::filesystem::path& path) {
             if (format.empty()) {
-                format = path.extension().string();
+                format = lfs::core::path_to_utf8(path.extension());
             }
             if (!format.empty() && format.front() == '.') {
                 format.erase(format.begin());
@@ -1125,7 +1182,7 @@ namespace lfs::python {
                 throw std::invalid_argument("export path is empty");
             }
 
-            auto ext = path.extension().string();
+            auto ext = lfs::core::path_to_utf8(path.extension());
             std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
                 return static_cast<char>(std::tolower(c));
             });
@@ -1183,155 +1240,58 @@ namespace lfs::python {
             return image;
         }
 
-        [[nodiscard]] core::Tensor renderCurrentViewRgb8(const vis::ViewInfo& view_info,
-                                                         const int width,
-                                                         const int height,
-                                                         const std::optional<glm::vec3>& background_color_override) {
-            auto image = renderViewThreadSafe(
-                viewInfoRotationMatrix(view_info),
-                glm::vec3{view_info.translation[0], view_info.translation[1], view_info.translation[2]},
-                width,
-                height,
-                view_info.fov,
-                PreviewReadback::UInt8Rgb,
-                background_color_override,
-                view_info.orthographic,
-                viewInfoOrthoScale(view_info),
-                view_info.height);
-            if (!image || !image->is_valid()) {
-                throw std::runtime_error("viewport export render failed");
-            }
-            return toU8Hwc(std::move(*image));
-        }
-
-        using ExportImageResult = std::expected<core::Tensor, std::string>;
-
-        [[nodiscard]] ExportImageResult runExportOnViewerThread(
-            std::function<ExportImageResult()> invoke_render) {
-            auto* const viewer = get_visualizer();
-            if (!viewer || viewer->isOnViewerThread()) {
-                return invoke_render();
-            }
-            if (!viewer->acceptsPostedWork()) {
-                return std::unexpected("viewer is not accepting export work");
-            }
-
-            nb::gil_scoped_release release;
-            return vis::post_work_and_wait(
-                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
-                std::move(invoke_render),
-                []() -> ExportImageResult {
-                    return std::unexpected("viewport export was cancelled");
-                });
-        }
-
-        [[nodiscard]] core::Tensor renderCurrentViewExport(const vis::ViewInfo& view_info,
-                                                           const int width,
-                                                           const int height,
-                                                           const vis::ExportPostProcessMode mode) {
-            auto result = runExportOnViewerThread([&view_info, width, height, mode]() -> ExportImageResult {
+        // Throws when the shaders the viewport binds cannot draw it.
+        [[nodiscard]] Result<core::Tensor> renderCurrentViewExport(const vis::ViewInfo& view_info,
+                                                                   const int width,
+                                                                   const int height,
+                                                                   const vis::ExportPostProcessMode mode) {
+            const vis::RenderingManager::ExportImageRequest request{
+                .rotation = viewInfoRotationMatrix(view_info),
+                .translation = {view_info.translation[0],
+                                view_info.translation[1],
+                                view_info.translation[2]},
+                .focal_length_mm = lfs::rendering::vFovToFocalLength(view_info.fov),
+                .width = width,
+                .height = height,
+                .reference_height = view_info.height,
+                .orthographic_override = view_info.orthographic,
+                .ortho_scale_override = viewInfoOrthoScale(view_info),
+                .mode = mode,
+            };
+            const auto render = [&request, mode]() -> Result<core::Tensor> {
                 auto* const viewer = get_visualizer();
                 auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
                 auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
                 if (!rendering_manager || !scene_manager) {
-                    return std::unexpected("no active viewer is available");
+                    return make_error(ErrorInit{
+                        .code = ErrorCode::Unavailable,
+                        .domain = ErrorDomain::Rendering,
+                        .user_message = "no active viewer is available",
+                        .detection = LFS_SOURCE_SITE_CURRENT(),
+                    });
                 }
-                const vis::RenderingManager::ExportImageRequest request{
-                    .rotation = viewInfoRotationMatrix(view_info),
-                    .translation = {view_info.translation[0],
-                                    view_info.translation[1],
-                                    view_info.translation[2]},
-                    .focal_length_mm = lfs::rendering::vFovToFocalLength(view_info.fov),
-                    .width = width,
-                    .height = height,
-                    .reference_height = view_info.height,
-                    .orthographic_override = view_info.orthographic,
-                    .ortho_scale_override = viewInfoOrthoScale(view_info),
-                    .mode = mode,
-                };
-                return rendering_manager->renderExportImage(scene_manager, request);
-            });
-            if (!result) {
-                throw std::runtime_error("viewport export failed: " + result.error());
-            }
-            return std::move(*result);
-        }
-
-        // Post-process for images assembled outside renderExportImage (the BW2A
-        // transparent fallback): applies the same PPISP correction path.
-        [[nodiscard]] core::Tensor applyExportPostProcessThreadSafe(core::Tensor image,
-                                                                    const vis::ExportPostProcessMode mode) {
-            auto result = runExportOnViewerThread(
-                [image = std::move(image), mode]() mutable -> ExportImageResult {
-                    auto* const viewer = get_visualizer();
-                    auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
-                    auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
-                    if (!rendering_manager || !scene_manager) {
-                        return std::unexpected("no active viewer is available");
-                    }
-                    const auto view_info = viewInfoForPanelArg("main");
-                    const vis::ExportPostProcessView view{
-                        .rotation = view_info ? viewInfoRotationMatrix(*view_info) : glm::mat3{1.0f},
-                        .focal_length_mm =
-                            view_info ? lfs::rendering::vFovToFocalLength(view_info->fov) : 0.0f,
-                        .equirectangular_view = rendering_manager->getSettings().equirectangular,
-                        .controller_predict_size =
-                            view_info ? glm::ivec2{view_info->width, view_info->height} : glm::ivec2{0, 0},
-                    };
-                    return vis::applyExportPostProcess(std::move(image),
-                                                       scene_manager,
-                                                       rendering_manager->getSettings(),
-                                                       rendering_manager->getCurrentCameraId(),
-                                                       mode,
-                                                       view);
-                });
-            if (!result) {
-                throw std::runtime_error("viewport export post-process failed: " + result.error());
-            }
-            return std::move(*result);
-        }
-
-        [[nodiscard]] core::Tensor recoverAlphaRgba(core::Tensor black_rgb, core::Tensor white_rgb) {
-            black_rgb = toU8Hwc(std::move(black_rgb));
-            white_rgb = toU8Hwc(std::move(white_rgb));
-
-            if (black_rgb.shape() != white_rgb.shape() || black_rgb.shape()[2] < 3) {
-                throw std::runtime_error("transparent viewport export expected matching RGB images");
-            }
-
-            const auto height = black_rgb.shape()[0];
-            const auto width = black_rgb.shape()[1];
-            auto rgba = core::Tensor::empty({height, width, std::size_t{4}},
-                                            core::Device::CPU,
-                                            core::DataType::UInt8);
-
-            const auto* const black = black_rgb.ptr<uint8_t>();
-            const auto* const white = white_rgb.ptr<uint8_t>();
-            auto* const out = rgba.ptr<uint8_t>();
-            const auto pixel_count = height * width;
-            const auto src_channels = black_rgb.shape()[2];
-
-            for (std::size_t i = 0; i < pixel_count; ++i) {
-                const auto src = i * src_channels;
-                const auto dst = i * std::size_t{4};
-                const float delta =
-                    (static_cast<float>(white[src]) - static_cast<float>(black[src]) +
-                     static_cast<float>(white[src + 1]) - static_cast<float>(black[src + 1]) +
-                     static_cast<float>(white[src + 2]) - static_cast<float>(black[src + 2])) /
-                    (3.0f * 255.0f);
-                const float alpha = std::clamp(1.0f - delta, 0.0f, 1.0f);
-                for (std::size_t channel = 0; channel < 3; ++channel) {
-                    const float recovered = alpha > 1.0e-6f
-                                                ? static_cast<float>(black[src + channel]) / alpha
-                                                : 0.0f;
-                    out[dst + channel] = static_cast<uint8_t>(
-                        std::lround(std::clamp(recovered, 0.0f, 255.0f)));
+                auto direct = rendering_manager->renderExportImage(scene_manager, request);
+                if (!direct && mode == vis::ExportPostProcessMode::Transparent) {
+                    LOG_DEBUG("transparent viewport export direct RGBA render failed, falling back to BW2A: {}", direct.error());
+                    return rendering_manager->renderTransparentExportFallback(scene_manager, request);
                 }
-                out[dst + 3] = static_cast<uint8_t>(
-                    std::lround(std::clamp(alpha * 255.0f, 0.0f, 255.0f)));
-            }
-
-            return rgba;
+                return from_legacy_expected(std::move(direct), LegacyErrorContext{
+                                                                   .code = ErrorCode::FailedPrecondition,
+                                                                   .domain = ErrorDomain::Rendering,
+                                                                   .operation = "Render viewport export",
+                                                                   .source = LFS_SOURCE_SITE_CURRENT()});
+            };
+            // Called with shaders bound, on the viewer thread that runs the viewport export.
+            const auto frame = [&request] {
+                auto* const viewer = get_visualizer();
+                return viewer->getRenderingManager()->exportImageFrame(viewer->getSceneManager(), request);
+            };
+            return drawWithViewportShaders(make_error(ErrorInit{
+                                               .code = ErrorCode::Cancelled,
+                                               .domain = ErrorDomain::Rendering,
+                                               .user_message = "viewport export was cancelled",
+                                               .detection = LFS_SOURCE_SITE_CURRENT()}),
+                                           frame, render, true);
         }
     } // namespace
 
@@ -1657,39 +1617,16 @@ namespace lfs::python {
             target_width = std::max(1, target_width);
             target_height = std::max(1, target_height);
 
-            if (transparent) {
-                try {
-                    image = renderCurrentViewExport(
-                        *view_info, target_width, target_height, vis::ExportPostProcessMode::Transparent);
-                } catch (const std::exception& e) {
-                    LOG_DEBUG("transparent viewport export direct RGBA render failed, falling back to BW2A: {}", e.what());
-                    auto black = renderCurrentViewRgb8(
-                        *view_info,
-                        target_width,
-                        target_height,
-                        std::optional<glm::vec3>{glm::vec3{0.0f}});
-                    auto white = renderCurrentViewRgb8(
-                        *view_info,
-                        target_width,
-                        target_height,
-                        std::optional<glm::vec3>{glm::vec3{1.0f}});
-                    image = applyExportPostProcessThreadSafe(
-                        recoverAlphaRgba(std::move(black), std::move(white)),
-                        vis::ExportPostProcessMode::Transparent);
-                }
-            } else {
-                const bool export_hdr_environment =
-                    render_settings &&
-                    render_settings->environment_mode ==
-                        static_cast<int>(vis::EnvironmentBackgroundMode::Equirectangular) &&
-                    !render_settings->environment_map_path.empty();
-                image = renderCurrentViewExport(
-                    *view_info,
-                    target_width,
-                    target_height,
-                    export_hdr_environment ? vis::ExportPostProcessMode::EnvironmentComposite
-                                           : vis::ExportPostProcessMode::Opaque);
-            }
+            const bool export_hdr_environment =
+                render_settings &&
+                render_settings->environment_mode ==
+                    static_cast<int>(vis::EnvironmentBackgroundMode::Equirectangular) &&
+                !render_settings->environment_map_path.empty();
+            image = unwrap(renderCurrentViewExport(
+                *view_info, target_width, target_height,
+                transparent              ? vis::ExportPostProcessMode::Transparent
+                : export_hdr_environment ? vis::ExportPostProcessMode::EnvironmentComposite
+                                         : vis::ExportPostProcessMode::Opaque));
         }
 
         const auto comment = core::provenance_to_json(
@@ -1885,6 +1822,44 @@ Args:
 
 Returns:
     CPU uint8 Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
+)doc");
+
+        m.def("render_lightfield_view_u8", [](const PyTensor& rotation, const PyTensor& translation, int width, int height, float fov, float shift_x, float near_distance, float far_distance) -> std::optional<PyTensor> {
+            const auto r = tensorToVisualizerRotation(rotation);
+            const auto t = tensorToVisualizerTranslation(translation);
+            if (!r || !t)
+                return std::nullopt;
+            const auto frame = [width, height] { return vis::RenderingManager::ExportFrame{.width = width, .height = height}; };
+            auto image = drawWithViewportShaders(std::nullopt, frame, [&]() -> std::optional<core::Tensor> {
+                auto* viewer = get_visualizer();
+                auto* rm = viewer ? viewer->getRenderingManager() : nullptr;
+                if (!rm)
+                    return std::nullopt;
+                auto image = rm->renderLightFieldViewRgb8(viewer->getSceneManager(), *r, *t,
+                    width, height, fov, shift_x, near_distance, far_distance);
+                return image ? std::optional<core::Tensor>(*image) : std::nullopt;
+            });
+            return image ? std::optional<PyTensor>(PyTensor(std::move(*image), true)) : std::nullopt; }, nb::arg("rotation"), nb::arg("translation"), nb::arg("width"), nb::arg("height"), nb::arg("fov") = DEFAULT_FOV, nb::arg("shift_x") = 0.0f, nb::arg("near_distance") = 0.0f, nb::arg("far_distance") = 100000.0f,
+              R"doc(
+Render a parallel off-axis perspective view for light-field quilts.
+
+rotation is a [3, 3] camera-to-world rotation and translation is a [3] world
+position, using the visualizer camera convention. fov is vertical degrees
+(default: 60).
+shift_x offsets the principal point horizontally in pixels; positive values
+move the principal point right. near_distance and far_distance clip Gaussian
+centers by camera-space forward distance, not the tails of individual splats.
+
+Selection highlights are hidden. Projection, clipping, splat scale and editor
+visualization overrides are local to this render; the viewport settings and
+model are not changed. Other current render settings, such as background and
+appearance, are retained. Rendering is dispatched to the viewer thread when
+necessary.
+
+Returns a CPU uint8 Tensor [H, W, 3] RGB image, or None when there is no renderable
+scene, arguments are invalid, or rendering fails. Width and height must be
+1-2048, fov must be 1-120, shift_x must be finite, and clipping distances must
+be finite with 0 <= near_distance < far_distance.
 )doc");
 
         m.def("compute_screen_positions", &compute_screen_positions, nb::arg("rotation"), nb::arg("translation"),

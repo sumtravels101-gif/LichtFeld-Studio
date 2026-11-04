@@ -105,6 +105,10 @@ namespace lfs::core {
             EVENT(ForceExit, bool discard_autosave = false;);
             EVENT(SwitchToEditMode, );
             EVENT(ResetCamera, );
+            EVENT(SetVrActive, bool active;);
+            EVENT(RecenterVr, );
+            EVENT(SnapTurnVr, int direction;); // -1 left, +1 right
+            EVENT(SetVrPreferences, bool enabled; float resolution_scale; float scene_units_per_meter; float move_speed; bool persist;);
             EVENT(ShowWindow, std::string window_name; bool show;);
             EVENT(ExecuteConsole, std::string command;);
             EVENT(GoToCamView, int cam_id;);
@@ -127,13 +131,16 @@ namespace lfs::core {
             EVENT(AddGroupByParentId, std::string name; int32_t parent_id;); // -1 parent = root
             EVENT(DuplicateNode, std::string name;);                         // Duplicate node (and children if group)
             EVENT(DuplicateNodeById, int32_t node_id;);                      // Duplicate node (and children if group)
-            EVENT(MergeGroup, std::string name;);                            // Merge group children into single PLY
-            EVENT(MergeGroupById, int32_t node_id;);                         // Merge group children into single PLY
+            EVENT(MergeGroup, std::string name;);                            // Merge group children into a single model
+            EVENT(MergeGroupById, int32_t node_id;);                         // Merge group children into a single model
             EVENT(SetNodeLocked, std::string name; bool locked;);            // Lock/unlock node for editing
             EVENT(CropPLY, lfs::geometry::BoundingBox crop_box; bool inverse; int32_t target_node_id = -1;);
             EVENT(CropPLYEllipsoid, glm::mat4 world_transform; glm::vec3 radii; bool inverse; int32_t target_node_id = -1;);
+            // world_transform maps the polygon's local frame to data world space.
+            EVENT(CropPLYPolygon, glm::mat4 world_transform; std::vector<glm::vec2> vertices; float half_depth; bool inverse; int32_t target_node_id = -1;);
             EVENT(ApplyCropBox, );
             EVENT(ApplyEllipsoid, );
+            EVENT(ApplyCropPolygon, );
             EVENT(AddCropBox, std::string node_name;);       // Add cropbox to splat node
             EVENT(AddCropEllipsoid, std::string node_name;); // Add ellipsoid to splat node
             EVENT(ResetCropBox, );                           // Reset selected cropbox
@@ -171,7 +178,7 @@ namespace lfs::core {
             EVENT(SequencerPlayPause, );
             // Empty path opens the save dialog; a path set by a script exports straight
             // to it, since a modal dialog cannot be answered from an automation client.
-            EVENT(SequencerExportVideo, int width; int height; int framerate; int crf; std::string path = {}; bool include_provenance = true;);
+            EVENT(SequencerExportVideo, int width; int height; int framerate; int crf; std::string path = {}; bool include_provenance = true; int framerate_denominator = 1; int camera_width = 0; int camera_height = 0; int framing = 0;);
             EVENT(SequencerGoToKeyframe, size_t keyframe_index;);
             EVENT(SequencerSelectKeyframe, size_t keyframe_index;);
             EVENT(SequencerDeleteKeyframe, size_t keyframe_index;);

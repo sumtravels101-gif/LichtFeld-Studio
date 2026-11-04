@@ -10,6 +10,7 @@
 #include "core/splat_data.hpp"
 #include "core/user_paths.hpp"
 #include "gui/gui_focus_state.hpp"
+#include "gui/rml_menu_bar.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "input/camera_animation_cadence.hpp"
 #include "input/frame_input_buffer.hpp"
@@ -19,6 +20,7 @@
 #include "input/sdl_key_mapping.hpp"
 #include "internal/viewport.hpp"
 #include "keymap_history_helpers.hpp"
+#include "licht_test_support.hpp"
 #include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
@@ -36,6 +38,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#ifdef __linux__
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include <glm/gtc/constants.hpp>
 #include <gtest/gtest.h>
 #include <iterator>
@@ -145,7 +151,77 @@ namespace lfs::vis {
 #endif
             }
         };
+
+        // Two Gaussians at x +/- 1 around `x`, so framing has a nonzero box.
+        std::unique_ptr<lfs::core::SplatData> makeTwoGaussianSplat(const float x) {
+            using lfs::core::DataType;
+            using lfs::core::Device;
+            using lfs::core::Tensor;
+            return std::make_unique<lfs::core::SplatData>(
+                0,
+                Tensor::from_vector({x - 1.0f, 0.0f, 0.0f, x + 1.0f, 0.0f, 0.0f}, {size_t{2}, size_t{3}}, Device::CPU),
+                Tensor::zeros({size_t{2}, size_t{1}, size_t{3}}, Device::CPU),
+                Tensor::zeros({size_t{2}, size_t{0}, size_t{3}}, Device::CPU, DataType::Float32),
+                Tensor::zeros({size_t{2}, size_t{3}}, Device::CPU),
+                Tensor::from_vector({1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f}, {size_t{2}, size_t{4}}, Device::CPU),
+                Tensor::zeros({size_t{2}, size_t{1}}, Device::CPU),
+                1.0f);
+        }
     } // namespace
+
+    TEST_F(InputControllerFocusTest, WalkRejectionDoesNotEscapeNativeDispatch) {
+        SceneManager manager;
+        services().set(&manager);
+        auto& scene = manager.getScene();
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        controller.initialize();
+        controller.setCameraNavigationMode(InputController::CameraNavigationMode::Orbit);
+        gui::RmlMenuBar bar;
+        bar.rebuildToolbarButtons();
+        EXPECT_FALSE(bar.camera_buttons_.back().enabled);
+        EXPECT_NO_THROW(bar.dispatchToolbarAction("set_camera_navigation_mode", "walk"));
+        EXPECT_EQ(controller.walk_error, LOC("collision.walk_no_collision"));
+        const auto floor = scene.addCollision("Floor", collision_test::box({-8, -1, -8}, {16, 1, 16}));
+        scene.setNodeTransform(floor, lfs::rendering::VISUALIZER_TO_DATA_WORLD_AXES_4);
+        scene.setNodeVisibility(floor, false);
+        bar.rebuildToolbarButtons();
+        EXPECT_TRUE(bar.camera_buttons_.back().enabled);
+        viewport.camera.t = {0, 20, 0};
+        EXPECT_NO_THROW(bar.dispatchToolbarAction("set_camera_navigation_mode", "walk"));
+        EXPECT_EQ(controller.walk_error, LOC("collision.walk_no_support"));
+        EXPECT_EQ(controller.cameraNavigationMode(), InputController::CameraNavigationMode::Orbit);
+        EXPECT_EQ(viewport.camera.t, glm::vec3(0, 20, 0));
+    }
+
+    TEST_F(InputControllerFocusTest, WalkIdleAndSettingsKeepThePhysicsOwnerAcrossSplitFocusChanges) {
+        SceneManager manager;
+        services().set(&manager);
+        auto& scene = manager.getScene();
+        const auto floor = scene.addCollision("Floor", collision_test::box({-8, -1, -8}, {16, 1, 16}));
+        scene.setNodeTransform(floor, lfs::rendering::VISUALIZER_TO_DATA_WORLD_AXES_4);
+        Viewport primary(200, 200);
+        InputController controller(nullptr, primary);
+        RenderingManager rendering;
+        services().set(&rendering);
+        rendering.restoreSplitViewMode(SplitViewMode::IndependentDual, primary);
+        auto& secondary = rendering.resolvePanelViewport(primary, SplitViewPanelId::Right);
+        primary.camera.t = {-4, 1.7f, 0};
+        secondary.camera.t = {4, 1.7f, 0};
+        rendering.setFocusedSplitPanel(SplitViewPanelId::Right);
+        ASSERT_TRUE(controller.setCameraNavigationMode(InputController::CameraNavigationMode::Walk));
+        const auto primary_before = primary.camera.t;
+        rendering.setFocusedSplitPanel(SplitViewPanelId::Left);
+        controller.update(.016f);
+        EXPECT_EQ(primary.camera.t, primary_before);
+        EXPECT_NEAR(secondary.camera.t.x, 4, 1e-5f);
+        auto settings = controller.walk_settings;
+        settings.height = 1.9f;
+        ASSERT_NO_THROW(controller.setWalkSettings(settings));
+        EXPECT_EQ(primary.camera.t, primary_before);
+        EXPECT_NEAR(secondary.camera.t.y, 1.9f, .02f);
+        services().clear();
+    }
 
     TEST_F(InputControllerFocusTest, NavigationModeChangesRequestGuiRedraw) {
         using Mode = InputController::CameraNavigationMode;
@@ -491,6 +567,9 @@ namespace lfs::vis {
     }
 
     TEST_F(InputControllerFocusTest, CameraViewKeysUseSceneUidsWithoutTrainerAndPreserveComparison) {
+        // core::Camera keeps its transforms on the device; the CPU-only CI runners have none.
+        if (int devices = 0; cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+            GTEST_SKIP() << "CUDA device unavailable";
         Viewport viewport(200, 200);
         InputController controller(nullptr, viewport);
         input::InputRouter router;
@@ -519,6 +598,8 @@ namespace lfs::vis {
         ASSERT_TRUE(rendering_manager.isGTComparisonActive());
         const auto press = [&](const int key, const int expected_uid) {
             controller.handleKey(key, input::ACTION_PRESS, input::KEYMOD_NONE);
+            // Browsing repeats on its own timer; an OS repeat must not add a step.
+            controller.handleKey(key, input::ACTION_REPEAT, input::KEYMOD_NONE);
             controller.handleKey(key, input::ACTION_RELEASE, input::KEYMOD_NONE);
             controller.update(0.016f);
             EXPECT_EQ(rendering_manager.getCurrentCameraId(), expected_uid);
@@ -883,6 +964,165 @@ namespace lfs::vis {
         EXPECT_EQ(actions, (std::vector<int>{input::ACTION_PRESS, input::ACTION_RELEASE}));
         op::operators().cancelModalOperator();
         op::operators().unregisterOperator(id);
+    }
+
+    TEST_F(InputControllerFocusTest, FocusFramesOnlyVisibleModels) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        SceneManager scene_manager;
+        ToolContext tool_context(nullptr, &scene_manager, &viewport, nullptr);
+        controller.setToolContext(&tool_context);
+
+        auto& scene = scene_manager.getScene();
+        const auto group = scene.addGroup("group");
+        scene.addSplat("near", makeTwoGaussianSplat(0.0f), group);
+        scene.setNodeVisibility(scene.addSplat("far", makeTwoGaussianSplat(100.0f), group), false);
+
+        const auto expect_framed_near = [&](const char* selection) {
+            SCOPED_TRACE(selection);
+            viewport.camera.pivot = glm::vec3(7.0f);
+            ASSERT_TRUE(controller.focusSelection());
+            EXPECT_LT(glm::length(viewport.camera.getPivot()), 1e-3f);
+        };
+        expect_framed_near("nothing");
+        scene_manager.selectNode("group");
+        expect_framed_near("group with a hidden child");
+        scene_manager.selectNode("far");
+        expect_framed_near("hidden node");
+    }
+
+    // Fails if one far floater makes F park the camera beyond the zoom-out limit.
+    TEST_F(InputControllerFocusTest, FocusFramesThroughFarFloatersAndCanZoomOut) {
+        using lfs::core::Device;
+        using lfs::core::Tensor;
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        SceneManager scene_manager;
+        ToolContext tool_context(nullptr, &scene_manager, &viewport, nullptr);
+        controller.setToolContext(&tool_context);
+
+        constexpr size_t count = 500;
+        std::vector<float> means(count * 3, 0.0f), rotations(count * 4, 0.0f);
+        for (size_t i = 0; i < count; ++i) {
+            means[i * 3] = static_cast<float>(i % 10) * 0.2f - 1.0f;
+            means[i * 3 + 1] = static_cast<float>((i / 10) % 10) * 0.2f - 1.0f;
+            rotations[i * 4] = 1.0f;
+        }
+        means[0] = 90000.0f; // one floater
+        scene_manager.getScene().addSplat(
+            "model",
+            std::make_unique<lfs::core::SplatData>(
+                0, Tensor::from_vector(means, {count, size_t{3}}, Device::CPU),
+                Tensor::zeros({count, size_t{1}, size_t{3}}, Device::CPU),
+                Tensor::zeros({count, size_t{0}, size_t{3}}, Device::CPU),
+                Tensor::zeros({count, size_t{3}}, Device::CPU),
+                Tensor::from_vector(rotations, {count, size_t{4}}, Device::CPU),
+                Tensor::zeros({count, size_t{1}}, Device::CPU), 1.0f));
+
+        ASSERT_TRUE(controller.focusSelection());
+        const float framed = glm::length(viewport.camera.pivot - viewport.camera.t);
+        EXPECT_LT(framed, 100.0f);
+        viewport.camera.zoom(-1.0f);
+        EXPECT_GT(glm::length(viewport.camera.pivot - viewport.camera.t), framed);
+    }
+
+    TEST_F(InputControllerFocusTest, FrameAndHomeKeysWorkWhileAPanelHasKeyboardFocus) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        SceneManager scene_manager;
+        ToolContext tool_context(nullptr, &scene_manager, &viewport, nullptr);
+        controller.setToolContext(&tool_context);
+        scene_manager.getScene().addSplat("model", makeTwoGaussianSplat(10.0f));
+
+        // A row clicked in the scene panel holds keyboard focus.
+        auto& focus = gui::guiFocusState();
+        focus.want_capture_keyboard = true;
+        focus.any_item_active = true;
+        ASSERT_FALSE(router.isViewportKeyboardFocused());
+
+        // A key the panel handled itself stays there (the image preview uses F).
+        controller.handleKey(input::KEY_F, input::KEY_F, 0, input::ACTION_PRESS, input::KEYMOD_NONE, false, true);
+        EXPECT_LT(glm::length(viewport.camera.getPivot()), 1e-3f);
+
+        controller.handleKey(input::KEY_F, input::ACTION_PRESS, input::KEYMOD_NONE);
+        const glm::vec3 framed = viewport.camera.getPivot();
+        EXPECT_NEAR(glm::length(framed), 10.0f, 1e-3f);
+
+        controller.handleKey(input::KEY_H, input::ACTION_PRESS, input::KEYMOD_SHIFT);
+        viewport.camera.pivot = glm::vec3(7.0f);
+        controller.handleKey(input::KEY_H, input::ACTION_PRESS, input::KEYMOD_NONE);
+        EXPECT_EQ(viewport.camera.getPivot(), framed);
+
+        const decltype(viewport.camera) defaults{};
+        controller.resetHome();
+        EXPECT_EQ(viewport.camera.home_t, defaults.home_t);
+        EXPECT_EQ(viewport.camera.getPivot(), defaults.home_pivot);
+
+        focus.want_text_input = true;
+        controller.handleKey(input::KEY_F, input::ACTION_PRESS, input::KEYMOD_NONE);
+        EXPECT_EQ(viewport.camera.getPivot(), defaults.home_pivot);
+    }
+
+    // Fails if Ctrl+H does not restore the default home, as the Reset Home button does.
+    TEST_F(InputControllerFocusTest, CtrlHRestoresTheDefaultHome) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        const decltype(viewport.camera) defaults{};
+
+        viewport.camera.pivot = glm::vec3(7.0f);
+        controller.handleKey(input::KEY_H, input::ACTION_PRESS, input::KEYMOD_SHIFT);
+        ASSERT_NE(viewport.camera.home_pivot, defaults.home_pivot);
+
+        controller.handleKey(input::KEY_H, input::ACTION_PRESS, input::KEYMOD_CTRL);
+        EXPECT_EQ(viewport.camera.home_t, defaults.home_t);
+        EXPECT_EQ(viewport.camera.home_pivot, defaults.home_pivot);
+        EXPECT_EQ(viewport.camera.getPivot(), defaults.home_pivot);
+    }
+
+    // Fails if WASD, Shift speed-up or the speed keys stop while a panel row holds keyboard focus.
+    TEST_F(InputControllerFocusTest, NavigationKeysWorkWhileAPanelHasKeyboardFocus) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        controller.initialize();
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        auto& focus = gui::guiFocusState();
+        focus.want_capture_keyboard = true;
+        focus.any_item_active = true;
+        ASSERT_FALSE(router.isViewportKeyboardFocused());
+
+        // Hold W for half a second. Without a window the release cannot be read
+        // back from SDL, so focus loss clears the held key as it does in the app.
+        const auto travel = [&](const int mods) {
+            SDL_SetModState(mods & input::KEYMOD_SHIFT ? SDL_KMOD_LSHIFT : SDL_KMOD_NONE);
+            const glm::vec3 start = viewport.camera.t;
+            controller.handleKey(input::KEY_W, input::ACTION_PRESS, mods);
+            for (int i = 0; i < 30; ++i)
+                controller.update(1.0f / 60.0f);
+            const float distance = glm::length(viewport.camera.t - start);
+            controller.onWindowFocusLost();
+            viewport.camera.clearWasdMomentum();
+            SDL_SetModState(SDL_KMOD_NONE);
+            return distance;
+        };
+        const float plain = travel(input::KEYMOD_NONE);
+        EXPECT_GT(plain, 0.0f);
+        EXPECT_GT(travel(input::KEYMOD_SHIFT), plain * 1.5f);
+
+        const float speed = viewport.camera.getWasdSpeed();
+        controller.handleKey(input::KEY_EQUAL, input::ACTION_PRESS, input::KEYMOD_CTRL);
+        EXPECT_GT(viewport.camera.getWasdSpeed(), speed);
+
+        // A focused text field keeps its keys.
+        focus.want_text_input = true;
+        EXPECT_EQ(travel(input::KEYMOD_NONE), 0.0f);
     }
 
     TEST_F(InputControllerFocusTest, DeleteNodeShortcutFiresWhenViewportFocused) {
@@ -1279,6 +1519,106 @@ namespace lfs::vis {
         EXPECT_NEAR(viewport.camera.t.z, 5.0f, 1e-5f);
         EXPECT_GT(forward.y, 0.0f);
         EXPECT_NEAR(glm::dot(forward, to_pivot), 1.0f, 1e-4f);
+    }
+
+    // Fails if mouse look stops while the locked pointer rests at the window edge.
+    TEST_F(InputControllerFocusTest, FpvLookKeepsTurningWhileThePointerRestsAtTheEdge) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
+        viewport.camera.setPivot(glm::vec3(0.0f));
+        viewport.camera.R = glm::mat3(1.0f);
+        controller.setCameraNavigationMode(InputController::CameraNavigationMode::FPV);
+        const glm::vec3 start = lfs::rendering::cameraForward(viewport.camera.R);
+
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 40.0, 50.0);
+        controller.handleMouseMove(0.0, 50.0, glm::dvec2(-40.0, 0.0));
+        const glm::vec3 first = lfs::rendering::cameraForward(viewport.camera.R);
+        controller.handleMouseMove(0.0, 50.0, glm::dvec2(-40.0, 0.0));
+        const glm::vec3 second = lfs::rendering::cameraForward(viewport.camera.R);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_RELEASE, 0.0, 50.0);
+
+        const float first_turn = std::acos(glm::clamp(glm::dot(start, first), -1.0f, 1.0f));
+        const float second_turn = std::acos(glm::clamp(glm::dot(first, second), -1.0f, 1.0f));
+        EXPECT_GT(first_turn, 0.01f);
+        EXPECT_NEAR(second_turn, first_turn, 1e-3f);
+        EXPECT_NEAR(viewport.camera.t.z, 5.0f, 1e-5f);
+    }
+
+    TEST_F(InputControllerFocusTest, VrViewingBlocksRelativeMouseLookAndRestoresItOnExit) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
+        viewport.camera.setPivot(glm::vec3(0.0f));
+        viewport.camera.R = glm::mat3(1.0f);
+        controller.setCameraNavigationMode(InputController::CameraNavigationMode::FPV);
+
+        const auto button = static_cast<int>(input::AppMouseButton::MIDDLE);
+        controller.handleMouseButton(button, input::ACTION_PRESS, 40.0, 50.0);
+        ASSERT_TRUE(controller.isCameraDragging());
+        controller.setVrViewing(true);
+        EXPECT_FALSE(controller.isCameraDragging());
+        const auto rotation = viewport.camera.R;
+        const auto position = viewport.camera.t;
+        const auto pivot = viewport.camera.getPivot();
+
+        controller.handleMouseButton(button, input::ACTION_PRESS, 40.0, 50.0);
+        controller.handleMouseMove(0.0, 50.0, glm::dvec2(-40.0, 0.0));
+        controller.handleMouseMove(40.0, 0.0);
+        EXPECT_EQ(viewport.camera.R, rotation);
+        EXPECT_EQ(viewport.camera.t, position);
+        EXPECT_EQ(viewport.camera.getPivot(), pivot);
+        EXPECT_FALSE(controller.isCameraDragging());
+
+        controller.setVrViewing(false);
+        controller.handleMouseButton(button, input::ACTION_PRESS, 40.0, 50.0);
+        controller.handleMouseMove(0.0, 50.0, glm::dvec2(-40.0, 0.0));
+        EXPECT_GT(glm::distance(lfs::rendering::cameraForward(viewport.camera.R),
+                                lfs::rendering::cameraForward(rotation)),
+                  0.01f);
+        EXPECT_EQ(viewport.camera.t, position);
+        controller.handleMouseButton(button, input::ACTION_RELEASE, 0.0, 50.0);
+        EXPECT_FALSE(controller.isCameraDragging());
+    }
+
+    TEST_F(InputControllerFocusTest, VrViewingTurnsKeysIntoVrCommandsAndHeldMovement) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        controller.initialize();
+        lfs::event::ScopedHandler handlers;
+        std::vector<bool> active_requests;
+        std::vector<int> turns;
+        int recenters = 0;
+        handlers.subscribe<core::events::cmd::SetVrActive>(
+            [&](const auto& event) { active_requests.push_back(event.active); });
+        handlers.subscribe<core::events::cmd::SnapTurnVr>([&](const auto& event) { turns.push_back(event.direction); });
+        handlers.subscribe<core::events::cmd::RecenterVr>([&](const auto&) { ++recenters; });
+        const auto key = [&](const int code, const int action) {
+            controller.handleKey(code, action, input::KEYMOD_NONE);
+        };
+
+        controller.setVrViewing(true);
+        key(input::KEY_LEFT, input::ACTION_PRESS);
+        key(input::KEY_RIGHT, input::ACTION_PRESS);
+        key(input::KEY_R, input::ACTION_PRESS);
+        key(input::KEY_W, input::ACTION_PRESS);
+        key(input::KEY_Q, input::ACTION_PRESS);
+        EXPECT_EQ(turns, (std::vector<int>{-1, 1}));
+        EXPECT_EQ(recenters, 1);
+        EXPECT_EQ(controller.vrMovement(), glm::vec3(0.0f, 1.0f, -1.0f));
+        key(input::KEY_W, input::ACTION_RELEASE);
+        EXPECT_EQ(controller.vrMovement(), glm::vec3(0.0f, 1.0f, 0.0f));
+        key(input::KEY_ESCAPE, input::ACTION_PRESS);
+        EXPECT_EQ(active_requests, std::vector<bool>{false});
+
+        controller.setVrViewing(false);
+        EXPECT_EQ(controller.vrMovement(), glm::vec3(0.0f));
+        key(input::KEY_R, input::ACTION_PRESS);
+        key(input::KEY_ESCAPE, input::ACTION_PRESS);
+        EXPECT_EQ(recenters, 1);
+        EXPECT_EQ(active_requests.size(), 1u);
     }
 
     TEST_F(InputControllerFocusTest, TrackballModeAllowsPerfectTopView) {
@@ -2017,15 +2357,50 @@ namespace lfs::vis {
 })";
         }
 
-        input::InputBindings::setPersistenceEnabled(true);
+        // Construct before persistence is on so this load is the migration
+        // that replaces Default.json. The callback runs after that save and
+        // before load returns. An unclosed source stream still owns the
+        // original inode there; Windows then refuses the atomic replace.
+        input::InputBindings::setPersistenceEnabled(false);
         input::InputBindings loaded;
+        bool published = false;
+        bool source_open_at_publish = false;
+#ifdef __linux__
+        struct stat source_identity {};
+        ASSERT_EQ(::stat(profile_path.c_str(), &source_identity), 0);
+#endif
+        loaded.setOnBindingsChanged([&] {
+            published = true;
+#ifdef __linux__
+            std::error_code scan_error;
+            const std::filesystem::directory_iterator end;
+            for (std::filesystem::directory_iterator entry("/proc/self/fd", scan_error);
+                 !scan_error && entry != end; entry.increment(scan_error)) {
+                const auto fd_text = entry->path().filename().string();
+                char* parsed_end = nullptr;
+                const auto fd = std::strtol(fd_text.c_str(), &parsed_end, 10);
+                if (parsed_end == fd_text.c_str() || fd < 0)
+                    continue;
+                struct stat open_identity {};
+                if (::fstat(static_cast<int>(fd), &open_identity) != 0)
+                    continue;
+                if (open_identity.st_dev == source_identity.st_dev &&
+                    open_identity.st_ino == source_identity.st_ino)
+                    source_open_at_publish = true;
+            }
+#endif
+        });
+        input::InputBindings::setPersistenceEnabled(true);
         ASSERT_TRUE(loaded.loadProfileFromFile(profile_path));
         input::InputBindings::setPersistenceEnabled(false);
+        EXPECT_TRUE(published);
+        EXPECT_FALSE(source_open_at_publish);
 
         std::ifstream persisted(profile_path);
         ASSERT_TRUE(persisted.is_open());
         const std::string contents((std::istreambuf_iterator<char>(persisted)), {});
-        EXPECT_NE(contents.find("\"version\": 32"), std::string::npos); // PROFILE_VERSION
+        EXPECT_NE(contents.find("\"version\": " + std::to_string(input::test::currentProfileVersion())),
+                  std::string::npos);
         EXPECT_NE(contents.find("Gallery Primary Action"), std::string::npos);
         EXPECT_NE(contents.find("Copy Gallery Link"), std::string::npos);
         EXPECT_NE(contents.find("Refresh Assets"), std::string::npos);
@@ -2099,6 +2474,7 @@ namespace lfs::vis {
         struct MenuAccelerator {
             std::string source;
             Action action = Action::NONE;
+            ToolMode mode = ToolMode::GLOBAL;
             bool save_project = false;
         };
         const auto menu_root = std::filesystem::path(PROJECT_ROOT_PATH) / "src/python/lfs_plugins";
@@ -2120,23 +2496,28 @@ namespace lfs::vis {
                          .save_project = true});
                     continue;
                 }
+                const auto identifier = [&](const std::size_t from) {
+                    auto end = from;
+                    while (end < line.size() &&
+                           (std::isalnum(static_cast<unsigned char>(line[end])) || line[end] == '_'))
+                        ++end;
+                    return std::string_view(line).substr(from, end - from);
+                };
                 auto action_start = line.find("Action.", start);
                 if (action_start == std::string::npos)
                     action_start = line.find("action.", start);
                 ASSERT_NE(action_start, std::string::npos)
                     << entry.path().filename().string() << ": " << line;
-                action_start += 7;
-                auto action_end = action_start;
-                while (action_end < line.size() &&
-                       (std::isalnum(static_cast<unsigned char>(line[action_end])) ||
-                        line[action_end] == '_'))
-                    ++action_end;
-                const auto action = actionFromName(
-                    std::string_view(line).substr(action_start, action_end - action_start));
+                const auto action = actionFromName(identifier(action_start + 7));
                 ASSERT_TRUE(action)
                     << entry.path().filename().string() << ": " << line;
+                // Mode shortcuts name their mode: keymap_shortcut(action, ToolMode.X).
+                const auto mode_start = line.find("ToolMode.", action_start);
                 menu_accelerators.push_back(
-                    {.source = entry.path().filename().string(), .action = *action});
+                    {.source = entry.path().filename().string(),
+                     .action = *action,
+                     .mode = mode_start == std::string::npos ? ToolMode::GLOBAL
+                                                             : toolModeFromName(identifier(mode_start + 9))});
             }
         }
         ASSERT_FALSE(menu_accelerators.empty());
@@ -2157,10 +2538,13 @@ namespace lfs::vis {
         handlers.subscribe<core::events::ui::ToggleVramHud>(record(Action::TOGGLE_PERFORMANCE_HUD));
         handlers.subscribe<core::events::ui::ToggleUI>(record(Action::TOGGLE_UI));
         handlers.subscribe<core::events::cmd::ProjectSave>(record(Action::NONE));
+        handlers.subscribe<core::events::cmd::SetVrActive>(record(Action::EXIT_VR));
+        handlers.subscribe<core::events::cmd::RecenterVr>(record(Action::VR_RECENTER));
 
         const auto default_profile = InputBindings::createDefaultProfile();
         for (const auto& accelerator : menu_accelerators) {
             SCOPED_TRACE(accelerator.source);
+            controller.setVrViewing(accelerator.mode == ToolMode::VR);
             if (accelerator.save_project) {
                 const auto before = dispatched[Action::NONE];
                 const int physical_key = sdlScancodeToAppKey(SDL_SCANCODE_S);
@@ -2178,7 +2562,7 @@ namespace lfs::vis {
 
             const auto binding = std::ranges::find_if(
                 default_profile.bindings, [&](const auto& candidate) {
-                    return candidate.mode == ToolMode::GLOBAL &&
+                    return candidate.mode == accelerator.mode &&
                            candidate.action == accelerator.action;
                 });
             ASSERT_NE(binding, default_profile.bindings.end())
@@ -2191,16 +2575,26 @@ namespace lfs::vis {
             const int physical_key = sdlScancodeToAppKey(scancode);
             const int logical_key = sdlShortcutKeyToAppKey(
                 scancode, SDL_GetKeyFromScancode(scancode, SDL_KMOD_NONE, false));
-            EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, logical_key,
+            EXPECT_EQ(bindings.getActionForKey(accelerator.mode, logical_key,
                                                trigger->modifiers),
                       accelerator.action);
             const auto before = dispatched[accelerator.action];
             const int console_before = python_console_toggle_calls;
+            // The home keys move the viewport camera instead of publishing a command.
+            const bool home_action = accelerator.action == Action::CAMERA_RESET_HOME ||
+                                     accelerator.action == Action::CAMERA_SET_HOME ||
+                                     accelerator.action == Action::CAMERA_RESTORE_HOME;
+            if (home_action)
+                viewport.camera.pivot = glm::vec3(3.0f);
+            const auto camera_before = std::pair{viewport.camera.getPivot(), viewport.camera.home_pivot};
             controller.handleKey(physical_key, logical_key, scancode,
                                  ACTION_PRESS, trigger->modifiers);
             controller.handleKey(physical_key, logical_key, scancode,
                                  ACTION_RELEASE, trigger->modifiers);
-            if (accelerator.action == Action::TOGGLE_PYTHON_CONSOLE)
+            if (home_action)
+                EXPECT_NE(std::pair(viewport.camera.getPivot(), viewport.camera.home_pivot), camera_before)
+                    << getActionName(accelerator.action);
+            else if (accelerator.action == Action::TOGGLE_PYTHON_CONSOLE)
                 EXPECT_EQ(python_console_toggle_calls, console_before + 1);
             else if (accelerator.action != Action::OPEN_PREFERENCES)
                 EXPECT_EQ(dispatched[accelerator.action], before + 1)
@@ -2772,6 +3166,56 @@ namespace lfs::vis {
                 services().clear();
             }
         }
+    }
+
+    TEST_F(InputControllerFocusTest, JoypadAssignmentSurvivesSidebarFocusAndApplicationFocusLoss) {
+        Viewport primary(200, 200);
+        InputController controller(nullptr, primary);
+        RenderingManager rendering;
+        services().set(&rendering);
+        controller.updateViewportBounds(0, 0, 200, 200);
+        rendering.restoreSplitViewMode(SplitViewMode::IndependentDual, primary);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        const auto click = [&](double x, double y) {
+            router.beginMouseButton(input::ACTION_PRESS, x, y);
+            controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_PRESS, x, y);
+            controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_RELEASE, x, y);
+            router.endMouseButton(input::ACTION_RELEASE, x, y);
+        };
+        click(160, 80);
+        ASSERT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        click(250, 80); // panel outside the viewport
+        EXPECT_FALSE(controller.hasViewportKeyboardFocus());
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        controller.onWindowFocusLost();
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        rendering.setFocusedSplitPanel(SplitViewPanelId::Left);
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        click(40, 80);
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Left);
+        services().clear();
+    }
+
+    TEST_F(InputControllerFocusTest, JoypadSplitAssignmentIsRevokedOnSceneChange) {
+        Viewport primary(200, 200);
+        InputController controller(nullptr, primary);
+        RenderingManager rendering;
+        services().set(&rendering);
+        controller.updateViewportBounds(0, 0, 200, 200);
+        rendering.restoreSplitViewMode(SplitViewMode::IndependentDual, primary);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.beginMouseButton(input::ACTION_PRESS, 160, 80);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_PRESS, 160, 80);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::LEFT), input::ACTION_RELEASE, 160, 80);
+        router.endMouseButton(input::ACTION_RELEASE, 160, 80);
+        ASSERT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Right);
+        core::events::state::SceneCleared{}.emit();
+        EXPECT_EQ(controller.gamepadNavigationPanel(), SplitViewPanelId::Left);
+        services().clear();
     }
 
 } // namespace lfs::vis

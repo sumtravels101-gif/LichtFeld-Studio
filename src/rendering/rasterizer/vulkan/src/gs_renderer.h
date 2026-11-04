@@ -5,12 +5,30 @@
 #include "../shader/src/slang/overlay_flags.inc"
 #include "indirect_layout.h"
 #include "perf_timer.h"
+#include "stochastic.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
+#include <utility>
 #include <vector>
+
+namespace lfs::vis {
+    struct UserShaderTestAccess;
+    struct HiGSExportTestAccess;
+} // namespace lfs::vis
+
+struct VulkanGSOutlineStyle {
+    float red = 0.0f;
+    float green = 0.604f;
+    float blue = 0.733f;
+    float opacity = 1.0f;
+    float width = 2.0f;
+    float threshold = 0.5f;
+    uint32_t holes = 1;
+};
+static_assert(sizeof(VulkanGSOutlineStyle) == 28);
 
 // Descriptor layouts for q16/f16 projection skip binding 2 (shN is a 64-bit
 // buffer device address in push constants, not a storage-buffer descriptor).
@@ -105,8 +123,14 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t color_tonemapping;
     uint32_t splat_render_profile;
     float rasterization_scale;
+    // Orthographic views move the eye back along the view axis so nothing lies behind it; depth outputs subtract
+    // this distance again, so they stay measured from the viewport camera (match shader).
+    float depth_offset;
+    uint32_t stochastic_frame;
+    uint32_t stochastic_mode;
+    uint32_t stochastic_history_valid;
 });
-static_assert(sizeof(VulkanGSRendererUniforms) == 208);
+static_assert(sizeof(VulkanGSRendererUniforms) == 224);
 static_assert(offsetof(VulkanGSRendererUniforms, shN_address) % 8 == 0);
 static_assert(offsetof(VulkanGSRendererUniforms, dist_coeffs) % 16 == 0);
 
@@ -196,6 +220,9 @@ inline constexpr uint32_t kLodCompactProtectedCap = 98304;
 inline constexpr uint32_t kLodCompactMissCap = 16384;
 
 class VulkanGSRenderer : public VulkanGSPipeline {
+    friend struct lfs::vis::UserShaderTestAccess;
+    friend struct lfs::vis::HiGSExportTestAccess;
+
 public:
     struct PrimitiveVisibilityStats {
         size_t visible_count = 0; // clamped to the frame's visible capacity
@@ -207,10 +234,16 @@ public:
         size_t waves_needed = 0;
         size_t waves_armed = 0;
         bool count_overflow = false;
+        std::uint64_t submission_value = 0;
     };
     struct TileInstanceGate {
         size_t raw_count = 0;
         bool count_overflow = false;
+    };
+    // A complete single wave leaves its groups resident in one sort stream.
+    // The caller must prove that projection and scratch are unchanged.
+    struct StochasticTileState {
+        bool is_unsorted_1 = true;
     };
     struct LodSelectionStats {
         float threshold_scale = 1.0f;
@@ -241,6 +274,31 @@ public:
                             PFN_vkCmdBeginConditionalRenderingEXT begin_conditional_rendering = nullptr,
                             PFN_vkCmdEndConditionalRenderingEXT end_conditional_rendering = nullptr);
     void cleanup();
+
+    struct HostInputs {
+        bool quant_pool = false, shN_q16 = false, shN_f16 = false;
+        bool gut = false, survivors = false, banded = false;
+    };
+    struct HostPlan {
+        std::array<_ComputePipeline*, 10> programs{};
+        std::size_t count = 0;
+        std::string_view host;
+        bool banded = false;
+    };
+    _ComputePipeline* planned_custom_projection_ = nullptr;
+    [[nodiscard]] _ComputePipeline& projectionProgram(const HostInputs&);
+    [[nodiscard]] HostPlan hostsFor(const HostInputs& inputs);
+    CustomEffectDraw setCustomEffect(bool enabled, const HostPlan& plan);
+    void disableCustomEffect() { (void)VulkanGSPipeline::setCustomEffect(false, {}); }
+    // The program sets of those draws; see VulkanGSPipeline.
+    using VulkanGSPipeline::ComputeProgramSource;
+    using VulkanGSPipeline::deviceGeneration;
+    using VulkanGSPipeline::drainRetiredProgramSets;
+    using VulkanGSPipeline::invalidateProgramSets;
+    using VulkanGSPipeline::prepareProgramSet;
+    using VulkanGSPipeline::ProgramSetHandle;
+    using VulkanGSPipeline::programSetReady;
+    using VulkanGSPipeline::useProgramSet;
 
     void tagDeferredVisibleCountReadback(VkSemaphore semaphore, std::uint64_t value);
     void tagDeferredLodSelectionReadback(VkSemaphore semaphore, std::uint64_t value);
@@ -316,7 +374,10 @@ public:
                                 const _VulkanBuffer& overlay_params,
                                 bool overlays_active,
                                 bool predicate_waves = true,
-                                std::span<const uint32_t> exact_depth_sample_mask = {});
+                                std::span<const uint32_t> exact_depth_sample_mask = {},
+                                const _VulkanBuffer* outline_transform_indices = nullptr,
+                                bool single_node_outline = false,
+                                const VulkanGSOutlineStyle& outline_style = {});
     [[nodiscard]] bool supportsFloat16Storage() const { return supports_float16_storage_; }
     [[nodiscard]] bool supportsConditionalRendering() const {
         return supports_conditional_rendering_;
@@ -357,7 +418,16 @@ public:
                                  const _VulkanBuffer& model_transforms,
                                  bool use_gut_rasterization = false,
                                  bool overlays_active = true,
-                                 bool predicate_waves = true);
+                                 bool predicate_waves = true,
+                                 bool selection_outline = false,
+                                 bool single_node_outline = false,
+                                 const VulkanGSOutlineStyle& outline_style = {},
+                                 std::optional<StochasticTileState> cached_tiles = std::nullopt);
+    // One immutable volume per renderer/device, uploaded before recording a
+    // SteadySplats frame. Basic stochastic sampling retains white noise.
+    const _VulkanBuffer& prepareStochasticNoise();
+    // Hands the volume to the caller, which destroys it once no frame uses it.
+    [[nodiscard]] _VulkanBuffer releaseStochasticNoise() noexcept { return std::exchange(stochastic_noise_, {}); }
     // When set, forward forces the non-batched per-pixel rasterizer: the
     // load-balanced batched compose only covers a subset of pixels, leaving the
     // rest with shared-buffer residue, which corrupts a one-shot depth readback.
@@ -386,7 +456,17 @@ public:
     // Projection rejects are compacted out on the GPU before the radix sort.
     // Writes the depth-ranked primitive indices into buffers.primitive_sort_indices.
     void executeSortPrimitivesByDepth(const VulkanGSRendererUniforms& uniforms,
-                                      VulkanGSPipelineBuffers& buffers);
+                                      VulkanGSPipelineBuffers& buffers,
+                                      bool sort_depth = true);
+
+    void executeStochasticReuse(const VulkanGSRendererUniforms& uniforms,
+                                VulkanGSPipelineBuffers& buffers,
+                                VulkanGSStochasticBuffers& history);
+    [[nodiscard]] const _VulkanBuffer& executeStochasticResolve(
+        const VulkanGSStochasticResolveUniforms& uniforms,
+        VulkanGSPipelineBuffers& buffers,
+        VulkanGSStochasticBuffers& history,
+        std::size_t output_index);
 
     // Reorder tiles_touched into depth-rank order so the subsequent cumsum
     // produces offsets matching the depth-ordered walk in generate_keys.
@@ -429,6 +509,13 @@ protected:
                                       bool wave_barriers_hoisted);
     void executePrepareTileSort(const VulkanGSRendererUniforms& uniforms,
                                 VulkanGSPipelineBuffers& buffers);
+    // The derived geometry of a custom effect 3DGUT draw, sized for `slots`
+    // render slots; any other projection retires it.
+    _VulkanBuffer* prepareCustomGeometry(VulkanGSPipelineBuffers& buffers, size_t slots, bool gut);
+    // The projection programs for the encoding `buffers` holds, shared by the
+    // dispatches and custom draw resolution.
+    _ComputePipeline& forwardProjectionProgram(const VulkanGSPipelineBuffers& buffers, bool gut);
+    _ComputePipeline& survivorProjectionProgram(const VulkanGSPipelineBuffers& buffers);
 
     // Binding 8 is unused (legacy write-only radii buffer deleted). Shader
     // binding numbers stay stable so tagged lists keep placeholder slot 8.
@@ -508,9 +595,16 @@ protected:
         _ComputePipeline(4),
         _ComputePipeline(4)};
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(15);
-    _ComputePipelinePair pipeline_rasterize_forward_3dgut = _ComputePipelinePair(21);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut = _ComputePipelinePair(24);
     _ComputePipelinePair pipeline_rasterize_forward_plain = _ComputePipelinePair(15);
-    _ComputePipelinePair pipeline_rasterize_forward_3dgut_plain = _ComputePipelinePair(21);
+    _ComputePipelinePair pipeline_rasterize_stochastic = _ComputePipelinePair(17);
+    _ComputePipelinePair pipeline_rasterize_stochastic_plain = _ComputePipelinePair(17);
+    _VulkanBuffer stochastic_noise_;
+    _ComputePipeline pipeline_stochastic_reuse = _ComputePipeline(6);
+    _ComputePipeline pipeline_stochastic_resolve = _ComputePipeline(6);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut_plain = _ComputePipelinePair(24);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut_rad = _ComputePipelinePair(24);
+    _ComputePipelinePair pipeline_rasterize_forward_3dgut_plain_rad = _ComputePipelinePair(24);
     _ComputePipelinePair pipeline_rasterize_forward_light = _ComputePipelinePair(15);
     _ComputePipelinePair pipeline_rasterize_forward_light_plain = _ComputePipelinePair(15);
     _ComputePipeline pipeline_tile_batch_descriptors = _ComputePipeline(4);
@@ -518,6 +612,23 @@ protected:
     _ComputePipelinePair pipeline_rasterize_forward_batches_plain = _ComputePipelinePair(7);
     _ComputePipeline pipeline_compose_tile_batches = _ComputePipeline(17);
     _ComputePipeline pipeline_compose_tile_batches_plain = _ComputePipeline(12);
+    _ComputePipelinePair pipeline_rasterize_outline = _ComputePipelinePair(21);
+    _ComputePipelinePair pipeline_rasterize_outline_gut = _ComputePipelinePair(27);
+    _ComputePipelinePair pipeline_rasterize_outline_gut_rad = _ComputePipelinePair(27);
+    _ComputePipelinePair pipeline_rasterize_outline_gut_plain_rad = _ComputePipelinePair(27);
+    _ComputePipelinePair pipeline_rasterize_outline_plain = _ComputePipelinePair(21);
+    _ComputePipelinePair pipeline_rasterize_outline_gut_plain = _ComputePipelinePair(27);
+    _ComputePipeline pipeline_outline_resolve = _ComputePipeline(4);
+    _ComputePipeline pipeline_outline_seeds = _ComputePipeline(3);
+    _ComputePipeline pipeline_outline_horizontal = _ComputePipeline(2);
+    _ComputePipeline pipeline_outline_background_init = _ComputePipeline(2);
+    _ComputePipeline pipeline_outline_background_union = _ComputePipeline(2);
+    _ComputePipeline pipeline_outline_mask = _ComputePipeline(13);
+    _ComputePipeline pipeline_outline_coverage = _ComputePipeline(2);
+    void executeOutlineCoverage(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, float threshold);
+    void executeOutlineResolve(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, const VulkanGSOutlineStyle& style);
+    _ComputePipeline pipeline_outline_tiles = _ComputePipeline(5);
+    void executeOutlineTiles(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     _ComputePipeline pipeline_expected_depth_finalize = _ComputePipeline(2);
     bool depth_capture_ = false;
     struct _CumsumComputePipeline {

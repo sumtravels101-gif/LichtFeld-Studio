@@ -90,6 +90,7 @@ namespace lfs::vis::gui {
                 }
             }
             snapshot.model_transforms = render_state.model_transforms;
+            snapshot.effect_scene = shaders::captureEffectScene(scene, snapshot.model_transforms.size());
             snapshot.node_active_sh_degrees = render_state.node_active_sh_degrees;
             snapshot.transform_indices = owned ? cloneOptionalTensor(render_state.transform_indices) : render_state.transform_indices;
             snapshot.selection_mask = owned ? cloneOptionalTensor(render_state.selection_mask) : render_state.selection_mask;
@@ -160,6 +161,22 @@ namespace lfs::vis::gui {
                 };
                 break;
             }
+        }
+
+        const lfs::core::NodeId selected_polygon_id = scene_manager.getSelectedNodeCropPolygonId();
+        snapshot.crop_polygons.reserve(render_state.crop_polygons.size());
+        for (const auto& polygon : render_state.crop_polygons) {
+            if (!polygon.data)
+                continue;
+            if (polygon.node_id == selected_polygon_id)
+                snapshot.selected_crop_polygon_index = static_cast<int>(snapshot.crop_polygons.size());
+            snapshot.crop_polygons.push_back(VideoExportCropPolygonSnapshot{
+                .node_id = polygon.node_id,
+                .parent_splat_id = polygon.parent_splat_id,
+                .parent_node_index = scene.getVisibleNodeIndex(polygon.parent_splat_id),
+                .data = *polygon.data,
+                .world_transform = polygon.world_transform,
+            });
         }
 
         if (!snapshot.hasRenderableContent()) {

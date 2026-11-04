@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "app/licht_command.hpp"
+#include "core/native_fs.hpp"
 
 #include "app/terminal_progress_bar.hpp"
 #include "core/path_utils.hpp"
@@ -10,14 +11,19 @@
 #include "io/loader.hpp"
 #include "io/project_chapters.hpp"
 #include "io/project_document.hpp"
+#include "io/project_inspector.hpp"
 #include "io/project_operations.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <optional>
 #include <print>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace lfs::app {
 
@@ -76,12 +82,12 @@ namespace lfs::app {
             const std::filesystem::path& dataset,
             const lfs::io::project::EmbeddedDatasetManifest& manifest) {
             for (const auto& entry : manifest.entries) {
-                const auto source = dataset / std::filesystem::path(entry.rel_path);
+                const auto source = dataset / lfs::core::utf8_to_path(entry.rel_path);
                 std::error_code error;
-                if (!std::filesystem::is_regular_file(source, error) || error) {
+                if (!lfs::core::native_fs::is_regular_file(source, error) || error) {
                     return false;
                 }
-                const auto size = std::filesystem::file_size(source, error);
+                const auto size = lfs::core::native_fs::file_size(source, error);
                 if (error || size != entry.bytes) {
                     return false;
                 }
@@ -96,10 +102,128 @@ namespace lfs::app {
             return true;
         }
 
+        std::string format_size(const std::uint64_t bytes) {
+            constexpr std::array units{"bytes", "KiB", "MiB", "GiB", "TiB"};
+            auto value = static_cast<double>(bytes);
+            std::size_t unit = 0;
+            while (value >= 1024.0 && unit + 1 < units.size()) {
+                value /= 1024.0;
+                ++unit;
+            }
+            return unit == 0 ? std::format("{} bytes", bytes) : std::format("{:.1f} {}", value, units[unit]);
+        }
+
+        std::vector<lfs::io::project::ProjectInspectorCheckpoint>
+        newest_first(std::vector<lfs::io::project::ProjectInspectorCheckpoint> checkpoints) {
+            std::erase_if(checkpoints, [](const auto& checkpoint) { return !checkpoint.retained; });
+            std::ranges::stable_sort(checkpoints, std::ranges::greater{},
+                                     &lfs::io::project::ProjectInspectorCheckpoint::iteration);
+            return checkpoints;
+        }
+
+        int list_checkpoints(const std::filesystem::path& project) {
+            auto details = lfs::io::project::inspect_project_details(project);
+            if (!details) {
+                return print_io_error(details.error());
+            }
+            const auto checkpoints = newest_first(details->retained_checkpoints);
+            if (checkpoints.empty()) {
+                std::println("The project has no checkpoints.");
+            } else {
+                std::println("{:>10}  {:>10}  {:<36}", "Iteration", "Gaussians", "Checkpoint");
+                for (const auto& checkpoint : checkpoints) {
+                    std::println("{:>10}  {:>10}  {}{}", checkpoint.iteration, checkpoint.gaussians,
+                                 checkpoint.instance_uuid.to_string(),
+                                 checkpoint.binds_scene_graph ? "  resume" : "");
+                }
+            }
+            std::println("Project: {} ({})", lfs::core::path_to_utf8(project),
+                         format_size(details->card.physical_file_size));
+            return 0;
+        }
+
+        int remove_checkpoints(const std::filesystem::path& project,
+                               const core::args::LichtMode& mode) {
+            auto details = lfs::io::project::inspect_project_details(project);
+            if (!details) {
+                return print_io_error(details.error());
+            }
+            const auto checkpoints = newest_first(details->retained_checkpoints);
+            std::vector<lfs::io::project::ProjectInspectorCheckpoint> removed;
+            if (mode.action == core::args::LichtMode::Action::PRUNE_CHECKPOINTS) {
+                std::size_t kept = 0;
+                for (const auto& checkpoint : checkpoints) {
+                    if (!checkpoint.binds_scene_graph && kept++ >= mode.keep_checkpoints) {
+                        removed.push_back(checkpoint);
+                    }
+                }
+            } else {
+                for (const auto iteration : mode.checkpoint_iterations) {
+                    const auto before = removed.size();
+                    for (const auto& checkpoint : checkpoints) {
+                        if (checkpoint.iteration == iteration) {
+                            removed.push_back(checkpoint);
+                        }
+                    }
+                    if (removed.size() == before) {
+                        return print_error(std::format("The project has no checkpoint at iteration {}.", iteration));
+                    }
+                }
+            }
+            if (removed.empty()) {
+                std::println("No checkpoints to remove.");
+                std::println("Project: {} ({})", lfs::core::path_to_utf8(project),
+                             format_size(details->card.physical_file_size));
+                return 0;
+            }
+
+            lfs::io::project::ProjectReduceSelection selection;
+            for (const auto& checkpoint : removed) {
+                selection.checkpoints.push_back(checkpoint.instance_uuid);
+                if (checkpoint.binds_scene_graph) {
+                    std::println("Removing the resume checkpoint at iteration {}: the trained model stays in the "
+                                 "project, but training can no longer resume from it.",
+                                 checkpoint.iteration);
+                }
+            }
+            TerminalProgressBar bar("Removing checkpoints");
+            auto reduced = lfs::io::project::reduce_size(
+                project, false, false,
+                [&bar](const float value, const std::string& stage) { bar.report(value, stage); },
+                {}, selection);
+            if (!reduced) {
+                bar.abort();
+                return print_io_error(reduced.error());
+            }
+            bar.complete();
+            std::string iterations;
+            for (const auto& checkpoint : removed) {
+                iterations += std::format("{}{}", iterations.empty() ? "" : ", ", checkpoint.iteration);
+            }
+            const auto plural = reduced->checkpoints_removed == 1 ? "" : "s";
+            std::println("Removed {} checkpoint{} (iteration{} {}), reclaimed {}.", reduced->checkpoints_removed,
+                         plural, plural, iterations, format_size(reduced->bytes_reclaimed));
+            std::println("Project: {} ({})", lfs::core::path_to_utf8(project),
+                         format_size(reduced->card.physical_file_size));
+            std::println("Recovery copy of the previous project ({}): {}",
+                         format_size(details->card.physical_file_size),
+                         lfs::core::path_to_utf8(reduced->recovery_copy));
+            return 0;
+        }
+
     } // namespace
 
     int run_licht_command(const core::args::LichtMode& mode) {
         const auto project = std::filesystem::absolute(mode.project_path).lexically_normal();
+        switch (mode.action) {
+        case core::args::LichtMode::Action::LIST_CHECKPOINTS:
+            return list_checkpoints(project);
+        case core::args::LichtMode::Action::PRUNE_CHECKPOINTS:
+        case core::args::LichtMode::Action::REMOVE_CHECKPOINTS:
+            return remove_checkpoints(project, mode);
+        case core::args::LichtMode::Action::EMBED:
+            break;
+        }
         auto document = lfs::io::project::ProjectDocument::open(project);
         if (!document) {
             return print_io_error(document.error());
@@ -135,7 +259,7 @@ namespace lfs::app {
             }
             auto resolved = lfs::io::project::resolve_path_reference(
                 document->references(), project.parent_path(), **existing_reference);
-            if (!resolved || !std::filesystem::is_directory(*resolved)) {
+            if (!resolved || !lfs::core::native_fs::is_directory(*resolved)) {
                 return print_error(
                     "The referenced dataset folder is unavailable. Specify --embed <dataset>.");
             }
@@ -143,15 +267,15 @@ namespace lfs::app {
         }
 
         if (!dataset.is_absolute()) {
-            dataset = std::filesystem::current_path() / dataset;
+            dataset = lfs::core::native_fs::current_path() / dataset;
         }
         dataset = std::filesystem::absolute(dataset).lexically_normal();
         std::error_code equivalence_error;
         const bool same_dataset = previous_dataset &&
-                                  std::filesystem::equivalent(
+                                  lfs::core::native_fs::equivalent(
                                       *previous_dataset, dataset, equivalence_error) &&
                                   !equivalence_error;
-        if (!std::filesystem::is_directory(dataset)) {
+        if (!lfs::core::native_fs::is_directory(dataset)) {
             return print_error(std::format("Dataset folder not found: {}",
                                            lfs::core::path_to_utf8(dataset)));
         }

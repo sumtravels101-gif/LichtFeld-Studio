@@ -71,16 +71,23 @@ class TestOptimizationParams:
         mesh.write_text("v 0 0 1\n", encoding="utf-8")
         params = lf.optimization_params()
         original_path = params.eval_mask
-        original_invert = params.eval_mask_invert
+        original_report = params.eval_mask_report
+        original_eval = params.enable_eval
         try:
             monkeypatch.chdir(tmp_path)
+            # A mask is only valid with evaluation on.
+            params.enable_eval = True
             params.eval_mask = "mask.obj"
-            params.eval_mask_invert = True
+            params.eval_mask_report = "inverted,mask"
             assert params.eval_mask == str(mesh.resolve())
-            assert params.eval_mask_invert is True
+            assert params.eval_mask_report == "inverted,mask"
+            with pytest.raises(ValueError):
+                params.eval_mask_report = "inverted,background"
+            assert params.eval_mask_report == "inverted,mask"
         finally:
             params.eval_mask = original_path
-            params.eval_mask_invert = original_invert
+            params.eval_mask_report = original_report
+            params.enable_eval = original_eval
 
     def test_depth_loss_properties_are_editable(self, lf):
         """Depth loading/loss controls should be exposed through Python params."""
@@ -639,3 +646,17 @@ class TestUILayout:
         """UILayout class should exist in ui submodule."""
         assert hasattr(lf.ui, "UILayout")
         # Can't instantiate directly without an active panel draw context
+
+
+@pytest.mark.parametrize("prop, expected", [
+    ("raster_backend", "3dgs"),
+    ("mesh_shadow_resolution", "2048"),
+    ("grid_plane", "1"),
+])
+def test_render_label_defaults_match_native_enum_descriptors(lf, prop, expected):
+    settings = lf.get_render_settings()
+    if settings is None:
+        pytest.skip("Requires a rendering context")
+    info = settings.prop_info(prop)
+    descriptor = settings.get_all_properties()[prop]
+    assert info["default_identifier"] == info["builtin_default"] == descriptor.default == expected

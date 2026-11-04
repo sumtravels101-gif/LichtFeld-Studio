@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "vulkan_context.hpp"
+#include "core/native_fs.hpp"
 
 #include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
@@ -656,7 +657,10 @@ namespace lfs::vis {
         return fail(std::format("{}: {}", detail_on_fail, result.error().detail()));
     }
 
-    bool VulkanContext::init(SDL_Window* window, const int framebuffer_width, const int framebuffer_height) {
+    bool VulkanContext::init(SDL_Window* window, const int framebuffer_width, const int framebuffer_height,
+                             VulkanDeviceHooks hooks) {
+        device_hooks_ = std::move(hooks);
+        transparent_surface_ = (SDL_GetWindowFlags(window) & SDL_WINDOW_TRANSPARENT) != 0;
         framebuffer_width_ = framebuffer_width;
         framebuffer_height_ = framebuffer_height;
 
@@ -678,6 +682,7 @@ namespace lfs::vis {
             timed("vulkan_init.createCommandPool", [&] { return createCommandPool(); }) &&
             timed("vulkan_init.createCommandBuffers", [&] { return createCommandBuffers(); }) &&
             timed("vulkan_init.createSyncObjects", [&] { return createSyncObjects(); });
+        device_hooks_ = {};
         return initialized;
     }
 
@@ -698,8 +703,9 @@ namespace lfs::vis {
                           static_cast<int>(idle_result));
             }
         }
-        lfs::rendering::set_graphics_queue_external_sync(
-            nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr);
+        if (owns_scene_runtimes_)
+            lfs::rendering::set_graphics_queue_external_sync(
+                nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr);
 
         // #1488: surface leaked External* counts after idle, before device destroy.
         {
@@ -1966,9 +1972,9 @@ namespace lfs::vis {
             copy_region.bufferRowLength = 0;
             copy_region.bufferImageHeight = 0;
             copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copy_region.imageSubresource.layerCount = 1;
             copy_region.imageSubresource.mipLevel = 0;
             copy_region.imageSubresource.baseArrayLayer = 0;
+            copy_region.imageSubresource.layerCount = 1;
             copy_region.imageOffset = {0, 0, 0};
             copy_region.imageExtent = {extent.width, extent.height, 1};
             vkCmdCopyImageToBuffer(command_buffer,
@@ -2364,7 +2370,9 @@ namespace lfs::vis {
         create_info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         create_info.ppEnabledExtensionNames = extensions.data();
 
-        const VkResult result = vkCreateInstance(&create_info, nullptr, &instance_);
+        const VkResult result = device_hooks_.create_instance
+                                    ? device_hooks_.create_instance(create_info, instance_)
+                                    : vkCreateInstance(&create_info, nullptr, &instance_);
         if (result != VK_SUCCESS) {
             return setVkFailure(std::format("vkCreateInstance failed: {}", vkResultToString(result)), result);
         }
@@ -2642,6 +2650,10 @@ namespace lfs::vis {
         }
         if (physical_device_ == VK_NULL_HANDLE) {
             return fail("No Vulkan device supports graphics presentation, swapchain creation, Vulkan 1.3, and required features");
+        }
+        if (device_hooks_.required_physical_device &&
+            device_hooks_.required_physical_device(instance_) != physical_device_) {
+            return fail("The device hooks require a different GPU than the one selected for rendering");
         }
 
         VkPhysicalDeviceProperties props{};
@@ -2975,7 +2987,9 @@ namespace lfs::vis {
         create_info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         create_info.ppEnabledExtensionNames = extensions.data();
 
-        const VkResult result = vkCreateDevice(physical_device_, &create_info, nullptr, &device_);
+        const VkResult result = device_hooks_.create_device
+                                    ? device_hooks_.create_device(physical_device_, create_info, device_)
+                                    : vkCreateDevice(physical_device_, &create_info, nullptr, &device_);
         if (result != VK_SUCCESS) {
             return setVkFailure(std::format("vkCreateDevice failed: {}", vkResultToString(result)), result);
         }
@@ -3039,8 +3053,9 @@ namespace lfs::vis {
         sparse_binding_enabled_ = features2.features.sparseBinding == VK_TRUE;
         buffer_device_address_enabled_ = features12.bufferDeviceAddress == VK_TRUE;
         geometry_shader_enabled_ = features2.features.geometryShader == VK_TRUE;
-        lfs::rendering::set_graphics_queue_external_sync(
-            &graphics_queue_mutex_, graphics_queue_, present_queue_, &device_queue_access_mutex_);
+        if (owns_scene_runtimes_)
+            lfs::rendering::set_graphics_queue_external_sync(
+                &graphics_queue_mutex_, graphics_queue_, present_queue_, &device_queue_access_mutex_);
 
         VkPhysicalDeviceMaintenance3Properties maint3{};
         maint3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
@@ -3619,6 +3634,9 @@ namespace lfs::vis {
                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                             VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (buffer_device_address_enabled_) {
+            buffer_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        }
         // Same concurrent-queue rationale as createExternalImage.
         std::array<uint32_t, 2> external_buffer_families{
             graphics_queue_family_,
@@ -3724,9 +3742,17 @@ namespace lfs::vis {
         import_info.fd = dup_fd;
 #endif
 
+        VkMemoryAllocateFlagsInfo alloc_flags{};
+        alloc_flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        if (buffer_device_address_enabled_) {
+            alloc_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+            alloc_flags.pNext = &import_info;
+        }
+
         VkMemoryAllocateInfo allocate_info{};
         allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocate_info.pNext = &import_info;
+        allocate_info.pNext = buffer_device_address_enabled_ ? static_cast<void*>(&alloc_flags)
+                                                             : static_cast<void*>(&import_info);
         // Import the exact physical payload size recorded by the exporter, not
         // either the logical buffer view or Vulkan's memory-requirements size.
         allocate_info.allocationSize = exported_allocation_size;
@@ -3774,6 +3800,13 @@ namespace lfs::vis {
             return setVkFailure(std::format("vkBindBufferMemory(import) failed: {}", vkResultToString(result)), result);
         }
 
+        if (buffer_device_address_enabled_ && out.buffer != VK_NULL_HANDLE) {
+            VkBufferDeviceAddressInfo address_info{};
+            address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+            address_info.buffer = out.buffer;
+            out.device_address = vkGetBufferDeviceAddress(device_, &address_info);
+        }
+
         // We do NOT own the handle; the exporter retains it. Leave native_handle invalid.
         out.native_handle = kInvalidExternalNativeHandle;
         LOG_DEBUG(
@@ -3805,7 +3838,12 @@ namespace lfs::vis {
             return fail("Imported exportable block has no committed chunks");
         }
 
-        if (!sparse_binding_enabled_) {
+        const bool is_single_full_chunk =
+            block.chunks.size() == 1 &&
+            block.chunks[0].offset == 0 &&
+            block.chunks[0].bytes >= block.reserved_bytes;
+
+        if (!sparse_binding_enabled_ || is_single_full_chunk) {
             if (block.chunks.size() != 1 || block.chunks[0].offset != 0 ||
                 block.chunks[0].bytes < block.reserved_bytes) {
                 const auto violation = lfs::core::shareable_allocation_violation(
@@ -3814,13 +3852,18 @@ namespace lfs::vis {
                     "sparseBinding is required to import a multi-chunk or partially-committed "
                     "exportable CUDA block"));
             }
-            return importExternalBuffer(block.chunks[0].handle.native,
-                                        static_cast<VkDeviceSize>(block.reserved_bytes),
-                                        static_cast<VkDeviceSize>(block.chunks[0].bytes),
-                                        usage,
-                                        out,
-                                        diagnostic_scope,
-                                        diagnostic_label);
+            if (!importExternalBuffer(block.chunks[0].handle.native,
+                                      static_cast<VkDeviceSize>(block.reserved_bytes),
+                                      static_cast<VkDeviceSize>(block.chunks[0].bytes),
+                                      usage,
+                                      out,
+                                      diagnostic_scope,
+                                      diagnostic_label)) {
+                return false;
+            }
+            out.bound_chunk_offsets.push_back(0);
+            out.bound_chunks = 1;
+            return true;
         }
 
         VkExternalMemoryBufferCreateInfo external_buffer_info{};
@@ -3890,6 +3933,9 @@ namespace lfs::vis {
         if (unbound.empty()) {
             imported.bound_chunks = imported.bound_chunk_offsets.size();
             return true;
+        }
+        if (!imported.sparse) {
+            return fail("bindNewChunks requires a sparse imported VkBuffer");
         }
 
         VkMemoryRequirements memory_requirements{};
@@ -4608,7 +4654,9 @@ namespace lfs::vis {
         const bool extent_fixed_to_surface =
             support.capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max();
         const bool add_resize_headroom =
-            old_swapchain != VK_NULL_HANDLE && framebuffer_resize_allow_headroom_;
+            !transparent_surface_ && old_swapchain != VK_NULL_HANDLE && framebuffer_resize_allow_headroom_;
+        // Layered desktop panels require an exact surface extent. NVIDIA's
+        // scaled transparent swapchains can fail during interactive resizing.
         // Present scaling only has work to do when the swapchain is deliberately sized
         // away from the surface, which is the headroom path. Requesting it for an
         // exact-extent swapchain gains nothing and makes NVIDIA run a scaled-image setup
@@ -4658,6 +4706,16 @@ namespace lfs::vis {
         create_info.pQueueFamilyIndices = shared_queues ? queue_indices.data() : nullptr;
         create_info.preTransform = support.capabilities.currentTransform;
         create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        if (transparent_surface_) {
+            for (const auto alpha : {VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                                     VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+                                     VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR}) {
+                if (support.capabilities.supportedCompositeAlpha & alpha) {
+                    create_info.compositeAlpha = alpha;
+                    break;
+                }
+            }
+        }
         create_info.presentMode = present_mode;
         create_info.clipped = VK_TRUE;
         create_info.oldSwapchain = old_swapchain;
@@ -4677,7 +4735,10 @@ namespace lfs::vis {
             result = vkCreateSwapchainKHR(device_, &create_info, nullptr, &swapchain_);
         }
         if (result != VK_SUCCESS) {
-            return setVkFailure(std::format("vkCreateSwapchainKHR failed: {}", vkResultToString(result)), result);
+            return setVkFailure(std::format("vkCreateSwapchainKHR failed: {} (extent={}x{}, transparent={}, present_scaling={}, old_swapchain={:#x})",
+                                            vkResultToString(result), extent.width, extent.height,
+                                            transparent_surface_, use_present_scaling, vkHandleValue(old_swapchain)),
+                                result);
         }
         setDebugObjectName(VK_OBJECT_TYPE_SWAPCHAIN_KHR, swapchain_, "swapchain.main");
 
@@ -5156,7 +5217,7 @@ namespace lfs::vis {
                 }
                 std::error_code ec;
                 if (path) {
-                    std::filesystem::create_directories(path->parent_path(), ec);
+                    lfs::core::native_fs::create_directories(path->parent_path(), ec);
                 }
                 if (path && !ec) {
                     const auto temporary = *path;
@@ -5170,14 +5231,14 @@ namespace lfs::vis {
                         file.close();
                         if (file) {
                             std::error_code rename_ec;
-                            std::filesystem::rename(temporary_path, *path, rename_ec);
+                            lfs::core::native_fs::rename(temporary_path, *path, rename_ec);
                             if (rename_ec) {
                                 // Windows does not replace an existing file
                                 // with rename(). The fallback still ensures
                                 // readers never see a partially written cache.
-                                std::filesystem::remove(*path, rename_ec);
+                                lfs::core::native_fs::remove(*path, rename_ec);
                                 rename_ec.clear();
-                                std::filesystem::rename(temporary_path, *path, rename_ec);
+                                lfs::core::native_fs::rename(temporary_path, *path, rename_ec);
                             }
                             if (!rename_ec) {
                                 saved_pipeline_cache_hash_ = cache_hash;

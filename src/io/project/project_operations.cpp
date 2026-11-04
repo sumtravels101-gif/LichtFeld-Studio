@@ -2,8 +2,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "io/project_operations.hpp"
+#include "core/native_fs.hpp"
 
 #include "core/image_io.hpp"
+#include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
 #include "core/splat_data_transform.hpp"
@@ -19,6 +21,7 @@
 #include "io/project_container.hpp"
 #include "io/project_document.hpp"
 #include "project_container_internal.hpp"
+#include "project_filesystem.hpp"
 #include "span_streambuf.hpp"
 
 #include <stb_image_write.h>
@@ -101,7 +104,7 @@ namespace lfs::io::project {
                     return std::move(identity).error();
                 std::error_code error;
                 if (active_operation_lease && !active_operation_lease->owns(path) &&
-                    std::filesystem::exists(path, error))
+                    lfs::core::native_fs::exists(path, error))
                     return fail<WriterLockLease>(lfs::ErrorCode::FailedPrecondition, path,
                                                  "The project path changed before writing. Refresh Projects and try again.",
                                                  "the operation tried to edit a different existing file", "operation.path");
@@ -126,7 +129,7 @@ namespace lfs::io::project {
             return fourcc == FOURCC_PROJ || fourcc == FOURCC_PRMS ||
                    fourcc == FOURCC_SCNG || fourcc == FOURCC_SELM ||
                    fourcc == FOURCC_REFS || fourcc == FOURCC_GUIL ||
-                   fourcc == FOURCC_VIEW || fourcc == FOURCC_EDTR ||
+                   fourcc == FOURCC_SHDR || fourcc == FOURCC_VIEW || fourcc == FOURCC_EDTR ||
                    fourcc == FOURCC_SEQR || fourcc == FOURCC_METR;
         }
 
@@ -134,16 +137,15 @@ namespace lfs::io::project {
                        const std::filesystem::path& rhs) {
             std::error_code lhs_error;
             std::error_code rhs_error;
-            const auto left = std::filesystem::weakly_canonical(lhs, lhs_error);
-            const auto right = std::filesystem::weakly_canonical(rhs, rhs_error);
-            return !lhs_error && !rhs_error &&
-                   left.lexically_normal() == right.lexically_normal();
+            const auto left = detail::project_fs::weakly_canonical(lhs, lhs_error);
+            const auto right = detail::project_fs::weakly_canonical(rhs, rhs_error);
+            return !lhs_error && !rhs_error && left == right;
         }
 
         lfs::Result<void> refuse_existing_destination(
             const std::filesystem::path& path) {
             std::error_code error;
-            if (std::filesystem::exists(path, error)) {
+            if (lfs::core::native_fs::exists(path, error)) {
                 return fail<void>(
                     lfs::ErrorCode::AlreadyExists, path,
                     "The restore destination already exists.",
@@ -403,7 +405,7 @@ namespace lfs::io::project {
                 document.source_path() ? document.source_path()->parent_path()
                                        : std::filesystem::path{},
                 **dataset_uuid);
-            if (!root || !std::filesystem::is_directory(*root)) {
+            if (!root || !lfs::core::native_fs::is_directory(*root)) {
                 return status;
             }
             auto directory_check = check_fingerprint(*root, (*record)->fingerprint);
@@ -416,8 +418,8 @@ namespace lfs::io::project {
                 std::error_code error;
                 if (relative.empty() || relative.is_absolute() ||
                     relative.lexically_normal() != relative ||
-                    !std::filesystem::is_regular_file(file, error) || error ||
-                    std::filesystem::file_size(file, error) != entry.bytes || error) {
+                    !lfs::core::native_fs::is_regular_file(file, error) || error ||
+                    lfs::core::native_fs::file_size(file, error) != entry.bytes || error) {
                     return status;
                 }
                 auto hash = hash_dataset_file(file);
@@ -433,7 +435,7 @@ namespace lfs::io::project {
         }
 
         lfs::Result<ProjectReducePlan>
-        make_reduce_plan(const std::filesystem::path& path) {
+        make_reduce_plan(const std::filesystem::path& path, const bool validate_dataset_replacement = true) {
             auto reader = ProjectReader::open(path);
             if (!reader) {
                 return std::move(reader).error();
@@ -487,11 +489,15 @@ namespace lfs::io::project {
             }
             bool all_external = manifest->has_value();
             if (*manifest) {
-                auto external = validate_external_dataset(*document, **manifest);
-                if (!external) {
-                    return std::move(external).error();
+                bool external_valid = false;
+                if (validate_dataset_replacement) {
+                    auto external = validate_external_dataset(*document, **manifest);
+                    if (!external) {
+                        return std::move(external).error();
+                    }
+                    external_valid = external->valid;
                 }
-                all_external = external->valid;
+                all_external = external_valid;
                 for (const auto& entry : (**manifest).entries) {
                     const auto* row = reader->find(FOURCC_DSRC, entry.chunk_uuid);
                     plan.embedded_dataset.push_back(ProjectReduceDatasetPayload{
@@ -499,7 +505,7 @@ namespace lfs::io::project {
                         .rel_path = entry.rel_path,
                         .kind = entry.kind,
                         .bytes = row ? row_occupied_bytes(*row) : entry.bytes,
-                        .external_replacement_validated = external->valid,
+                        .external_replacement_validated = external_valid,
                     });
                 }
             } else {
@@ -571,7 +577,7 @@ namespace lfs::io::project {
                 lfs::io::Loader::getDatasetType(root) == DatasetType::Transforms;
             if (!configured_images.empty() && configured_images != ".") {
                 const auto configured = root / lfs::core::utf8_to_path(configured_images);
-                if (std::filesystem::is_directory(configured)) {
+                if (lfs::core::native_fs::is_directory(configured)) {
                     info.images_path = configured;
                 }
             }
@@ -580,14 +586,14 @@ namespace lfs::io::project {
             std::vector<std::pair<std::filesystem::path, std::string>> result;
             const auto append = [&](const std::filesystem::path& directory,
                                     const std::string_view kind) {
-                if (!std::filesystem::is_directory(directory)) {
+                if (!lfs::core::native_fs::is_directory(directory)) {
                     return;
                 }
                 std::error_code error;
-                for (std::filesystem::recursive_directory_iterator it(directory, error), end;
+                for (std::filesystem::recursive_directory_iterator it(lfs::core::native_fs::traversal_path(directory), error), end;
                      !error && it != end; it.increment(error)) {
                     if (it->is_regular_file(error) && !error) {
-                        result.emplace_back(it->path(), std::string(kind));
+                        result.emplace_back(lfs::core::native_fs::entry_path(directory, it->path()), std::string(kind));
                     }
                 }
             };
@@ -621,17 +627,17 @@ namespace lfs::io::project {
                                     "transforms_train.json", "transforms_test.json",
                                     "transforms_val.json"}) {
                 const auto file = root / name;
-                if (std::filesystem::is_regular_file(file)) {
+                if (lfs::core::native_fs::is_regular_file(file)) {
                     result.emplace_back(file, "meta");
                 }
             }
             if (transforms_dataset) {
-                const auto transforms_path = std::filesystem::is_regular_file(
+                const auto transforms_path = lfs::core::native_fs::is_regular_file(
                                                  root / "transforms_train.json")
                                                  ? root / "transforms_train.json"
                                                  : root / "transforms.json";
                 try {
-                    std::ifstream input(transforms_path, std::ios::binary);
+                    std::ifstream input(lfs::core::native_fs::native_path(transforms_path), std::ios::binary);
                     const auto document = nlohmann::json::parse(input);
                     if (document.contains("frames") && document["frames"].is_array()) {
                         for (const auto& frame : document["frames"]) {
@@ -641,12 +647,12 @@ namespace lfs::io::project {
                             }
                             const auto image = GetTransformImagePath(
                                 root, frame["file_path"].get<std::string>());
-                            if (std::filesystem::is_regular_file(image))
+                            if (lfs::core::native_fs::is_regular_file(image))
                                 result.emplace_back(image, "image");
                             if (frame.contains("mask_path") && frame["mask_path"].is_string()) {
                                 const auto mask = root / lfs::core::utf8_to_path(
                                                              frame["mask_path"].get<std::string>());
-                                if (std::filesystem::is_regular_file(mask))
+                                if (lfs::core::native_fs::is_regular_file(mask))
                                     result.emplace_back(mask, "mask");
                             }
                         }
@@ -655,14 +661,14 @@ namespace lfs::io::project {
                         document["ply_file_path"].is_string()) {
                         const auto point_cloud = root / lfs::core::utf8_to_path(
                                                             document["ply_file_path"].get<std::string>());
-                        if (std::filesystem::is_regular_file(point_cloud))
+                        if (lfs::core::native_fs::is_regular_file(point_cloud))
                             result.emplace_back(point_cloud, "sparse");
                     }
                 } catch (const std::exception&) {
                     // LFS-CENSUS-OK(empty-catch): the loader reports malformed metadata when loading.
                 }
                 const auto fallback_point_cloud = root / "pointcloud.ply";
-                if (std::filesystem::is_regular_file(fallback_point_cloud))
+                if (lfs::core::native_fs::is_regular_file(fallback_point_cloud))
                     result.emplace_back(fallback_point_cloud, "sparse");
             }
             std::set<std::string> seen;
@@ -763,7 +769,7 @@ namespace lfs::io::project {
                 }
                 source_path = *materialized;
             }
-            if (!source_path || !std::filesystem::is_regular_file(*source_path)) {
+            if (!source_path || !lfs::core::native_fs::is_regular_file(*source_path)) {
                 return fail<std::shared_ptr<lfs::core::SplatData>>(
                     lfs::ErrorCode::NotFound, {},
                     "A visible splat source file could not be found.",
@@ -900,7 +906,7 @@ namespace lfs::io::project {
         find_repair_candidate(const std::filesystem::path& path) {
             constexpr std::uint64_t kScanLimit = 256ull * 1024 * 1024;
             std::error_code size_error;
-            const auto size = std::filesystem::file_size(path, size_error);
+            const auto size = lfs::core::native_fs::file_size(path, size_error);
             if (size_error) {
                 return fail<RepairCandidate>(
                     lfs::ErrorCode::NotFound, path,
@@ -913,7 +919,7 @@ namespace lfs::io::project {
                     "No valid project save was found for repair.",
                     "the file is shorter than one complete commit", "repair.candidate");
             }
-            std::ifstream input(path, std::ios::binary);
+            std::ifstream input(lfs::core::native_fs::native_path(path), std::ios::binary);
             if (!input) {
                 return fail<RepairCandidate>(
                     lfs::ErrorCode::PermissionDenied, path,
@@ -986,9 +992,9 @@ namespace lfs::io::project {
                 auto temporary = path;
                 temporary += ".repair-" + lfs::core::generate_uuid_v4().to_string() + ".tmp";
                 std::error_code copy_error;
-                if (!std::filesystem::copy_file(path, temporary,
-                                                std::filesystem::copy_options::none,
-                                                copy_error)) {
+                if (!lfs::core::native_fs::copy_file(path, temporary,
+                                                     std::filesystem::copy_options::none,
+                                                     copy_error)) {
                     return fail<RepairCandidate>(
                         lfs::ErrorCode::PermissionDenied, temporary,
                         "The repair staging file could not be created.", copy_error.message(),
@@ -999,7 +1005,7 @@ namespace lfs::io::project {
                 input.seekg(static_cast<std::streamoff>(candidate_offset));
                 input.read(reinterpret_cast<char*>(commit.data()), commit.size());
                 if (input.gcount() != static_cast<std::streamsize>(commit.size())) {
-                    std::filesystem::remove(temporary);
+                    lfs::core::native_fs::remove(temporary);
                     continue;
                 }
                 std::array<std::byte, HEAD_SLOT_BYTES> head{};
@@ -1079,10 +1085,10 @@ namespace lfs::io::project {
                     write_u32_bytes(head, 4092, crc32c(0, head.data(), 4092));
                 };
                 {
-                    std::fstream output(temporary,
+                    std::fstream output(lfs::core::native_fs::native_path(temporary),
                                         std::ios::binary | std::ios::in | std::ios::out);
                     if (!output) {
-                        std::filesystem::remove(temporary);
+                        lfs::core::native_fs::remove(temporary);
                         return fail<RepairCandidate>(
                             lfs::ErrorCode::PermissionDenied, temporary,
                             "The repair staging file could not be opened.", "open failed",
@@ -1095,7 +1101,7 @@ namespace lfs::io::project {
                     }
                     output.flush();
                     if (!output) {
-                        std::filesystem::remove(temporary);
+                        lfs::core::native_fs::remove(temporary);
                         return fail<RepairCandidate>(
                             lfs::ErrorCode::PermissionDenied, temporary,
                             "The repair staging head could not be written.", "write failed",
@@ -1110,7 +1116,7 @@ namespace lfs::io::project {
                         .preview_selection_recovered = recovered_preview.has_value(),
                     };
                 }
-                std::filesystem::remove(temporary);
+                lfs::core::native_fs::remove(temporary);
             }
             return fail<RepairCandidate>(
                 lfs::ErrorCode::DataLoss, path,
@@ -1177,7 +1183,7 @@ namespace lfs::io::project {
         if (!recovery_identity)
             return std::move(recovery_identity).error();
         std::error_code error;
-        if (std::filesystem::exists(recovery, error)) {
+        if (lfs::core::native_fs::exists(recovery, error)) {
             auto backup = ProjectReader::open(recovery);
             if (backup && backup->superblock().project_uuid == reader->superblock().project_uuid &&
                 backup->commit().commit_uuid == reader->commit().commit_uuid &&
@@ -1187,26 +1193,26 @@ namespace lfs::io::project {
                                                "The existing recovery copy is damaged or belongs to another file.",
                                                "backup identity does not match its source", "recovery_copy");
         }
-        std::filesystem::create_directories(recovery.parent_path(), error);
+        lfs::core::native_fs::create_directories(recovery.parent_path(), error);
         if (error)
             return fail<std::filesystem::path>(lfs::ErrorCode::PermissionDenied, recovery,
                                                "The recovery folder could not be created.", error.message(), "recovery_copy");
         const auto temporary = lfs::io::make_atomic_temp_output_path(recovery);
-        if (!std::filesystem::copy_file(path, temporary, std::filesystem::copy_options::none, error)) {
+        if (!lfs::core::native_fs::copy_file(path, temporary, std::filesystem::copy_options::none, error)) {
             const auto reason = error.message();
-            std::filesystem::remove(temporary, error);
+            lfs::core::native_fs::remove(temporary, error);
             return fail<std::filesystem::path>(lfs::ErrorCode::PermissionDenied, temporary,
                                                "The recovery copy could not be created.", reason, "recovery_copy");
         }
         for (const auto* identity : {&*source_identity, &*recovery_identity}) {
             if (auto checked = identity->validate(); !checked) {
-                std::filesystem::remove(temporary, error);
+                lfs::core::native_fs::remove(temporary, error);
                 return std::move(checked).error();
             }
         }
         auto copied = lfs::io::replace_atomic_output_file(temporary, recovery_identity->canonical_path, lfs::io::AtomicOutputDurability::Durable);
         if (!copied) {
-            std::filesystem::remove(temporary, error);
+            lfs::core::native_fs::remove(temporary, error);
             return fail<std::filesystem::path>(lfs::ErrorCode::PermissionDenied, recovery,
                                                "The recovery copy could not be saved.", copied.error().message, "recovery_copy");
         }
@@ -1251,23 +1257,23 @@ namespace lfs::io::project {
         }
         const auto temporary = lfs::io::make_atomic_temp_output_path(identity->canonical_path);
         std::error_code error;
-        if (!std::filesystem::copy_file(backup, temporary, std::filesystem::copy_options::none, error)) {
+        if (!lfs::core::native_fs::copy_file(backup, temporary, std::filesystem::copy_options::none, error)) {
             const auto reason = error.message();
-            std::filesystem::remove(temporary, error);
+            lfs::core::native_fs::remove(temporary, error);
             return fail<void>(lfs::ErrorCode::PermissionDenied, path,
                               "The recovery copy could not be restored.", reason, "recovery.copy");
         }
         if (auto checked = identity->validate(); !checked) {
-            std::filesystem::remove(temporary, error);
+            lfs::core::native_fs::remove(temporary, error);
             return checked;
         }
         if (auto checked = backup_identity->validate(); !checked) {
-            std::filesystem::remove(temporary, error);
+            lfs::core::native_fs::remove(temporary, error);
             return checked;
         }
         auto restored = lfs::io::replace_atomic_output_file(temporary, identity->canonical_path, lfs::io::AtomicOutputDurability::Durable);
         if (!restored) {
-            std::filesystem::remove(temporary, error);
+            lfs::core::native_fs::remove(temporary, error);
             return fail<void>(lfs::ErrorCode::PermissionDenied, path,
                               "The recovery copy could not replace the project.", restored.error().message, "recovery.replace");
         }
@@ -1454,13 +1460,18 @@ namespace lfs::io::project {
                 return std::move(appended).error();
             auto writer = std::move(*appended);
             const auto& selected_commit = lineage[generation - 1];
+            auto selected_reader_caps = reader->commit().required_reader_capabilities;
+            auto selected_writer_caps = reader->commit().required_writer_capabilities;
+            selected_reader_caps.set(USER_SHADERS_V1, selected_commit.required_reader_capabilities.contains(USER_SHADERS_V1));
+            selected_writer_caps.set(USER_SHADERS_V1, selected_commit.required_writer_capabilities.contains(USER_SHADERS_V1));
             if (auto planned = writer.plan_commit(CommitOptions{
                     .kind = CommitKind::Explicit,
                     .snapshot_uuid = selected_commit.snapshot_uuid,
                     .min_reader_version = reader->commit().min_reader_version,
                     .min_safe_writer_version = reader->commit().min_safe_writer_version,
-                    .extra_reader_capabilities = reader->commit().required_reader_capabilities,
-                    .extra_writer_capabilities = reader->commit().required_writer_capabilities,
+                    .extra_reader_capabilities = selected_reader_caps,
+                    .extra_writer_capabilities = selected_writer_caps,
+                    .recompute_shader_capabilities = true,
                 });
                 !planned)
                 return std::move(planned).error();
@@ -1823,15 +1834,15 @@ namespace lfs::io::project {
             return std::move(output_lock).error();
         if (auto available = refuse_existing_destination(destination); !available)
             return std::move(available).error();
-        auto temporary = destination;
-        temporary += ".clean-" + lfs::core::generate_uuid_v4().to_string() + ".tmp";
+        const auto temporary = detail::project_artifact_path(destination,
+                                                             ".clean-" + lfs::core::generate_uuid_v4().to_string() + ".tmp");
         struct Cleanup {
             std::filesystem::path path;
             ~Cleanup() {
                 std::error_code error;
-                std::filesystem::remove(path, error);
+                lfs::core::native_fs::remove(path, error);
                 path += ".lock";
-                std::filesystem::remove(path, error);
+                lfs::core::native_fs::remove(path, error);
             }
         } cleanup{temporary};
         for (const auto& uuid : removed)
@@ -1898,7 +1909,7 @@ namespace lfs::io::project {
         auto identity = detail::ProjectPathIdentity::capture(path);
         if (!identity)
             return std::move(identity).error();
-        auto plan = make_reduce_plan(path);
+        auto plan = make_reduce_plan(path, drop_embedded_dataset);
         if (!plan) {
             return std::move(plan).error();
         }
@@ -1985,14 +1996,14 @@ namespace lfs::io::project {
             remember("save:" + std::to_string(selection.save_generation), "save", bytes,
                      {{"generation", selection.save_generation}, {"date", saved.wallclock_unix_ns}});
         }
-        if (selection.checkpoint) {
-            const auto checkpoint = std::ranges::find(plan->retained_checkpoints, *selection.checkpoint,
+        for (const auto& selected : selection.checkpoints) {
+            const auto checkpoint = std::ranges::find(plan->retained_checkpoints, selected,
                                                       &ProjectReduceCheckpoint::instance_uuid);
             if (checkpoint == plan->retained_checkpoints.end()) {
                 return fail<ProjectReduceResult>(lfs::ErrorCode::NotFound, path,
                                                  "The checkpoint was not found.", "checkpoint is no longer retained", "reduce.checkpoint");
             }
-            if (*bound && **bound == *selection.checkpoint) {
+            if (*bound && **bound == selected) {
 #ifdef LFS_FORMAT_TEST_TARGET
                 return fail<ProjectReduceResult>(lfs::ErrorCode::Unsupported, path,
                                                  "Removing this checkpoint requires the full application.", "model conversion is unavailable", "reduce.checkpoint");
@@ -2039,9 +2050,9 @@ namespace lfs::io::project {
                     return std::move(updated).error();
 #endif
             }
-            if (document->remove_checkpoint(*selection.checkpoint))
+            if (document->remove_checkpoint(selected))
                 ++result.checkpoints_removed;
-            remember("checkpoint:" + selection.checkpoint->to_string(), "checkpoint", checkpoint->bytes,
+            remember("checkpoint:" + selected.to_string(), "checkpoint", checkpoint->bytes,
                      {{"iteration", checkpoint->iteration}});
         }
         if (selection.metrics) {
@@ -2079,12 +2090,12 @@ namespace lfs::io::project {
                 }
             }
         }
-        const auto operation = drop_embedded_dataset       ? "dataset_removed"
-                               : selection.save_generation ? "save_removed"
-                               : selection.checkpoint      ? "checkpoint_removed"
-                               : selection.thumbnail       ? "thumbnail_removed"
-                               : selection.metrics         ? "metrics_removed"
-                                                           : "changed";
+        const auto operation = drop_embedded_dataset            ? "dataset_removed"
+                               : selection.save_generation      ? "save_removed"
+                               : !selection.checkpoints.empty() ? "checkpoint_removed"
+                               : selection.thumbnail            ? "thumbnail_removed"
+                               : selection.metrics              ? "metrics_removed"
+                                                                : "changed";
         if (auto marked = mark_contents_edit(*document, operation, drop_embedded_dataset ? 3 : 1); !marked)
             return std::move(marked).error();
         ProjectDocumentSaveOptions save_options;
@@ -2201,12 +2212,11 @@ namespace lfs::io::project {
             return std::move(details).error();
         }
         auto after_bound = details->scene_graph.training_node_id;
-        if (*bound && (!after_bound ||
-                       !std::ranges::any_of(details->retained_checkpoints,
-                                            [&](const auto& checkpoint) {
-                                                return checkpoint.binds_scene_graph &&
-                                                       checkpoint.instance_uuid == **bound;
-                                            }))) {
+        const bool bound_removed = *bound && std::ranges::contains(selection.checkpoints, **bound);
+        if (*bound && !bound_removed && (!after_bound || !std::ranges::any_of(details->retained_checkpoints, [&](const auto& checkpoint) {
+                return checkpoint.binds_scene_graph &&
+                       checkpoint.instance_uuid == **bound;
+            }))) {
             return fail<ProjectReduceResult>(
                 lfs::ErrorCode::DataLoss, path,
                 "The reduced project lost its bound checkpoint.",
@@ -2245,20 +2255,31 @@ namespace lfs::io::project {
             "the full I/O library is required for closed-file dataset embedding",
             "dataset_embed.composition");
     }
-#else
+
     lfs::Result<DatasetEmbedResult>
-    embed_dataset_file(const std::filesystem::path& path,
-                       ProjectOperationProgress progress,
-                       ProjectOperationCancel cancel) {
-        auto lease = acquire_operation_lock(path);
-        if (!lease) {
-            return std::move(lease).error();
-        }
-        auto document = ProjectDocument::open(path);
-        if (!document) {
-            return std::move(document).error();
-        }
-        auto dataset_uuid = document->project().dataset_reference();
+    write_training_project(const std::filesystem::path& destination,
+                           ParameterManagerSnapshot,
+                           const std::filesystem::path&,
+                           const std::optional<TrainingProjectInitialization>&,
+                           ProjectOperationProgress,
+                           ProjectOperationCancel) {
+        return fail<DatasetEmbedResult>(
+            lfs::ErrorCode::Unsupported, destination,
+            "Training projects are unavailable in the CPU format-test composition.",
+            "the full I/O library is required to embed the dataset",
+            "training_project.composition");
+    }
+#else
+    // Embeds the dataset PROJ references into `document`, which is bound to
+    // the file at `path`; `images` is the dataset's image folder setting.
+    static lfs::Result<DatasetEmbedResult>
+    embed_referenced_dataset(ProjectDocument& document,
+                             const std::filesystem::path& path,
+                             const WriterLockLease& lease,
+                             const std::string& images,
+                             ProjectOperationProgress progress,
+                             ProjectOperationCancel cancel) {
+        auto dataset_uuid = document.project().dataset_reference();
         if (!dataset_uuid) {
             return std::move(dataset_uuid).error();
         }
@@ -2269,20 +2290,16 @@ namespace lfs::io::project {
                 "REFS has no dataset record selected by PROJ", "dataset.reference");
         }
         auto root = resolve_path_reference(
-            document->references(), path.parent_path(), **dataset_uuid);
-        if (!root || !std::filesystem::is_directory(*root)) {
+            document.references(), path.parent_path(), **dataset_uuid);
+        if (!root || !lfs::core::native_fs::is_directory(*root)) {
             return fail<DatasetEmbedResult>(
                 lfs::ErrorCode::NotFound, path,
                 "The external dataset folder could not be found.",
                 "the dataset reference is unreachable", "dataset.path");
         }
-        auto snapshot = document->parameters().snapshot();
-        if (!snapshot) {
-            return std::move(snapshot).error();
-        }
         std::string images_folder;
         auto files = discover_dataset_files(
-            *root, snapshot->dataset.images, images_folder);
+            *root, images, images_folder);
         if (progress) {
             progress(0.02F, "Scanning dataset");
         }
@@ -2303,7 +2320,7 @@ namespace lfs::io::project {
             }
             const auto& [source_path, kind] = files[index];
             std::error_code error;
-            const auto bytes = std::filesystem::file_size(source_path, error);
+            const auto bytes = lfs::core::native_fs::file_size(source_path, error);
             if (error) {
                 return fail<DatasetEmbedResult>(
                     lfs::ErrorCode::DataLoss, source_path,
@@ -2321,7 +2338,7 @@ namespace lfs::io::project {
             total_bytes += bytes;
         }
         std::error_code space_error;
-        const auto available = std::filesystem::space(path.parent_path(), space_error).available;
+        const auto available = lfs::core::native_fs::space(path.parent_path(), space_error).available;
         if (space_error || available < total_bytes + 64ull * 1024 * 1024) {
             return fail<DatasetEmbedResult>(
                 lfs::ErrorCode::ResourceExhausted, path,
@@ -2338,13 +2355,13 @@ namespace lfs::io::project {
         ProjectDocumentSaveOptions options;
         options.commit.kind = CommitKind::Explicit;
         options.regenerate_dataset_preview = false;
-        options.writer_lock_lease = *lease;
+        options.writer_lock_lease = lease;
         options.disk_reserve_bytes = 64ull * 1024 * 1024;
-        if (auto marked = mark_contents_edit(*document, "dataset_embedded", 2); !marked)
+        if (auto marked = mark_contents_edit(document, "dataset_embedded", 2); !marked)
             return std::move(marked).error();
-        if (auto marked = document->save(path, options); !marked)
+        if (auto marked = document.save(path, options); !marked)
             return std::move(marked).error();
-        auto saved = document->embed_dataset_batch(
+        auto saved = document.embed_dataset_batch(
             manifest, sources, options,
             [progress](const float value, const std::string& stage) {
                 if (progress) {
@@ -2383,13 +2400,131 @@ namespace lfs::io::project {
         }
         return result;
     }
+
+    lfs::Result<DatasetEmbedResult>
+    embed_dataset_file(const std::filesystem::path& path,
+                       ProjectOperationProgress progress,
+                       ProjectOperationCancel cancel) {
+        auto lease = acquire_operation_lock(path);
+        if (!lease) {
+            return std::move(lease).error();
+        }
+        auto document = ProjectDocument::open(path);
+        if (!document) {
+            return std::move(document).error();
+        }
+        auto snapshot = document->parameters().snapshot();
+        if (!snapshot) {
+            return std::move(snapshot).error();
+        }
+        return embed_referenced_dataset(*document, path, *lease, snapshot->dataset.images,
+                                        std::move(progress), std::move(cancel));
+    }
+
+    lfs::Result<DatasetEmbedResult>
+    write_training_project(const std::filesystem::path& requested_destination,
+                           ParameterManagerSnapshot parameters,
+                           const std::filesystem::path& dataset_root,
+                           const std::optional<TrainingProjectInitialization>& initialization,
+                           ProjectOperationProgress progress,
+                           ProjectOperationCancel cancel) {
+        // A bare file name has no folder for the references and the disk
+        // space check, so resolve it against the working directory.
+        std::error_code destination_error;
+        const auto destination = std::filesystem::absolute(requested_destination, destination_error);
+        if (destination_error) {
+            return fail<DatasetEmbedResult>(
+                lfs::ErrorCode::InvalidArgument, requested_destination,
+                "The destination path is invalid.", destination_error.message(), "training_project.destination");
+        }
+        std::error_code dataset_error;
+        if (dataset_root.empty() || !lfs::core::native_fs::is_directory(dataset_root, dataset_error)) {
+            return fail<DatasetEmbedResult>(
+                lfs::ErrorCode::NotFound, dataset_root,
+                "The dataset folder could not be found.",
+                dataset_error ? dataset_error.message() : "write_training_project requires the dataset folder",
+                "dataset.path");
+        }
+        // Hold the writer lock from the first save until the dataset is
+        // embedded.
+        auto lease = acquire_operation_lock(destination);
+        if (!lease)
+            return std::move(lease).error();
+        std::optional<lfs::Result<DatasetEmbedResult>> embedded;
+        {
+            auto document = ProjectDocument::create(lfs::core::generate_uuid_v4());
+            if (!document)
+                return std::move(document).error();
+            const auto project_root = destination.parent_path();
+            const auto reference_file = [&](const std::filesystem::path& path, const std::string& key,
+                                            const std::string_view kind) -> std::optional<lfs::core::Uuid> {
+                if (path.empty())
+                    return std::nullopt;
+                auto minted = upsert_path_reference(document->edit_references(), project_root, path, key, kind);
+                if (!minted) {
+                    LOG_WARN("Training project does not reference '{}': {}", lfs::core::path_to_utf8(path),
+                             lfs::format_for_developer(minted.error()));
+                    return std::nullopt;
+                }
+                return *minted;
+            };
+            // PRMS may only name REFS rows of this document: reference the
+            // files the parameters name the way a save does.
+            parameters.for_each_role([&](const std::string_view role, const auto& values, auto& bindings) {
+                bindings = {};
+                bindings.background_image_reference = reference_file(
+                    values.bg_image_path, std::format("presets.{}.background_image", role), "background_image");
+                bindings.ppisp_reference = reference_file(
+                    values.ppisp_sidecar_path, std::format("presets.{}.ppisp_sidecar", role), "ppisp_sidecar");
+            });
+            if (auto set = document->edit_parameters().set_snapshot(parameters); !set)
+                return std::move(set).error();
+            if (initialization) {
+                if (auto set = document->edit_project().set_training_initialization(ProjectTrainingInitialization{
+                        .init_reference_uuid = reference_file(initialization->init_path, "training_init", "training_init"),
+                        .data_origin = initialization->data_origin,
+                        .scene_center = initialization->scene_center,
+                    });
+                    !set)
+                    return std::move(set).error();
+            }
+            auto reference = upsert_path_reference(
+                document->edit_references(), project_root, dataset_root, "dataset", "dataset");
+            if (!reference)
+                return std::move(reference).error();
+            if (auto set = document->edit_project().set_dataset_reference(*reference); !set)
+                return std::move(set).error();
+            ProjectDocumentSaveOptions options;
+            options.regenerate_dataset_preview = false;
+            options.writer_lock_lease = *lease;
+            // A first save publishes atomically and refuses an existing destination.
+            if (auto saved = document->save(destination, options); !saved)
+                return std::move(saved).error();
+            // The saved document is bound to the new file; embed into it
+            // without opening the file again.
+            embedded.emplace(embed_referenced_dataset(*document, destination, *lease, parameters.dataset.images,
+                                                      std::move(progress), std::move(cancel)));
+        }
+        // The document is closed here, so the file can be removed.
+        if (!*embedded) {
+            std::error_code removed;
+            lfs::core::native_fs::remove(destination, removed);
+            if (removed) {
+                return std::move(*embedded).error().with_suppressed(operation_error(
+                    lfs::ErrorCode::Unavailable, destination,
+                    "The incomplete training project could not be removed.", removed.message(),
+                    "training_project.cleanup"));
+            }
+        }
+        return std::move(*embedded);
+    }
 #endif
 
     lfs::Result<DatasetReferenceResult>
     set_dataset_reference(const std::filesystem::path& path,
                           const std::filesystem::path& dataset_dir,
                           const bool accept_content_change) {
-        if (dataset_dir.empty() || !std::filesystem::is_directory(dataset_dir)) {
+        if (dataset_dir.empty() || !lfs::core::native_fs::is_directory(dataset_dir)) {
             return fail<DatasetReferenceResult>(
                 lfs::ErrorCode::NotFound, dataset_dir,
                 "The dataset folder could not be found.",
@@ -2541,7 +2676,7 @@ namespace lfs::io::project {
         }
         const auto source_commit = source_reader->commit().commit_uuid;
         std::error_code space_error;
-        const auto available = std::filesystem::space(destination.parent_path(), space_error).available;
+        const auto available = lfs::core::native_fs::space(destination.parent_path(), space_error).available;
         if (space_error || available < source_reader->physical_file_size() / 4 + 64ull * 1024 * 1024) {
             return fail<ProjectExportResult>(
                 lfs::ErrorCode::ResourceExhausted, destination,
@@ -2628,7 +2763,7 @@ namespace lfs::io::project {
             break;
         }
         std::error_code size_error;
-        const auto bytes = std::filesystem::file_size(destination, size_error);
+        const auto bytes = lfs::core::native_fs::file_size(destination, size_error);
         if (size_error) {
             return fail<ProjectExportResult>(
                 lfs::ErrorCode::DataLoss, destination,
@@ -2693,7 +2828,7 @@ namespace lfs::io::project {
             ~TemporaryCleanup() {
                 if (!path.empty()) {
                     std::error_code ignored;
-                    std::filesystem::remove(path, ignored);
+                    lfs::core::native_fs::remove(path, ignored);
                 }
             }
         } cleanup{temporary};

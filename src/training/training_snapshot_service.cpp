@@ -4,6 +4,7 @@
  */
 
 #include "training_snapshot_service.hpp"
+#include "core/native_fs.hpp"
 
 #include "checkpoint.hpp"
 #include "core/cuda/sh_layout.cuh"
@@ -121,7 +122,8 @@ namespace lfs::training {
         }
 
         [[nodiscard]] lfs::Error snapshot_host_memory_error(
-            const std::uint64_t required_bytes,
+            const std::uint64_t checkpoint_bytes,
+            const std::uint64_t reserve_bytes,
             const std::uint64_t available_bytes,
             std::string detail,
             const lfs::core::SourceSite source) {
@@ -129,9 +131,10 @@ namespace lfs::training {
                 .code = lfs::ErrorCode::ResourceExhausted,
                 .domain = lfs::ErrorDomain::Training,
                 .user_message = std::format(
-                    "{}: needed {}, available {}.",
+                    "{}: the save copies the {} checkpoint into RAM and keeps {} free, {} of RAM is available.",
                     lfs::core::HOST_MEMORY_SAVE_ERROR_PREFIX,
-                    format_memory_size(required_bytes),
+                    format_memory_size(checkpoint_bytes),
+                    format_memory_size(reserve_bytes),
                     format_memory_size(available_bytes)),
                 .detail = std::move(detail),
                 .detection = source,
@@ -142,7 +145,7 @@ namespace lfs::training {
 
         std::uint64_t read_rss_bytes() {
 #if defined(__linux__)
-            std::ifstream input("/proc/self/status");
+            std::ifstream input(lfs::core::native_fs::native_path("/proc/self/status"));
             std::string line;
             while (std::getline(input, line)) {
                 if (!line.starts_with("VmRSS:")) {
@@ -179,7 +182,7 @@ namespace lfs::training {
                 };
             }
 #elif defined(__linux__)
-            std::ifstream input("/proc/meminfo");
+            std::ifstream input(lfs::core::native_fs::native_path("/proc/meminfo"));
             std::string line;
             while (std::getline(input, line)) {
                 unsigned long long kib = 0;
@@ -1366,7 +1369,12 @@ namespace lfs::training {
 
         void shutdown() {
             if (drain_thread.joinable()) {
-                drain_thread.request_stop();
+                {
+                    // Under the mutex, so the drain thread between its predicate check and
+                    // its wait cannot miss the stop and sleep through the notify.
+                    std::scoped_lock lock(ring_mutex);
+                    drain_thread.request_stop();
+                }
                 ring_condition.notify_all();
                 drain_thread.join();
             }
@@ -1905,7 +1913,7 @@ namespace lfs::training {
                     request.strategy, request.params,
                     request.bilateral_grid, request.ppisp,
                     request.ppisp_controller_pool,
-                    request.sparsity_optimizer);
+                    request.popspa_controller, request.popspa_optimizer);
                 if (!serialized) {
                     return lfs::Status::failure(
                         std::move(serialized)
@@ -1988,7 +1996,7 @@ namespace lfs::training {
                 request.strategy, request.params,
                 request.bilateral_grid, request.ppisp,
                 request.ppisp_controller_pool,
-                request.sparsity_optimizer);
+                request.popspa_controller, request.popspa_optimizer);
             if (!serialized) {
                 return std::move(serialized)
                     .error()
@@ -2042,17 +2050,21 @@ namespace lfs::training {
             if (request.release_host_memory &&
                 host_memory.available_bytes > 0 &&
                 host_memory.available_bytes <
-                    required_host_memory &&
+                    required_host_memory) {
+                const auto short_available = host_memory.available_bytes;
                 request.release_host_memory(
-                    required_host_memory -
-                    host_memory.available_bytes) > 0) {
+                    required_host_memory - short_available);
                 host_memory = read_host_memory_info();
+                LOG_INFO("Project save needs {} of RAM: released host memory, available {} -> {}",
+                         format_memory_size(required_host_memory), format_memory_size(short_available),
+                         format_memory_size(host_memory.available_bytes));
             }
             if (host_memory.available_bytes == 0 ||
                 host_memory.available_bytes <
                     required_host_memory) {
                 return snapshot_host_memory_error(
-                    required_host_memory,
+                    prepared->checkpoint_bytes,
+                    reserve_bytes,
                     host_memory.available_bytes,
                     std::format(
                         "Training snapshot {}: {} bytes available, "
@@ -2273,8 +2285,8 @@ namespace lfs::training {
                         request.ppisp,
                         request
                             .ppisp_controller_pool,
-                        request
-                            .sparsity_optimizer);
+                        request.popspa_controller,
+                        request.popspa_optimizer);
                 if (!serialized) {
                     const auto& error =
                         serialized.error();

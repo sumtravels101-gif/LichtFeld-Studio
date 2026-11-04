@@ -172,6 +172,43 @@ namespace lfs::core::nn::kernels {
             }
         }
 
+        // One output per thread of a convolution with one input and one output channel per group. Taps accumulate in
+        // im2col order with one FMA each, out-of-image taps as zeros, then the zero products of the GEMM's K-tile
+        // padding and the channel bias: the result equals im2col + GEMM + channel_bias bit for bit.
+        __global__ void depthwise_conv2d_kernel(const float* __restrict__ input, const float* __restrict__ weight,
+                                                const float* __restrict__ bias, float* __restrict__ output, int n,
+                                                int c, int h, int w, int k_h, int k_w, int out_h, int out_w,
+                                                int stride_h, int stride_w, int pad_h, int pad_w, int dil_h,
+                                                int dil_w, int pad_mode, bool padded_k) {
+            const long long total = static_cast<long long>(n) * c * out_h * out_w;
+            for (long long idx = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; idx < total;
+                 idx += static_cast<long long>(blockDim.x) * gridDim.x) {
+                const int ow = static_cast<int>(idx % out_w);
+                const int oh = static_cast<int>((idx / out_w) % out_h);
+                const long long plane = idx / (static_cast<long long>(out_w) * out_h);
+                const int ch = static_cast<int>(plane % c);
+                const float* channel = input + plane * h * w;
+                const float* taps = weight + static_cast<long long>(ch) * k_h * k_w;
+                float acc = 0.0f;
+                for (int kh = 0; kh < k_h; ++kh) {
+                    for (int kw = 0; kw < k_w; ++kw) {
+                        int y = oh * stride_h - pad_h + kh * dil_h;
+                        int x = ow * stride_w - pad_w + kw * dil_w;
+                        if (pad_mode == 1) {
+                            y = y < 0 ? 0 : (y >= h ? h - 1 : y);
+                            x = x < 0 ? 0 : (x >= w ? w - 1 : x);
+                        }
+                        const float v = y >= 0 && y < h && x >= 0 && x < w ? __ldg(&channel[y * w + x]) : 0.0f;
+                        acc = fmaf(v, __ldg(&taps[kh * k_w + kw]), acc);
+                    }
+                }
+                if (padded_k) {
+                    acc = fmaf(0.0f, 0.0f, acc);
+                }
+                output[idx] = bias ? acc + __ldg(&bias[ch]) : acc;
+            }
+        }
+
         int grid_for(const int total) {
             const int block = 256;
             const int max_blocks = 2048;
@@ -293,8 +330,8 @@ namespace lfs::core::nn::kernels {
             constexpr int BK = 8;
             const int tid = static_cast<int>(threadIdx.x);
             const int ni = static_cast<int>(blockIdx.z);
-            const int block_row = static_cast<int>(blockIdx.y) * BM;
-            const int block_col = static_cast<int>(blockIdx.x) * BN;
+            const int block_row = static_cast<int>(blockIdx.x) * BM;
+            const int block_col = static_cast<int>(blockIdx.y) * BN;
             const int row0 = (tid / 16) * 4;
             const int col0 = (tid % 16) * 4;
             const int spatial = out_h * out_w;
@@ -373,11 +410,11 @@ namespace lfs::core::nn::kernels {
             const int kdim = cin * 9;
             const int tid = static_cast<int>(threadIdx.x);
             const int n_tw = (out_w + BM - 1) / BM;
-            const int tile = static_cast<int>(blockIdx.y);
+            const int tile = static_cast<int>(blockIdx.x);
             const int oh0 = tile / n_tw;
             const int tw = tile % n_tw;
             const int ow0 = tw * BM;
-            const int block_col = static_cast<int>(blockIdx.x) * BN;
+            const int block_col = static_cast<int>(blockIdx.y) * BN;
             if (oh0 >= out_h) {
                 return;
             }
@@ -546,8 +583,8 @@ namespace lfs::core::nn::kernels {
             const int spatial = out_h * out_w;
             const int kdim = cin * 9;
             const int tid = static_cast<int>(threadIdx.x);
-            const int block_row = static_cast<int>(blockIdx.y) * BM;
-            const int block_col = static_cast<int>(blockIdx.x) * BN;
+            const int block_row = static_cast<int>(blockIdx.x) * BM;
+            const int block_col = static_cast<int>(blockIdx.y) * BN;
             Y += static_cast<long long>(ni) * cout * spatial;
 
 #if __CUDA_ARCH__ >= 700
@@ -676,6 +713,23 @@ namespace lfs::core::nn::kernels {
         LFS_CUDA_LAUNCH_CHECK(stream, "nn.conv.im2col");
     }
 
+    void depthwise_conv2d(const float* input, const float* weight, const float* bias, float* output, int n, int c,
+                          int h, int w, int k_h, int k_w, int out_h, int out_w, int stride_h, int stride_w, int pad_h,
+                          int pad_w, int dil_h, int dil_w, int pad_mode, cudaStream_t stream) {
+        NvtxRange nvtx("nn.op/depthwise_conv2d");
+        const long long total = static_cast<long long>(n) * c * out_h * out_w;
+        if (total <= 0) {
+            return;
+        }
+        // The fp32 GEMM pads K to tiles of eight.
+        const bool padded_k = k_h * k_w % 8 != 0;
+        const int blocks = static_cast<int>(std::min<long long>(65535, (total + 255) / 256));
+        depthwise_conv2d_kernel<<<blocks, 256, 0, stream>>>(input, weight, bias, output, n, c, h, w, k_h, k_w, out_h,
+                                                            out_w, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+                                                            pad_mode, padded_k);
+        LFS_CUDA_LAUNCH_CHECK(stream, "nn.conv.depthwise_conv2d");
+    }
+
     void col2im(const void* col, void* output, int n, int c, int h, int w, int k_h, int k_w,
                 int in_h, int in_w, int stride_h, int stride_w, int pad_h, int pad_w,
                 int dil_h, int dil_w, int c_start, int c_count, DataType dtype,
@@ -732,7 +786,7 @@ namespace lfs::core::nn::kernels {
         const int kdim = cin * 9;
         if (dtype == DataType::Float32) {
             dim3 block(256);
-            dim3 grid((cout + 63) / 64, (spatial + 63) / 64, n);
+            dim3 grid((spatial + 63) / 64, (cout + 63) / 64, n);
             conv2d_implicit_simt_kernel<false><<<grid, block, 0, stream>>>(
                 input, weight, bias, output, n, cin, h, w, cout, out_h, out_w,
                 pad_h, pad_w, pad_mode, activation);
@@ -749,7 +803,7 @@ namespace lfs::core::nn::kernels {
         const bool force_mma = forced_path && std::strcmp(forced_path, "mma") == 0;
         auto launch_simt = [&]() {
             dim3 block(256);
-            dim3 grid((cout + 63) / 64, (spatial + 63) / 64, n);
+            dim3 grid((spatial + 63) / 64, (cout + 63) / 64, n);
             conv2d_implicit_simt_kernel<true><<<grid, block, 0, stream>>>(
                 x, wt, b, y, n, cin, h, w, cout, out_h, out_w, pad_h, pad_w, pad_mode, activation);
             LFS_CUDA_LAUNCH_CHECK(stream, "nn.conv.implicit_3x3_simt_f16");
@@ -762,14 +816,14 @@ namespace lfs::core::nn::kernels {
                 const int n_tw = (out_w + BM - 1) / BM;
                 if (cout >= 128) {
                     constexpr int BN = 128;
-                    dim3 grid((cout + BN - 1) / BN, n_tw * out_h, n);
+                    dim3 grid(n_tw * out_h, (cout + BN - 1) / BN, n);
                     hgemm_implicit_3x3_halo_kernel<BN><<<grid, block, 0, stream>>>(
                         x, wt, y, b, n, cin, h, w, cout, out_h, out_w, pad_h, pad_w, pad_mode,
                         activation);
                     LFS_CUDA_LAUNCH_CHECK(stream, "nn.conv.implicit_3x3_halo128");
                 } else {
                     constexpr int BN = 64;
-                    dim3 grid((cout + BN - 1) / BN, n_tw * out_h, n);
+                    dim3 grid(n_tw * out_h, (cout + BN - 1) / BN, n);
                     hgemm_implicit_3x3_halo_kernel<BN><<<grid, block, 0, stream>>>(
                         x, wt, y, b, n, cin, h, w, cout, out_h, out_w, pad_h, pad_w, pad_mode,
                         activation);
@@ -779,7 +833,7 @@ namespace lfs::core::nn::kernels {
             }
             constexpr int BM = 64, BN = 64;
             dim3 block(128);
-            dim3 grid((cout + BN - 1) / BN, (spatial + BM - 1) / BM, n);
+            dim3 grid((spatial + BM - 1) / BM, (cout + BN - 1) / BN, n);
             hgemm_implicit_3x3_kernel<BM, BN, 128><<<grid, block, 0, stream>>>(
                 x, wt, y, b, n, cin, h, w, cout, out_h, out_w, pad_h, pad_w, pad_mode, activation);
             LFS_CUDA_LAUNCH_CHECK(stream, "nn.conv.implicit_3x3_64x64");
@@ -820,7 +874,7 @@ namespace lfs::core::nn::kernels {
                 LFS_CUDA_CHECK(cudaEventElapsedTime(&wmma_ms, begin, wmma_done));
                 LFS_CUDA_CHECK(cudaEventElapsedTime(&simt_ms, wmma_done, simt_done));
                 auto_choice[device].store(wmma_ms <= simt_ms ? 1 : 2, std::memory_order_relaxed);
-                LOG_DEBUG("NN FP16 conv dispatch device={}: {} (WMMA {:.3f} ms, SIMT {:.3f} ms)",
+                LOG_DEBUG("NN FP16 conv dispatch device=%d: %s (WMMA %.3f ms, SIMT %.3f ms)",
                           device, auto_choice[device].load(std::memory_order_relaxed) == 1 ? "wmma" : "simt", wmma_ms, simt_ms);
                 LFS_CUDA_CHECK(cudaEventDestroy(begin));
                 LFS_CUDA_CHECK(cudaEventDestroy(wmma_done));

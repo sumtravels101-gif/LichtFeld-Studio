@@ -8,6 +8,8 @@
 #include "core/scene.hpp"
 #include "passes/vulkan_mesh_pass.hpp"
 #include "render_pass.hpp"
+#include <optional>
+#include <vector>
 
 namespace lfs::vis {
 
@@ -44,8 +46,22 @@ namespace lfs::vis {
         const RenderSettings& settings,
         const glm::vec3& camera_backward);
 
-    // Visible splat node shown in a PLY-comparison panel, or null when the
-    // scene has fewer than two visible splat slots.
+    // The transforms argument must outlive the returned request.
+    [[nodiscard]] LFS_VIS_API lfs::rendering::PointCloudRenderRequest buildPointCloudNodeRenderRequest(
+        const FrameContext& ctx, const core::Scene& scene, const core::SceneNode& node,
+        glm::ivec2 render_size, const std::vector<glm::mat4>& transforms);
+
+    struct PlyComparisonNode {
+        const core::SceneNode* node = nullptr;
+        // Combined-model slot of a splat node; empty for point clouds and meshes.
+        std::optional<size_t> splat_slot;
+    };
+
+    // Visible comparison-eligible nodes in depth-first scene-tree order.
+    [[nodiscard]] LFS_VIS_API std::vector<PlyComparisonNode> plyComparisonNodes(const core::Scene& scene);
+
+    // Visible splat, point cloud, or mesh shown in a comparison panel, or null when
+    // the scene has fewer than two of them.
     [[nodiscard]] LFS_VIS_API const core::SceneNode* plyComparisonNodeForPanel(
         const core::Scene& scene,
         size_t split_view_offset,
@@ -60,6 +76,11 @@ namespace lfs::vis {
         const FrameContext& ctx,
         const core::SceneNode& node,
         int visible_index);
+
+    // Keeps the object record of one slot, for a draw of that slot's model
+    // alone; drops the effect when no binding applies to it.
+    void scopeCustomEffectToSlot(std::optional<lfs::rendering::GaussianCustomEffectState>& effect,
+                                 int visible_index);
 
     struct PlyComparisonDepthSample {
         const core::SceneNode* node = nullptr;

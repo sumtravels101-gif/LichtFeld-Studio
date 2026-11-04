@@ -375,11 +375,17 @@ namespace fast_lfs::rasterization {
             ctx.per_primitive_buffers = forward_result.per_primitive_buffers;
             ctx.per_tile_buffers = per_tile_buffers_blob;
             ctx.sorted_primitive_indices = forward_result.sorted_primitive_indices;
+            ctx.contributor_masks = forward_result.contributor_masks;
+            ctx.contributor_positions = forward_result.contributor_positions;
+            ctx.primitive_touched = forward_result.primitive_touched;
+            ctx.contributor_storage_size = forward_result.contributor_storage_size;
             ctx.per_primitive_buffers_size = forward_result.per_primitive_buffers_size;
             ctx.per_tile_buffers_size = per_tile_size;
             ctx.sorted_primitive_indices_size = forward_result.sorted_primitive_indices_size;
             ctx.per_instance_sort_scratch_size = forward_result.per_instance_sort_scratch_size;
             ctx.per_instance_sort_total_size = forward_result.per_instance_sort_total_size;
+            ctx.visible_sort_scratch_size = forward_result.visible_sort_scratch_size;
+            ctx.tile_sort_key_bytes = forward_result.tile_sort_key_bytes;
             ctx.n_instances = forward_result.n_instances;
             ctx.n_visible = forward_result.n_visible;
             ctx.sh_layout_bases = sh_layout_bases;
@@ -442,6 +448,18 @@ namespace fast_lfs::rasterization {
         arena.end_frame(forward_ctx.frame_id, forward_ctx.stream);
     }
 
+    ForwardCaptureView forward_capture_view(const ForwardContext& context, const int width, const int height) {
+        if (!context.success || !context.per_tile_buffers || width <= 0 || height <= 0)
+            throw std::invalid_argument("Invalid context for forward capture");
+        const size_t tiles = ((static_cast<size_t>(width) + 15) / 16) *
+                             ((static_cast<size_t>(height) + 15) / 16);
+        if (tiles > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("Tile count exceeds forward capture capacity");
+        char* blob = static_cast<char*>(context.per_tile_buffers);
+        const auto buffers = PerTileBuffers::from_blob(blob, static_cast<int>(tiles));
+        return {buffers.instance_ranges, buffers.n_contributions};
+    }
+
     BackwardOutputs backward_raw(
         float* densification_info_ptr,
         const float* densification_error_map_ptr,
@@ -477,7 +495,10 @@ namespace fast_lfs::rasterization {
         unsigned shN_value_n_cells,
         unsigned shN_value_bits,
         const float* edge_weight_map,
-        float* edge_score_out) {
+        float* edge_score_out,
+        float* impact_sum_out,
+        float* impact_peak_out,
+        const ColorVarianceLoss& color_variance) {
 
         // The forward chose the stream and chained the arena frame on it; the
         // backward shares the same context/arena frame and must match.
@@ -513,6 +534,11 @@ namespace fast_lfs::rasterization {
             outputs.error_message = "Invalid edge-score inputs in backward_raw";
             return outputs;
         }
+        if ((impact_sum_out == nullptr) != (impact_peak_out == nullptr)) {
+            release_forward_context(forward_ctx);
+            outputs.error_message = "Invalid impact-score outputs in backward_raw";
+            return outputs;
+        }
 
         try {
             // Validate required inputs using pure CUDA validation
@@ -541,6 +567,8 @@ namespace fast_lfs::rasterization {
             LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(grad_w2c_ptr, "grad_w2c_ptr");
             LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(edge_weight_map, "edge_weight_map");
             LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(edge_score_out, "edge_score_out");
+            LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(impact_sum_out, "impact_sum_out");
+            LFS_VALIDATE_CUDA_DEVICE_POINTER_OPTIONAL(impact_peak_out, "impact_peak_out");
         } catch (const std::exception& e) {
             release_forward_context(forward_ctx);
             last_backward_error = e.what();
@@ -643,6 +671,9 @@ namespace fast_lfs::rasterization {
                 static_cast<char*>(forward_ctx.per_primitive_buffers),
                 static_cast<char*>(forward_ctx.per_tile_buffers),
                 static_cast<const uint*>(forward_ctx.sorted_primitive_indices),
+                forward_ctx.contributor_masks,
+                forward_ctx.contributor_positions,
+                forward_ctx.primitive_touched,
                 forward_ctx.primitive_work_indices,
                 grad_opacity_helper,
                 reinterpret_cast<float3*>(grad_color_helper),
@@ -671,7 +702,10 @@ namespace fast_lfs::rasterization {
                 shN_value_bits,
                 edge_weight_map,
                 edge_score_out,
-                stream);
+                impact_sum_out,
+                impact_peak_out,
+                stream,
+                color_variance);
 
             // Mark frame as complete
             release_forward_context(forward_ctx);

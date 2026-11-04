@@ -14,6 +14,7 @@ import pytest
 
 
 TOOL_MODE_NAMES = (
+    "EDITOR",
     "GLOBAL",
     "SELECTION",
     "TRANSLATE",
@@ -21,9 +22,15 @@ TOOL_MODE_NAMES = (
     "SCALE",
     "ALIGN",
     "CROP_BOX",
+    "WALK",
+    "VR",
 )
 
 ACTION_NAMES = (
+    "EDITOR_TOGGLE_KIND",
+    "EDITOR_RUN",
+    "EDITOR_STOP",
+    "EXIT_WALK",
     "NONE",
     "CAMERA_ORBIT",
     "CAMERA_PAN",
@@ -113,6 +120,18 @@ ACTION_NAMES = (
     "ASSET_GALLERY_COPY_LINK",
     "ASSET_REFRESH",
     "TOGGLE_PYTHON_CONSOLE",
+    "CAMERA_RESTORE_HOME",
+    "NEXT_SIDEBAR_CATEGORY",
+    "PREVIOUS_SIDEBAR_CATEGORY",
+    "REMOVE_LAST_POINT",
+    "APPLY_ALIGNMENT",
+    "INSERT_CROP_POLYGON_VERTEX",
+    "REMOVE_CROP_POLYGON_VERTEX",
+    "TOOL_SCALE_DISTANCE",
+    "VR_SNAP_TURN_LEFT",
+    "VR_SNAP_TURN_RIGHT",
+    "VR_RECENTER",
+    "EXIT_VR",
 )
 
 
@@ -147,6 +166,7 @@ def _install_lf_stub(monkeypatch):
         started=[],
         cancelled=0,
         section_request="",
+        splat_drag_preferences={"format": "ply", "sh_degree": 3, "up_axis": -2},
         mcp_preferences={
             "enabled": True,
             "expose_network": False,
@@ -275,6 +295,13 @@ def _install_lf_stub(monkeypatch):
     lf_stub.get_new_project_align_grid = lambda: True
     lf_stub.get_camera_view_snap_enabled = lambda: False
     lf_stub.ui = SimpleNamespace(
+        get_camera_browse_repeat=lambda: True,
+        set_camera_browse_repeat=lambda _enabled: None,
+        get_camera_browse_repeat_rate=lambda: 5.0,
+        set_camera_browse_repeat_rate=lambda _rate, persist=True: None,
+        get_vr_preferences=lambda: {"enabled": False, "resolution_scale": 0.7,
+                                    "scene_units_per_meter": 1.0, "move_speed": 1.5},
+        get_vr_state=lambda: {"available": False, "active": False, "status": ""},
         PanelSpace=panel_space,
         PanelHeightMode=panel_height_mode,
         PanelOption=panel_option,
@@ -303,6 +330,8 @@ def _install_lf_stub(monkeypatch):
         get_theme_family=lambda: "lichtfeld",
         get_theme_mode=lambda: "dark",
         get_ui_scale_preference=lambda: 0.0,
+        get_native_floating_windows=lambda: getattr(state, "native_floating_windows", False),
+        set_native_floating_windows=lambda enabled: setattr(state, "native_floating_windows", enabled),
         get_zoom_speed_preference=lambda: 0.0,
         set_zoom_speed_preference=lambda _speed: None,
         get_navigation_speed_preference=lambda: 0.0,
@@ -311,6 +340,8 @@ def _install_lf_stub(monkeypatch):
         remember_camera_view_snap=lambda: False,
         scene_graph_selection_markers=lambda: False,
         set_scene_graph_selection_markers=lambda _enabled: None,
+        get_splat_drag_preferences=lambda: dict(state.splat_drag_preferences),
+        set_splat_drag_preferences=lambda values: state.splat_drag_preferences.update(values),
         get_progress_bar_style=lambda: "classic",
         set_progress_bar_style=lambda _style: None,
         get_viewport_chrome_style=lambda: "translucent",
@@ -450,11 +481,22 @@ class _ElementStub:
 class _DocStub:
     def __init__(self, with_conflict_overlay=False, with_bindings_table=False):
         self.elements = {}
+        self.attributes = {}
+        self.listeners = []
         if with_conflict_overlay:
             self.elements["binding-conflict-overlay"] = _ElementStub()
             self.elements["binding-conflict-message"] = _ElementStub()
         if with_bindings_table:
             self.elements["bindings-table"] = _ElementStub()
+
+    def has_attribute(self, name):
+        return name in self.attributes
+
+    def set_attribute(self, name, value):
+        self.attributes[name] = value
+
+    def add_event_listener(self, name, callback):
+        self.listeners.append((name, callback))
 
     def get_element_by_id(self, element_id):
         return self.elements.get(element_id)
@@ -559,6 +601,14 @@ def test_keymap_section_is_wired_through_preferences(keymap_bindings_module):
     panel.on_mount(doc)
     assert doc.elements["bindings-table"].listeners == [("click", section._on_table_click)]
     assert doc.elements["binding-conflict-overlay"].classes["hidden"] is True
+    reset = panel._rendering_defaults._default_reset
+    reset_listeners = [("dblclick", reset._on_double_click), ("mouseover", reset._on_hover)]
+    assert all(doc.listeners.count(listener) == 1 for listener in reset_listeners)
+    # The reset controller must coexist with scrubbing and keymap listeners.
+    before_remount = list(doc.listeners)
+    panel._rendering_defaults.mount(doc)
+    assert doc.listeners == before_remount
+    assert doc.elements["bindings-table"].listeners == [("click", section._on_table_click)]
 
 
 def test_keymap_altgr_rejection_keeps_capture(keymap_bindings_module):
@@ -589,6 +639,9 @@ def test_keymap_builds_profile_and_mode_records(keymap_bindings_module):
         {"index": "4", "label": "Mode SCALE"},
         {"index": "5", "label": "Mode ALIGN"},
         {"index": "6", "label": "Mode CROP_BOX"},
+        {"index": "7", "label": "Mode WALK"},
+        {"index": "8", "label": "Mode VR"},
+        {"index": "9", "label": "Mode EDITOR"},
     ]
 
 

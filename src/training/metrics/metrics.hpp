@@ -11,10 +11,12 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "training/optimizer/render_output.hpp"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -53,16 +55,60 @@ namespace lfs::training {
         float compute(const lfs::core::Tensor& pred, const lfs::core::Tensor& target,
                       const lfs::core::Tensor& mask = {});
 
-        // Preserve complete-window scoring where available; normalize partial windows.
+        // Preserve complete-window scoring where available; normalize partial windows. Complete windows read the
+        // unmasked SSIM map, which shared_map keeps across calls on the same image pair when given.
         float compute_evaluation(const lfs::core::Tensor& pred, const lfs::core::Tensor& target,
                                  const lfs::core::Tensor& mask, bool complete_windows_only,
-                                 std::string_view camera_name);
+                                 std::string_view camera_name, lfs::core::Tensor* shared_map = nullptr);
 
     private:
         float compute_impl(const lfs::core::Tensor& pred, const lfs::core::Tensor& target,
-                           const lfs::core::Tensor& mask, bool normalize_windows);
+                           const lfs::core::Tensor& mask, bool normalize_windows,
+                           lfs::core::Tensor* shared_map = nullptr);
         bool apply_valid_padding_;
     };
+
+    // Scores of one pixel set listed in eval_mask_report.
+    struct MaskSetMetrics {
+        std::optional<float> psnr;
+        std::optional<float> ssim;
+        std::optional<float> lpips;
+        std::optional<float> flip;
+        float evaluated_pixel_fraction = 0.0f;
+        std::string skipped_reason;
+    };
+
+    // The scores of every scored pixel set, the headline set's included.
+    struct PixelSetScores {
+        std::array<std::optional<MaskSetMetrics>, lfs::core::param::kEvalPixelSets.size()> by_set;
+
+        [[nodiscard]] std::optional<MaskSetMetrics>& operator[](const lfs::core::param::EvalPixelSet set) {
+            return by_set[static_cast<size_t>(set)];
+        }
+        [[nodiscard]] const std::optional<MaskSetMetrics>& operator[](const lfs::core::param::EvalPixelSet set) const {
+            return by_set[static_cast<size_t>(set)];
+        }
+        [[nodiscard]] bool any() const {
+            return std::ranges::any_of(by_set, [](const auto& set) { return set.has_value(); });
+        }
+    };
+
+    // Key of a pixel set's object in per_image_metrics.json and compare.json.
+    [[nodiscard]] inline constexpr std::string_view pixel_set_json_key(const lfs::core::param::EvalPixelSet set) {
+        return set == lfs::core::param::EvalPixelSet::Mask ? "masked" : lfs::core::param::eval_pixel_set_name(set);
+    }
+
+    [[nodiscard]] inline constexpr std::string_view pixel_set_label(const lfs::core::param::EvalPixelSet set) {
+        switch (set) {
+        case lfs::core::param::EvalPixelSet::Mask:
+            return "Mask";
+        case lfs::core::param::EvalPixelSet::Unmasked:
+            return "Unmasked";
+        case lfs::core::param::EvalPixelSet::Inverted:
+            return "Inverted";
+        }
+        return "Mask";
+    }
 
     struct ViewMetrics {
         int index = 0;
@@ -78,6 +124,7 @@ namespace lfs::training {
         float evaluated_pixel_fraction = 0.0f;
         bool validity_mask_applied = false;
         std::string skipped_reason;
+        PixelSetScores sets;
     };
 
     struct EvalMetrics {
@@ -98,6 +145,9 @@ namespace lfs::training {
         float bias_corr_r = 0.0f;
         float bias_corr_g = 0.0f;
         float bias_corr_b = 0.0f;
+        // With scored pixel sets, the fields above are the headline set's.
+        lfs::core::param::EvalPixelSet headline = lfs::core::param::EvalPixelSet::Mask;
+        PixelSetScores sets;
         std::vector<ViewMetrics> views;
 
         [[nodiscard]] std::string to_string() const {
@@ -109,6 +159,8 @@ namespace lfs::training {
             }
             std::stringstream ss;
             ss << std::fixed << std::setprecision(4);
+            if (sets.any())
+                ss << pixel_set_label(headline) << " ";
             ss << "PSNR: " << psnr
                << ", SSIM: " << ssim;
             if (lpips && std::isfinite(*lpips)) {
@@ -128,6 +180,22 @@ namespace lfs::training {
                 ss << ", depth_absrel: " << *depth_absrel;
             }
             return ss.str();
+        }
+
+        [[nodiscard]] std::vector<std::string> mask_set_summaries() const {
+            const auto score = [](const std::optional<float>& value) {
+                return value && std::isfinite(*value) ? std::format("{:.4f}", *value) : std::string("-");
+            };
+            std::vector<std::string> lines;
+            for (const auto pixel_set : lfs::core::param::kEvalPixelSets) {
+                const auto& set = sets[pixel_set];
+                if (set && pixel_set != headline)
+                    lines.push_back(std::format("{} PSNR: {}, SSIM: {}, LPIPS: {}{}, pixels: {:.1f}%",
+                                                pixel_set_label(pixel_set), score(set->psnr), score(set->ssim),
+                                                score(set->lpips), set->flip ? ", FLIP: " + score(set->flip) : "",
+                                                100.0f * set->evaluated_pixel_fraction));
+            }
+            return lines;
         }
 
         static std::string to_csv_header() {
@@ -214,14 +282,12 @@ namespace lfs::training {
         lfs::core::Tensor means; // [N,3] CUDA Float32 in the training world frame
         int radius = 2;
         int close = 3;
-        bool invert = false;
     };
 
     // A splat whose rendered coverage selects the evaluated pixels.
     struct EvaluationSplat {
         lfs::core::SplatData model; // CUDA, SH degree 0, in the training world frame
         float opacity = 0.85f;      // rendered opacity a pixel needs to count as covered
-        bool invert = false;
     };
 
     struct EvaluationMaskSources {
@@ -232,7 +298,7 @@ namespace lfs::training {
     };
 
     [[nodiscard]] lfs::Result<EvaluationMesh> load_evaluation_mesh(
-        const std::filesystem::path& path, const std::array<float, 3>& training_origin, bool invert);
+        const std::filesystem::path& path, const std::array<float, 3>& training_origin);
 
     // A splat PLY moved into the training frame, kept with its geometry and opacity only.
     [[nodiscard]] lfs::Result<lfs::core::SplatData> load_evaluation_splat(
@@ -262,7 +328,8 @@ namespace lfs::training {
         int num_gaussians = 0;
         // Images that exist at one size, like files, are warped at that size.
         int warp_supersample = kEvaluationWarpSupersample;
-        std::filesystem::path image_dir; // Where images are saved; empty = <output>/eval_step_<iteration>
+        std::filesystem::path image_dir;                                   // Where images are saved; empty = <output>/eval_step_<iteration>
+        std::array<std::string, 2> image_labels{"Ground Truth", "Render"}; // Captions in saved images, left first
     };
 
     [[nodiscard]] lfs::Error evaluation_error(std::string detail, lfs::core::SourceSite site);
@@ -313,9 +380,10 @@ namespace lfs::training {
 
     // Adds this step's result for one image to the per-image document, which maps
     // image names to their size and evaluations. An earlier entry for the same
-    // step and split is replaced; entries stay sorted by step.
+    // step and split is replaced; entries stay sorted by step. With `pixel_sets` (the run scored extra pixel sets)
+    // the scores of each set sit under its own key: masked, unmasked, inverted.
     [[nodiscard]] nlohmann::json add_view_evaluation(nlohmann::json document, const ViewMetrics& view, int step,
-                                                     std::string_view split);
+                                                     std::string_view split, bool pixel_sets);
 
     // Metrics reporter class
     class MetricsReporter {

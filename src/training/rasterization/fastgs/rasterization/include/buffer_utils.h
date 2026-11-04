@@ -318,6 +318,11 @@ namespace fast_lfs::rasterization {
             const size_t aligned = align_allocation_size(size);
             LFS_ASSERT_MSG(aligned <= cursor_, "FastGS retained prefix exceeds the phase high-water");
             if (size > 0 && source != base_) {
+                const auto source_address = reinterpret_cast<std::uintptr_t>(source);
+                const auto destination_address = reinterpret_cast<std::uintptr_t>(base_);
+                LFS_ASSERT_MSG(source_address >= destination_address &&
+                                   source_address - destination_address >= size,
+                               "FastGS retained prefix overlaps its source");
                 LFS_CUDA_CHECK_MSG(
                     cudaMemcpyAsync(base_, source, size, cudaMemcpyDeviceToDevice, stream_),
                     "cudaMemcpyAsync(FastGS retained sorted indices)");
@@ -433,6 +438,16 @@ namespace fast_lfs::rasterization {
     };
     static_assert(sizeof(PackedMeanBBox) == 16, "PackedMeanBBox must be 128-bit");
 
+    // Projected attributes consumed together by blend and scoring kernels.
+    // Each field is one aligned 128-bit load; optional depth and normals stay separate.
+    struct alignas(16) ProjectedRecord {
+        PackedMeanBBox geometry;
+        float4 conic_opacity;
+        float4 color;
+    };
+    static_assert(sizeof(ProjectedRecord) == 48);
+    static_assert(alignof(ProjectedRecord) == 16);
+
     struct PerPrimitiveBuffers {
         size_t cub_workspace_size;
         char* cub_workspace;
@@ -441,17 +456,13 @@ namespace fast_lfs::rasterization {
         std::uint64_t* n_touched_tiles;
         std::uint64_t* offset;
         ushort4* screen_bounds;
-        PackedMeanBBox* mean2d;
-        float4* conic_opacity;
-        float4* color; // float3 padded to float4 for 128-bit shared/global loads
+        ProjectedRecord* projected;
         FastGSForwardStatus* forward_status;
 
         static PerPrimitiveBuffers from_persistent_blob(char*& blob, int n_visible) {
             PerPrimitiveBuffers buffers{};
             obtain(blob, buffers.depths, n_visible, 128);
-            obtain(blob, buffers.mean2d, n_visible, 128);
-            obtain(blob, buffers.conic_opacity, n_visible, 128);
-            obtain(blob, buffers.color, n_visible, 128);
+            obtain(blob, buffers.projected, n_visible, 128);
             obtain(blob, buffers.forward_status, 1, 128);
             return buffers;
         }

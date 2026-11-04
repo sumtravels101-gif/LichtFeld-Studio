@@ -6,7 +6,7 @@ from datetime import datetime
 from bisect import bisect_left
 from html import escape
 from itertools import islice
-from pathlib import Path
+from _lfs_path_io import Path
 import re
 import time
 
@@ -153,6 +153,7 @@ class LoggingPanel(Panel):
         self._handle = model.get_handle()
 
     def on_mount(self, doc):
+        super().on_mount(doc)
         self._doc = doc
         self._row_nodes = []
         self._rendered_selection = set()

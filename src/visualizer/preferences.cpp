@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "preferences.hpp"
+#include "core/native_fs.hpp"
+#include "input/gamepad_navigation.hpp"
+#include "input/gamepad_profiles.hpp"
 #include "rendering/rendering_types.hpp"
 #include "visualizer/navigation_up_axis.hpp"
 
@@ -26,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #ifdef _WIN32
 #include <process.h>
@@ -46,7 +50,7 @@ namespace lfs::vis {
         }
 
         [[nodiscard]] bool knownProgressBarStyle(std::string_view style) {
-            return style == "classic" || style == "miner";
+            return style == "classic" || style == "miner" || style == "tessle";
         }
 
         [[nodiscard]] bool knownViewportChromeStyle(std::string_view style) {
@@ -176,7 +180,7 @@ namespace lfs::vis {
                     expanded);
             }
             absolute = absolute.lexically_normal();
-            std::filesystem::create_directories(absolute, error);
+            lfs::core::native_fs::create_directories(absolute, error);
             if (error) {
                 return preferencePathError(
                     lfs::ErrorCode::PermissionDenied,
@@ -184,7 +188,7 @@ namespace lfs::vis {
                     error.message(),
                     absolute);
             }
-            if (!std::filesystem::is_directory(absolute, error) || error) {
+            if (!lfs::core::native_fs::is_directory(absolute, error) || error) {
                 return preferencePathError(
                     lfs::ErrorCode::InvalidArgument,
                     display_name + " path is not a directory.",
@@ -202,7 +206,7 @@ namespace lfs::vis {
                  std::to_string(
                      std::chrono::steady_clock::now().time_since_epoch().count()));
             {
-                std::ofstream output(probe, std::ios::binary | std::ios::trunc);
+                std::ofstream output(lfs::core::native_fs::native_path(probe), std::ios::binary | std::ios::trunc);
                 if (!output) {
                     return preferencePathError(
                         lfs::ErrorCode::PermissionDenied,
@@ -214,7 +218,7 @@ namespace lfs::vis {
                 output.flush();
                 if (!output) {
                     std::error_code ignored;
-                    std::filesystem::remove(probe, ignored);
+                    lfs::core::native_fs::remove(probe, ignored);
                     return preferencePathError(
                         lfs::ErrorCode::PermissionDenied,
                         display_name + " is not writable.",
@@ -222,7 +226,7 @@ namespace lfs::vis {
                         absolute);
                 }
             }
-            std::filesystem::remove(probe, error);
+            lfs::core::native_fs::remove(probe, error);
             if (error) {
                 return preferencePathError(
                     lfs::ErrorCode::PermissionDenied,
@@ -242,14 +246,13 @@ namespace lfs::vis {
 
         [[nodiscard]] bool containsLichtProject(const std::filesystem::path& directory) {
             std::error_code error;
-            if (!std::filesystem::is_directory(directory, error) || error)
+            if (!lfs::core::native_fs::is_directory(directory, error) || error)
                 return false;
 
             constexpr int max_depth = 4;
-            std::filesystem::recursive_directory_iterator iterator(
-                directory,
-                std::filesystem::directory_options::skip_permission_denied,
-                error);
+            std::filesystem::recursive_directory_iterator iterator(lfs::core::native_fs::traversal_path(directory),
+                                                                   std::filesystem::directory_options::skip_permission_denied,
+                                                                   error);
             const std::filesystem::recursive_directory_iterator end;
             while (iterator != end) {
                 if (error) {
@@ -292,6 +295,9 @@ namespace lfs::vis {
                 auto merged = lfs::core::persisted_settings::mergeForWrite(
                     paths->preferencesFile(), values, "schema_version", 1,
                     nullptr, {}, paths->backupDir());
+                // This map is authoritative: removed panel positions must stay removed.
+                if (values.contains("floating_window_geometry"))
+                    merged["floating_window_geometry"] = values["floating_window_geometry"];
                 if (reset_project_manager_on_save) {
                     auto saved_pm = merged.find("project_manager");
                     if (saved_pm != merged.end() && saved_pm->is_object()) {
@@ -329,13 +335,13 @@ namespace lfs::vis {
                                     "legacy_working_directory", "new_project_navigation_up_axis",
                                     "camera_navigation_mode", "status_bar_progress_style",
                                     "viewport_chrome_style", "viewport_toolbar_position",
-                                    "scene_upscaler"})
+                                    "scene_upscaler", "marketplace_view"})
                 (void)field<std::string>(values, key, {});
             for (const char* key : {"remember_camera_navigation", "remember_camera_view_snap",
-                                    "camera_view_snap", "new_project_align_grid",
-                                    "scene_graph_selection_markers"})
+                                    "camera_view_snap", "new_project_align_grid", "camera_browse_repeat",
+                                    "scene_graph_selection_markers", "marketplace_git_checkout"})
                 (void)field<bool>(values, key, false);
-            for (const char* key : {"zoom_speed", "navigation_speed", "viewport_toolbar_free_y"})
+            for (const char* key : {"zoom_speed", "navigation_speed", "camera_browse_repeat_rate", "viewport_toolbar_free_y"})
                 (void)field<float>(values, key, 0.0f);
             const auto scale = values.find("ui_scale");
             if (scale != values.end() && !scale->is_number() &&
@@ -361,6 +367,16 @@ namespace lfs::vis {
                 (void)field<bool>(*mcp, "expose_network", false);
                 (void)field<int>(*mcp, "port", 0);
                 (void)field<bool>(*mcp, "request_logging", false);
+            }
+        }
+
+        // Camera browsing preferences were first saved under GT comparison names.
+        void migrateRenamedKeysLocked() {
+            for (const auto& [from, to] : {std::pair{"gt_comparison_key_repeat", "camera_browse_repeat"},
+                                           std::pair{"gt_comparison_repeat_rate", "camera_browse_repeat_rate"}}) {
+                if (values.contains(from) && !values.contains(to))
+                    values[to] = values[from];
+                values.erase(from);
             }
         }
 
@@ -445,7 +461,7 @@ namespace lfs::vis {
             persisted_values = json::object();
             reset_project_manager_on_save = false;
 
-            std::ifstream input(path);
+            std::ifstream input(lfs::core::native_fs::native_path(path));
             if (!input)
                 return;
 
@@ -456,6 +472,7 @@ namespace lfs::vis {
                 values = std::move(parsed);
                 persisted_values = values;
                 input.close();
+                migrateRenamedKeysLocked();
                 logInvalidFieldsLocked();
                 const auto schema = values.find("schema_version");
                 if (schema != values.end() &&
@@ -524,6 +541,12 @@ namespace lfs::vis {
         values["show_grid"] = settings.show_grid;
         values["show_camera_frustums"] = settings.show_camera_frustums;
         values["desaturate_unselected"] = settings.desaturate_unselected;
+        values["selection_outline"] = settings.selection_outline;
+        values["selection_outline_opacity"] = settings.selection_outline_opacity;
+        values["selection_outline_width"] = settings.selection_outline_width;
+        values["selection_outline_threshold"] = settings.selection_outline_threshold;
+        values["selection_outline_holes"] = settings.selection_outline_holes;
+        values["selection_outline_color"] = {settings.selection_outline_color.r, settings.selection_outline_color.g, settings.selection_outline_color.b};
         values["desaturate_cropping"] = settings.desaturate_cropping;
         values["hide_outside_depth_box"] = settings.hide_outside_depth_box;
         values["axes_size"] = settings.axes_size;
@@ -563,6 +586,11 @@ namespace lfs::vis {
             if (!it->is_boolean())
                 return invalid("show_camera_frustums");
             candidate.show_camera_frustums = it->get<bool>();
+        }
+        if (const auto it = values.find("selection_outline"); it != values.end()) {
+            if (!it->is_boolean())
+                return invalid("selection_outline");
+            candidate.selection_outline = it->get<bool>();
         }
         if (const auto it = values.find("desaturate_unselected"); it != values.end()) {
             if (!it->is_boolean())
@@ -643,8 +671,146 @@ namespace lfs::vis {
                 candidate.selection_color_center_marker[static_cast<int>(i)] = static_cast<float>(value);
             }
         }
+        if (const auto it = values.find("selection_outline_color"); it != values.end()) {
+            if (!it->is_array() || it->size() != 3)
+                return invalid("selection_outline_color");
+            for (size_t i = 0; i < 3; ++i) {
+                if (!(*it)[i].is_number())
+                    return invalid("selection_outline_color");
+                const double value = (*it)[i].get<double>();
+                if (!std::isfinite(value) || value < 0 || value > 1)
+                    return invalid("selection_outline_color");
+                candidate.selection_outline_color[static_cast<int>(i)] = static_cast<float>(value);
+            }
+        }
+        if (const auto it = values.find("selection_outline_opacity"); it != values.end()) {
+            if (!it->is_number())
+                return invalid("selection_outline_opacity");
+            const double value = it->get<double>();
+            if (!std::isfinite(value) || value < 0 || value > 1)
+                return invalid("selection_outline_opacity");
+            candidate.selection_outline_opacity = static_cast<float>(value);
+        }
+
+        if (const auto it = values.find("selection_outline_width"); it != values.end()) {
+            if (!it->is_number())
+                return invalid("selection_outline_width");
+            const double value = it->get<double>();
+            if (!std::isfinite(value) || value < 1 || value > 12)
+                return invalid("selection_outline_width");
+            candidate.selection_outline_width = static_cast<float>(value);
+        }
+
+        if (const auto it = values.find("selection_outline_threshold"); it != values.end()) {
+            if (!it->is_number())
+                return invalid("selection_outline_threshold");
+            const double value = it->get<double>();
+            if (!std::isfinite(value) || value < 0.05 || value > 0.95)
+                return invalid("selection_outline_threshold");
+            candidate.selection_outline_threshold = static_cast<float>(value);
+        }
+
+        if (const auto it = values.find("selection_outline_holes"); it != values.end()) {
+            if (!it->is_boolean())
+                return invalid("selection_outline_holes");
+            candidate.selection_outline_holes = it->get<bool>();
+        }
+
         settings = std::move(candidate);
         return {};
+    }
+
+    namespace {
+        input::GamepadProfiles gamepadProfilesFromValues(const json& values) {
+            if (const auto legacy = values.find("gamepad_navigation"); legacy != values.end())
+                (void)input::GamepadNavigationSettings::fromJson(*legacy);
+            if (const auto profiles = values.find("gamepad_profiles"); profiles != values.end())
+                return input::GamepadProfiles::fromJson(*profiles);
+            return input::GamepadProfiles::migrate(input::GamepadNavigationSettings::fromJson(
+                values.value("gamepad_navigation", json::object())));
+        }
+    } // namespace
+
+    std::string UserPreferences::gamepadNavigation() {
+        std::lock_guard lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto found = impl_->values.find("gamepad_navigation");
+        if (!impl_->values.contains("gamepad_profiles"))
+            return found == impl_->values.end() ? "{}" : found->dump();
+        const bool enabled = found != impl_->values.end() ? found->value("enabled", false) : false;
+        return gamepadProfilesFromValues(impl_->values).activeSettings(enabled).json().dump();
+    }
+
+    std::string UserPreferences::gamepadProfiles() {
+        std::lock_guard lock(impl_->mutex);
+        impl_->loadLocked();
+        return gamepadProfilesFromValues(impl_->values).value.dump();
+    }
+
+    lfs::Status UserPreferences::setGamepadProfiles(const std::string_view serialized, bool enabled, const std::string_view expected) {
+        try {
+            auto profiles = input::GamepadProfiles::fromJson(json::parse(serialized));
+            std::lock_guard lock(impl_->mutex);
+            impl_->loadLocked();
+            if (!impl_->paths || !impl_->writable)
+                return invalidRenderingPreference("Gamepad preferences are not writable");
+            // Never replace unreadable/newer data, including via reset.
+            const auto previous = gamepadProfilesFromValues(impl_->values);
+            if (!expected.empty() && previous.value.dump() != expected)
+                return invalidRenderingPreference("Gamepad profiles changed while editing");
+            auto candidate = impl_->values;
+            candidate["gamepad_profiles"] = profiles.value;
+            candidate["gamepad_navigation"] = profiles.activeSettings(enabled).json();
+            auto merged = core::persisted_settings::mergeForWrite(impl_->paths->preferencesFile(), candidate,
+                                                                  "schema_version", 1, nullptr, {}, impl_->paths->backupDir());
+            merged["gamepad_profiles"] = candidate["gamepad_profiles"];
+            merged["gamepad_navigation"] = candidate["gamepad_navigation"];
+            if (auto result = impl_->paths->writePreferencesAtomically(merged.dump(2) + '\n'); !result)
+                return result;
+            impl_->values = merged;
+            impl_->persisted_values = std::move(merged);
+            return {};
+        } catch (const std::exception& error) {
+            return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = error.what(),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }));
+        }
+    }
+
+    lfs::Status UserPreferences::setGamepadNavigation(const std::string_view serialized) {
+        try {
+            const auto settings = input::GamepadNavigationSettings::fromJson(json::parse(serialized));
+            // Read/modify/write under the same mutex: slider/binding edits update
+            // only the active profile and cannot resurrect deleted profiles/overrides.
+            std::lock_guard lock(impl_->mutex);
+            impl_->loadLocked();
+            if (!impl_->paths || !impl_->writable)
+                return invalidRenderingPreference("Gamepad preferences are not writable");
+            auto profiles = gamepadProfilesFromValues(impl_->values);
+            profiles.updateActive(settings);
+            auto candidate = impl_->values;
+            candidate["gamepad_navigation"] = settings.json();
+            candidate["gamepad_profiles"] = profiles.value;
+            auto merged = core::persisted_settings::mergeForWrite(impl_->paths->preferencesFile(), candidate,
+                                                                  "schema_version", 1, nullptr, {}, impl_->paths->backupDir());
+            merged["gamepad_navigation"] = candidate["gamepad_navigation"];
+            merged["gamepad_profiles"] = candidate["gamepad_profiles"];
+            if (auto result = impl_->paths->writePreferencesAtomically(merged.dump(2) + '\n'); !result)
+                return result;
+            impl_->values = merged;
+            impl_->persisted_values = std::move(merged);
+            return {};
+        } catch (const std::exception& error) {
+            return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::InvalidArgument,
+                .domain = lfs::ErrorDomain::App,
+                .user_message = error.what(),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }));
+        }
     }
 
     lfs::Status UserPreferences::setRenderingDefaults(const std::string_view serialized) {
@@ -724,6 +890,54 @@ namespace lfs::vis {
         return result.dump();
     }
 
+    void UserPreferences::setSidebarDefaults(const float width, const float scene_ratio,
+                                             const std::string& active_tab) {
+        if (!std::isfinite(width) || width <= 0 || !std::isfinite(scene_ratio))
+            return;
+        std::lock_guard lock(impl_->mutex);
+        impl_->loadLocked();
+        auto& saved = impl_->values["sidebar_defaults"];
+        if (!saved.is_object())
+            saved = json::object();
+        saved["right_panel_width"] = width;
+        saved["scene_panel_ratio"] = std::clamp(scene_ratio, 0.01f, 0.99f);
+        saved["active_tab"] = active_tab;
+        impl_->saveValuesLocked();
+    }
+
+    std::string UserPreferences::sidebarDefaults() {
+        std::lock_guard lock(impl_->mutex);
+        impl_->loadLocked();
+        json result = json::object();
+        const auto stored = impl_->values.find("sidebar_defaults");
+        if (stored != impl_->values.end() && stored->is_object()) {
+            for (const char* key : {"right_panel_width", "scene_panel_ratio"}) {
+                const auto field = stored->find(key);
+                if (field != stored->end() && field->is_number()) {
+                    const auto value = field->get<double>();
+                    if (std::isfinite(value) && value > 0 &&
+                        (std::string_view(key) != "scene_panel_ratio" || value < 1))
+                        result[key] = value;
+                }
+            }
+            if (const auto tab = stored->find("active_tab"); tab != stored->end() && tab->is_string())
+                result["active_tab"] = *tab;
+        }
+        return result.dump();
+    }
+
+    void UserPreferences::clearSidebarDefaults() {
+        std::lock_guard lock(impl_->mutex);
+        impl_->loadLocked();
+        auto saved = impl_->values.find("sidebar_defaults");
+        if (saved != impl_->values.end() && saved->is_object())
+            for (const char* key : {"right_panel_width", "scene_panel_ratio", "active_tab"})
+                // Explicit nulls replace these fields during the recursive
+                // settings merge, without deleting future/unknown children.
+                (*saved)[key] = nullptr;
+        impl_->saveValuesLocked();
+    }
+
     void UserPreferences::setThemeName(const std::string& value) {
         std::scoped_lock lock(impl_->mutex);
         impl_->loadLocked();
@@ -734,6 +948,73 @@ namespace lfs::vis {
         std::scoped_lock lock(impl_->mutex);
         impl_->loadLocked();
         return lfs::core::persisted_settings::field<std::string>(impl_->values, "theme", {});
+    }
+    void UserPreferences::setNativeFloatingWindows(bool enabled) {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["native_floating_windows"] = enabled;
+        impl_->saveLocked();
+    }
+    bool UserPreferences::nativeFloatingWindows() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto it = impl_->values.find("native_floating_windows");
+        return it != impl_->values.end() && it->is_boolean() && it->get<bool>();
+    }
+
+    namespace {
+        [[nodiscard]] VrPreferences clampedVrPreferences(VrPreferences preferences) {
+            constexpr VrPreferences defaults;
+            const auto clamp = [](const float value, const float low, const float high, const float fallback) {
+                return std::isfinite(value) ? std::clamp(value, low, high) : fallback;
+            };
+            preferences.resolution_scale = clamp(preferences.resolution_scale, 0.25f, 1.5f, defaults.resolution_scale);
+            preferences.scene_units_per_meter =
+                clamp(preferences.scene_units_per_meter, 0.001f, 1000.0f, defaults.scene_units_per_meter);
+            preferences.move_speed = clamp(preferences.move_speed, 0.1f, 10.0f, defaults.move_speed);
+            return preferences;
+        }
+    } // namespace
+
+    void UserPreferences::setVrPreferences(const VrPreferences& preferences, const bool persist) {
+        const auto clamped = clampedVrPreferences(preferences);
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["vr_enabled"] = clamped.enabled;
+        impl_->values["vr_resolution_scale"] = clamped.resolution_scale;
+        impl_->values["vr_scene_units_per_meter"] = clamped.scene_units_per_meter;
+        impl_->values["vr_move_speed"] = clamped.move_speed;
+        if (persist)
+            impl_->saveLocked();
+    }
+
+    VrPreferences UserPreferences::vrPreferences() {
+        using lfs::core::persisted_settings::field;
+        constexpr VrPreferences defaults;
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto& values = impl_->values;
+        return clampedVrPreferences({
+            .enabled = field<bool>(values, "vr_enabled", defaults.enabled),
+            .resolution_scale = field<float>(values, "vr_resolution_scale", defaults.resolution_scale),
+            .scene_units_per_meter = field<float>(values, "vr_scene_units_per_meter", defaults.scene_units_per_meter),
+            .move_speed = field<float>(values, "vr_move_speed", defaults.move_speed),
+        });
+    }
+    void UserPreferences::setFloatingWindowGeometry(const std::string& value) {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto parsed = json::parse(value, nullptr, false);
+        if (!parsed.is_object())
+            return;
+        impl_->values["floating_window_geometry"] = parsed;
+        impl_->saveLocked();
+    }
+    std::string UserPreferences::floatingWindowGeometry() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto it = impl_->values.find("floating_window_geometry");
+        return it != impl_->values.end() && it->is_object() ? it->dump() : "{}";
     }
     void UserPreferences::setUiScale(const float value) {
         std::scoped_lock lock(impl_->mutex);
@@ -785,6 +1066,30 @@ namespace lfs::vis {
         if (it != impl_->values.end() && it->is_number())
             return clampNavigationSpeed(it->get<float>(), kDefaultNavigationSpeed);
         return kDefaultNavigationSpeed;
+    }
+    void UserPreferences::setCameraBrowseRepeat(const bool enabled) {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["camera_browse_repeat"] = enabled;
+        impl_->saveLocked();
+    }
+    bool UserPreferences::cameraBrowseRepeat() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        return lfs::core::persisted_settings::field<bool>(impl_->values, "camera_browse_repeat", true);
+    }
+    void UserPreferences::setCameraBrowseRepeatRate(const float value, const bool persist) {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["camera_browse_repeat_rate"] = std::isfinite(value) ? std::clamp(value, 1.0f, 20.0f) : 5.0f;
+        if (persist)
+            impl_->saveLocked();
+    }
+    float UserPreferences::cameraBrowseRepeatRate() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        const float value = lfs::core::persisted_settings::field<float>(impl_->values, "camera_browse_repeat_rate", 5.0f);
+        return std::isfinite(value) ? std::clamp(value, 1.0f, 20.0f) : 5.0f;
     }
     void UserPreferences::setLanguage(const std::string& value) {
         if (value.empty())
@@ -888,6 +1193,36 @@ namespace lfs::vis {
         impl_->loadLocked();
         return lfs::core::persisted_settings::field<bool>(impl_->values, "remember_camera_view_snap", false);
     }
+    void UserPreferences::setSplatDrag(const SplatDragPreferenceState& state) {
+        if ((state.format != "ply" && state.format != "spz") || !state.axes.valid())
+            return;
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["splat_drag"] = {{"format", state.format}, {"sh_degree", std::clamp(state.sh_degree, 0, 3)}, {"up_axis", state.axes.up}};
+        impl_->saveLocked();
+    }
+    SplatDragPreferenceState UserPreferences::splatDrag() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        SplatDragPreferenceState state;
+        const auto it = impl_->values.find("splat_drag");
+        if (it == impl_->values.end() || !it->is_object())
+            return state;
+        using lfs::core::persisted_settings::field;
+        state.format = field<std::string>(*it, "format", "ply");
+        if (state.format != "ply" && state.format != "spz")
+            state.format = "ply";
+        state.sh_degree = std::clamp(field<int>(*it, "sh_degree", 3), 0, 3);
+        // Preserve the old checkbox for existing users, while fresh settings
+        // retain source axes unless the native drag recognizes Blender.
+        if (!it->contains("up_axis") && field<bool>(*it, "blender_axes", false))
+            state.axes = SplatDragAxes::blender();
+        else
+            state.axes = {field<int>(*it, "up_axis", -2)};
+        if (!state.axes.valid())
+            state.axes = {};
+        return state;
+    }
     void UserPreferences::setSceneGraphSelectionMarkers(const bool enabled) {
         std::scoped_lock lock(impl_->mutex);
         impl_->loadLocked();
@@ -962,6 +1297,47 @@ namespace lfs::vis {
             return 0.5f;
         const float value = it->get<float>();
         return std::clamp(std::isfinite(value) ? value : 0.5f, 0.0f, 1.0f);
+    }
+
+    void UserPreferences::setMarketplaceView(const std::string_view value) {
+        if (value != "card" && value != "list")
+            throw std::invalid_argument("Unsupported Marketplace view");
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["marketplace_view"] = std::string(value);
+        impl_->saveLocked();
+    }
+
+    std::string UserPreferences::marketplaceView() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto it = impl_->values.find("marketplace_view");
+        if (it == impl_->values.end() || !it->is_string())
+            return "list";
+        const auto value = it->get<std::string>();
+        return value == "card" || value == "list" ? value : "list";
+    }
+
+    void UserPreferences::setMarketplaceGitCheckout(const bool enabled) {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["marketplace_git_checkout"] = enabled;
+        impl_->saveLocked();
+    }
+
+    bool UserPreferences::marketplaceGitCheckout() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        const auto it = impl_->values.find("marketplace_git_checkout");
+        return it != impl_->values.end() && it->is_boolean() && it->get<bool>();
+    }
+
+    void UserPreferences::resetMarketplacePreferences() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values.erase("marketplace_view");
+        impl_->values.erase("marketplace_git_checkout");
+        impl_->saveLocked();
     }
 
     void UserPreferences::setProjectManagerDefaultView(const std::string_view value) {
@@ -1272,7 +1648,7 @@ namespace lfs::vis {
         const auto resolved = lfs::core::UserPaths::resolve();
         if (!resolved)
             return {};
-        std::ifstream input(resolved->preferencesFile());
+        std::ifstream input(lfs::core::native_fs::native_path(resolved->preferencesFile()));
         if (!input)
             return {};
         try {
@@ -1297,6 +1673,24 @@ namespace lfs::vis {
     }
     std::filesystem::path projectLocationPreferenceRaw() {
         return UserPreferences::instance().projectLocationPreference();
+    }
+    std::filesystem::path resolvedProjectLocationPreference() {
+        const auto raw = projectLocationPreferenceRaw();
+        if (raw.empty())
+            return {};
+        const auto expanded = expandLeadingTilde(raw);
+        std::error_code error;
+        const auto absolute = std::filesystem::absolute(expanded, error);
+        return error || !expanded.is_absolute() ? std::filesystem::path{}
+                                                : absolute.lexically_normal();
+    }
+    lfs::Status probeProjectLocation(const std::filesystem::path& path) {
+        if (auto probed = validateWritableDirectory(
+                path, "project_location", "The project location",
+                ".lfs-project-write-probe-");
+            !probed)
+            return lfs::Status::failure(std::move(probed).error());
+        return {};
     }
     void clearProjectLocationPreference() {
         UserPreferences::instance().clearProjectLocation();

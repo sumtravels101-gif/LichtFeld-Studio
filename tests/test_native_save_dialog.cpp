@@ -2,10 +2,12 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/path_utils.hpp"
+#include "gui/editor/document_kind.hpp"
 #include "gui/utils/native_file_dialog.hpp"
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <nfd.h>
 
@@ -71,4 +73,25 @@ TEST(NativeSaveDialogTest, CancelDoesNotCreateADestination) {
     dialog_result = NFD_CANCEL;
     EXPECT_TRUE(lfs::vis::gui::SavePlyFileDialog("cloud-context").empty());
     dialog_result = NFD_OKAY;
+}
+
+TEST(NativeSaveDialogTest, JsonApprovalDoesNotCoverAnAppendedSuffix) {
+    const auto path = std::filesystem::temp_directory_path() / "lfs-collision-dialog-test.json";
+    std::ofstream(path).put('x');
+    for (int choice = 0; choice < 3; ++choice) {
+        selected_path = (choice == 1 ? path.parent_path() / path.stem() : path).string();
+        dialog_result = choice == 2 ? NFD_CANCEL : NFD_OKAY;
+        const auto [selected, confirmed] = lfs::vis::gui::SaveJsonFileDialogWithConfirmation("collision.voxel.json");
+        EXPECT_EQ(selected, choice == 2 ? std::filesystem::path{} : path);
+        EXPECT_EQ(confirmed, choice == 0);
+    }
+    dialog_result = NFD_OKAY;
+    std::filesystem::remove(path);
+}
+
+TEST(NativeSaveDialogTest, ShaderSaveUsesSlangSuffixAndPreservesTheChosenName) {
+    selected_path = "/tmp/generated-shader";
+    EXPECT_EQ(lfs::vis::gui::SavePythonFileDialog("generated-shader", {}, lfs::vis::editor::DocumentKind::Shader),
+              "/tmp/generated-shader.slang");
+    EXPECT_EQ(suggested_name, "generated-shader");
 }

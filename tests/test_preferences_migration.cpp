@@ -4,12 +4,16 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/user_paths.hpp"
+#include "gui/gui_manager.hpp"
 #include "gui/layout_state.hpp"
 #include "gui/panel_layout.hpp"
+#include "input/gamepad_navigation.hpp"
+#include "input/gamepad_profiles.hpp"
 #include "project/project_lifecycle.hpp"
 #include "project/session_state.hpp"
 #include "rendering/rendering_types.hpp"
 #include "visualizer/preferences.hpp"
+#include "visualizer_impl.hpp"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -18,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -82,6 +87,96 @@ namespace {
         return false;
     }
 } // namespace
+
+TEST(PreferencesMigration, StartupSidebarNeverOverridesAnAppliedProjectLayout) {
+    const auto home = makeHome("lfs_sidebar_startup_defaults");
+    const ScopedLfsHome scoped_home(home);
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    preferences.setSidebarDefaults(510, 0.35f, "lfs.rendering");
+    lfs::vis::gui::PanelLayoutManager manager;
+    manager.loadState();
+    EXPECT_FLOAT_EQ(manager.captureProjectState().right_panel_width, 510);
+    EXPECT_EQ(manager.captureProjectState().active_tab_id, "lfs.rendering");
+    auto project = manager.captureProjectState();
+    project.right_panel_width = 720;
+    project.active_tab_id = "lfs.training";
+    manager.applyProjectState(project);
+    EXPECT_FLOAT_EQ(manager.captureProjectState().right_panel_width, 720);
+    EXPECT_EQ(manager.captureProjectState().active_tab_id, "lfs.training");
+    EXPECT_EQ(json::parse(preferences.sidebarDefaults())["right_panel_width"], 510);
+    preferences.clearSidebarDefaults();
+    EXPECT_EQ(preferences.sidebarDefaults(), "{}");
+    EXPECT_FLOAT_EQ(manager.captureProjectState().right_panel_width, 720);
+}
+
+TEST(PreferencesMigration, GuilRestoreOverridesStartupSidebarThroughTheCoordinator) {
+    const auto home = makeHome("lfs_sidebar_guil_restore");
+    const ScopedLfsHome scoped_home(home);
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    preferences.setSidebarDefaults(510, 0.35f, "lfs.rendering");
+    lfs::vis::ViewerOptions options;
+    options.show_startup_overlay = false;
+    lfs::vis::VisualizerImpl viewer(options);
+    auto& manager = viewer.getGuiManager()->panelLayout();
+    EXPECT_FLOAT_EQ(manager.captureProjectState().right_panel_width, 510);
+    lfs::io::project::ProjectSessionChapters chapters;
+    auto gui = json::parse(chapters.gui_layout.dom().dump());
+    auto& fixed = gui["layouts"][0]["areas"][0]["spaces"][0]["opaque_payload"];
+    fixed["right_panel_width"] = 720;
+    fixed["scene_panel_ratio"] = 0.65f;
+    auto parsed = lfs::io::project::GuiLayoutChapter::parse(gui.dump());
+    ASSERT_TRUE(parsed);
+    chapters.gui_layout = std::move(*parsed);
+    lfs::vis::project::GuiSessionRestoreCoordinator coordinator;
+    ASSERT_TRUE(coordinator.stage(std::move(chapters)));
+    EXPECT_FALSE(coordinator.takeReady());
+    coordinator.onFirstGuiFrame();
+    coordinator.onPanelsReady(1);
+    auto ready = coordinator.takeReady();
+    ASSERT_TRUE(ready);
+    std::vector<lfs::vis::project::CameraBookmarkProjectState> bookmarks;
+    lfs::vis::project::applyGuiSession(viewer, *ready, bookmarks);
+    EXPECT_FLOAT_EQ(manager.captureProjectState().right_panel_width, 720);
+    EXPECT_FLOAT_EQ(manager.captureProjectState().scene_panel_ratio, 0.65f);
+    EXPECT_EQ(json::parse(preferences.sidebarDefaults())["right_panel_width"], 510);
+}
+
+TEST(PreferencesMigration, ClearingAfterAnotherInstanceRemovesTheParentDoesNotWriteNulls) {
+    const auto home = makeHome("lfs_sidebar_missing_parent");
+    const ScopedLfsHome scoped_home(home);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    ASSERT_TRUE(paths->ensureDirectories());
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    preferences.setSidebarDefaults(510, 0.35f, "lfs.rendering");
+    writePreferences(*paths, {{"schema_version", 1}});
+    preferences.clearSidebarDefaults();
+    EXPECT_EQ(readPreferences(*paths)["sidebar_defaults"], json::object());
+    preferences.setSidebarDefaults(610, 0.45f, "lfs.training");
+    EXPECT_EQ(readPreferences(*paths)["sidebar_defaults"]["right_panel_width"], 610);
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(paths->backupDir()))
+        EXPECT_NE(entry.path().filename(), paths->preferencesFile().filename());
+}
+
+TEST(PreferencesMigration, SidebarSaveClearSaveDoesNotBackupHealthyPreferences) {
+    const auto home = makeHome("lfs_sidebar_clear_no_backup");
+    const ScopedLfsHome scoped_home(home);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    ASSERT_TRUE(paths->ensureDirectories());
+    writePreferences(*paths, {{"schema_version", 1}, {"sidebar_defaults", {{"future_child", "keep"}}}});
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    preferences.setSidebarDefaults(510, 0.35f, "lfs.rendering");
+    const auto before = readPreferences(*paths).dump(2) + "\n";
+    preferences.clearSidebarDefaults();
+    EXPECT_EQ(preferences.sidebarDefaults(), "{}");
+    EXPECT_EQ(readPreferences(*paths)["sidebar_defaults"], json({{"future_child", "keep"}}));
+    preferences.setSidebarDefaults(610, 0.45f, "lfs.training");
+    EXPECT_EQ(readPreferences(*paths)["sidebar_defaults"]["future_child"], "keep");
+    EXPECT_FALSE(hasBackup(paths->backupDir(), paths->preferencesFile(), before));
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(paths->backupDir()))
+        EXPECT_NE(entry.path().filename(), paths->preferencesFile().filename());
+}
 
 TEST(PreferencesMigration, AssetDirectoryWinsOverWorkingDirectoryAndErasesLegacyKeys) {
     const auto home = makeHome("lfs_preferences_migration_asset_wins");
@@ -382,6 +477,33 @@ TEST(PreferencesMigration, InvalidProjectLocationIsRejectedWithoutPersisting) {
     EXPECT_EQ(readPreferences(*paths), before);
 }
 
+TEST(PreferencesMigration, NativeFloatingWindowsPersistAndGeometryResetPreservesOtherPreferences) {
+    const auto home = makeHome("lfs_preferences_native_windows");
+    const ScopedLfsHome scoped_home(home);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    ASSERT_TRUE(paths->ensureDirectories());
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    EXPECT_FALSE(preferences.nativeFloatingWindows());
+    preferences.setNativeFloatingWindows(true);
+    EXPECT_TRUE(preferences.nativeFloatingWindows());
+    preferences.setNativeFloatingWindows(false);
+    preferences.setThemeName("dark");
+    preferences.setFloatingWindowGeometry(R"({"preferences":[-900,50,800,600]})");
+    EXPECT_FALSE(preferences.nativeFloatingWindows());
+    EXPECT_FALSE(readPreferences(*paths).at("native_floating_windows").get<bool>());
+    EXPECT_EQ(json::parse(preferences.floatingWindowGeometry()).at("preferences")[0], -900);
+    preferences.setFloatingWindowGeometry("invalid");
+    EXPECT_TRUE(json::parse(preferences.floatingWindowGeometry()).contains("preferences"));
+    preferences.setFloatingWindowGeometry(R"({"video_extractor":[100,50,800,600]})");
+    EXPECT_FALSE(readPreferences(*paths).at("floating_window_geometry").contains("preferences"));
+    preferences.setFloatingWindowGeometry("{}");
+    EXPECT_EQ(preferences.floatingWindowGeometry(), "{}");
+    EXPECT_TRUE(readPreferences(*paths).at("floating_window_geometry").empty());
+    EXPECT_EQ(preferences.themeName(), "dark");
+    EXPECT_FALSE(preferences.nativeFloatingWindows());
+}
+
 TEST(PreferencesMigration, CameraSpeedPreferencesPersistAndClamp) {
     const auto home = makeHome("lfs_preferences_camera_speed");
     const ScopedLfsHome scoped_home(home);
@@ -504,6 +626,46 @@ TEST(PreferencesMigration, InvalidProjectManagerPreferencesFallBackWithoutContam
     EXPECT_EQ(readPreferences(*paths).at("theme"), "dark");
 }
 
+TEST(PreferencesMigration, MarketplacePreferencesPersistAndResetIndependently) {
+    const auto home = makeHome("lfs_preferences_marketplace");
+    const ScopedLfsHome scoped_home(home);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    ASSERT_TRUE(paths->ensureDirectories());
+    writePreferences(*paths, {{"schema_version", 999}, {"theme", "light"}, {"future_field", 42}});
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    EXPECT_EQ(preferences.marketplaceView(), "list");
+    EXPECT_FALSE(preferences.marketplaceGitCheckout());
+    preferences.setMarketplaceView("card");
+    preferences.setMarketplaceGitCheckout(true);
+    EXPECT_EQ(preferences.marketplaceView(), "card");
+    EXPECT_TRUE(preferences.marketplaceGitCheckout());
+    EXPECT_EQ(readPreferences(*paths).at("marketplace_view"), "card");
+    EXPECT_EQ(readPreferences(*paths).at("marketplace_git_checkout"), true);
+    EXPECT_THROW(preferences.setMarketplaceView("tiles"), std::invalid_argument);
+    preferences.resetMarketplacePreferences();
+    EXPECT_EQ(preferences.marketplaceView(), "list");
+    EXPECT_FALSE(preferences.marketplaceGitCheckout());
+    const auto saved = readPreferences(*paths);
+    EXPECT_FALSE(saved.contains("marketplace_view"));
+    EXPECT_FALSE(saved.contains("marketplace_git_checkout"));
+    EXPECT_EQ(saved.at("theme"), "light");
+    EXPECT_EQ(saved.at("future_field"), 42);
+    EXPECT_EQ(saved.at("schema_version"), 999);
+}
+
+TEST(PreferencesMigration, InvalidMarketplacePreferencesUseDefaults) {
+    const auto home = makeHome("lfs_preferences_marketplace_invalid");
+    const ScopedLfsHome scoped_home(home);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    ASSERT_TRUE(paths->ensureDirectories());
+    writePreferences(*paths, {{"marketplace_view", "tiles"}, {"marketplace_git_checkout", "yes"}});
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    EXPECT_EQ(preferences.marketplaceView(), "list");
+    EXPECT_FALSE(preferences.marketplaceGitCheckout());
+}
+
 TEST(PreferencesMigration, RenderingDefaultsPreserveFutureFieldsAndDoNotChangeProjectValues) {
     const auto home = makeHome("lfs_rendering_defaults_future");
     const ScopedLfsHome scoped_home(home);
@@ -583,4 +745,211 @@ TEST(PreferencesMigration, ViewportVignetteIsGlobalAndValidated) {
     const auto paths = lfs::core::UserPaths::resolve();
     ASSERT_TRUE(paths);
     EXPECT_EQ(readPreferences(*paths)["viewport_vignette"]["radius"], 0.4);
+}
+
+TEST(PreferencesMigration, CameraBrowseRepeatKeepsValuesSavedUnderOldNames) {
+    const auto home = makeHome("lfs_camera_browse_repeat_rename");
+    const ScopedLfsHome scoped_home(home);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    ASSERT_TRUE(paths->ensureDirectories());
+    writePreferences(*paths, {{"schema_version", 1},
+                              {"gt_comparison_key_repeat", false},
+                              {"gt_comparison_repeat_rate", 9.0}});
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    EXPECT_FALSE(preferences.cameraBrowseRepeat());
+    EXPECT_FLOAT_EQ(preferences.cameraBrowseRepeatRate(), 9.0f);
+    preferences.setCameraBrowseRepeatRate(11.0f);
+    const auto saved = readPreferences(*paths);
+    EXPECT_EQ(saved["camera_browse_repeat"], false);
+    EXPECT_EQ(saved["camera_browse_repeat_rate"], 11.0);
+    EXPECT_FALSE(saved.contains("gt_comparison_key_repeat"));
+    EXPECT_FALSE(saved.contains("gt_comparison_repeat_rate"));
+}
+
+TEST(PreferencesMigration, CameraBrowseRepeatRateIsClampedAndPersistedOnRequest) {
+    const auto home = makeHome("lfs_camera_browse_repeat_rate");
+    const ScopedLfsHome scoped_home(home);
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    EXPECT_TRUE(preferences.cameraBrowseRepeat());
+    EXPECT_FLOAT_EQ(preferences.cameraBrowseRepeatRate(), 5.0f);
+    preferences.setCameraBrowseRepeatRate(200.0f);
+    EXPECT_FLOAT_EQ(preferences.cameraBrowseRepeatRate(), 20.0f);
+    preferences.setCameraBrowseRepeatRate(-2.0f);
+    EXPECT_FLOAT_EQ(preferences.cameraBrowseRepeatRate(), 1.0f);
+    preferences.setCameraBrowseRepeatRate(std::numeric_limits<float>::quiet_NaN());
+    EXPECT_FLOAT_EQ(preferences.cameraBrowseRepeatRate(), 5.0f);
+    preferences.setCameraBrowseRepeatRate(7.0f);
+    preferences.setCameraBrowseRepeatRate(12.0f, false);
+    EXPECT_FLOAT_EQ(preferences.cameraBrowseRepeatRate(), 12.0f);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    EXPECT_EQ(readPreferences(*paths)["camera_browse_repeat_rate"], 7.0);
+}
+
+TEST(PreferencesMigration, GamepadEnablementAndAssignmentsSurviveReloadWithoutConnectionIds) {
+    const auto home = makeHome("lfs_gamepad_preferences_reload");
+    const auto other = makeHome("lfs_gamepad_preferences_reload_other");
+    const ScopedLfsHome scoped_home(home);
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    lfs::vis::input::GamepadNavigationSettings settings;
+    settings.enabled = true;
+    settings.move_speed = 2.3f;
+    settings.bindings.modes[0][0] = lfs::vis::input::GamepadBinding{};
+    ASSERT_TRUE(preferences.setGamepadNavigation(settings.json().dump()));
+    settings.bindings.modes[0][0].reset();
+    ASSERT_TRUE(preferences.setGamepadNavigation(settings.json().dump()));
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    const auto saved = readPreferences(*paths)["gamepad_navigation"];
+    EXPECT_TRUE(saved["enabled"].get<bool>());
+    EXPECT_FALSE(saved.contains("selected"));
+    EXPECT_FALSE(saved.contains("revision"));
+    EXPECT_FALSE(saved["bindings"]["modes"].contains("orbit"));
+    {
+        const ScopedLfsHome switch_home(other);
+        EXPECT_EQ(json::parse(preferences.gamepadNavigation()), json::object());
+    }
+    const auto restored = lfs::vis::input::GamepadNavigationSettings::fromJson(json::parse(preferences.gamepadNavigation()));
+    EXPECT_TRUE(restored.enabled);
+    EXPECT_FLOAT_EQ(restored.move_speed, 2.3f);
+    EXPECT_FALSE(restored.bindings.modes[0][0]);
+    settings.enabled = false;
+    ASSERT_TRUE(preferences.setGamepadNavigation(settings.json().dump()));
+    {
+        const ScopedLfsHome switch_home(other);
+        (void)preferences.gamepadNavigation();
+    }
+    EXPECT_FALSE(lfs::vis::input::GamepadNavigationSettings::fromJson(json::parse(preferences.gamepadNavigation())).enabled);
+}
+
+TEST(PreferencesMigration, InvalidGamepadProfileDoesNotOverwriteSavedPreferences) {
+    const auto home = makeHome("lfs_gamepad_invalid_preferences");
+    const ScopedLfsHome scoped_home(home);
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    lfs::vis::input::GamepadNavigationSettings settings;
+    ASSERT_TRUE(preferences.setGamepadNavigation(settings.json().dump()));
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    const auto before = readPreferences(*paths);
+    auto invalid = settings.json();
+    invalid["enabled"] = "true";
+    EXPECT_FALSE(preferences.setGamepadNavigation(invalid.dump()));
+    EXPECT_EQ(readPreferences(*paths), before);
+    settings.bindings.common[8] = settings.bindings.common[10];
+    EXPECT_FALSE(preferences.setGamepadNavigation(settings.json().dump()));
+    EXPECT_EQ(readPreferences(*paths), before);
+}
+
+TEST(PreferencesMigration, NamedGamepadProfilesMigrateAndSwitchAtomicallyWithoutChangingEnablement) {
+    const auto home = makeHome("lfs_named_gamepad_profiles");
+    const ScopedLfsHome scoped_home(home);
+    const auto paths = lfs::core::UserPaths::resolve();
+    ASSERT_TRUE(paths);
+    lfs::vis::input::GamepadNavigationSettings legacy{true};
+    legacy.move_speed = 2.4f;
+    ASSERT_TRUE(paths->ensureDirectories());
+    writePreferences(*paths, {{"gamepad_navigation", legacy.json()}, {"unrelated", 42}});
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    auto library = json::parse(preferences.gamepadProfiles());
+    EXPECT_EQ(library["profiles"][0]["name"], "Personal");
+    EXPECT_FALSE(library["profiles"][0]["settings"].contains("enabled"));
+    EXPECT_FLOAT_EQ(library["profiles"][0]["settings"]["move_speed"].get<float>(), 2.4f);
+    auto second = library["profiles"][0];
+    second["id"] = "second";
+    second["name"] = "Second";
+    second["settings"]["move_speed"] = 0.7;
+    library["profiles"].push_back(second);
+    library["active"] = "second";
+    library["device_profiles"][std::string(32, 'b')] = "second";
+    ASSERT_TRUE(preferences.setGamepadProfiles(library.dump(), true));
+    const auto saved = readPreferences(*paths);
+    EXPECT_EQ(saved["gamepad_profiles"]["active"], "second");
+    EXPECT_TRUE(saved["gamepad_navigation"]["enabled"].get<bool>());
+    EXPECT_EQ(saved["unrelated"], 42);
+    EXPECT_FLOAT_EQ(json::parse(preferences.gamepadNavigation())["move_speed"].get<float>(), 0.7f);
+    // Ordinary slider/binding writes update only the selected layout.
+    auto settings = lfs::vis::input::GamepadNavigationSettings::fromJson(json::parse(preferences.gamepadNavigation()));
+    settings.look_speed = 2.2f;
+    ASSERT_TRUE(preferences.setGamepadNavigation(settings.json().dump()));
+    const auto updated = json::parse(preferences.gamepadProfiles());
+    EXPECT_EQ(updated["profiles"][0], library["profiles"][0]);
+    EXPECT_EQ(updated["device_profiles"], library["device_profiles"]);
+    const auto other_home = makeHome("lfs_named_gamepad_profiles_other");
+    {
+        const ScopedLfsHome other(other_home);
+        (void)preferences.gamepadProfiles();
+    }
+    EXPECT_EQ(json::parse(preferences.gamepadProfiles()), updated);
+}
+
+TEST(PreferencesMigration, StaleGamepadProfileEditsCannotOverwriteConcurrentChanges) {
+    const ScopedLfsHome scoped_home(makeHome("lfs_named_gamepad_stale"));
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    const auto expected = preferences.gamepadProfiles();
+    auto library = json::parse(expected);
+    ASSERT_TRUE(preferences.setGamepadProfiles(library.dump(), false, expected));
+    const auto old = preferences.gamepadProfiles();
+    lfs::vis::input::GamepadNavigationSettings changed;
+    changed.move_speed = 3.0f;
+    ASSERT_TRUE(preferences.setGamepadNavigation(changed.json().dump()));
+    const auto paths = lfs::core::UserPaths::resolve();
+    const auto before = readPreferences(*paths);
+    library["profiles"][0]["name"] = "Stale rename";
+    EXPECT_FALSE(preferences.setGamepadProfiles(library.dump(), false, old));
+    EXPECT_EQ(readPreferences(*paths), before);
+}
+
+TEST(PreferencesMigration, FutureGamepadLibraryIsNeverReplacedByEditingOrReset) {
+    const ScopedLfsHome scoped_home(makeHome("lfs_named_gamepad_future"));
+    const auto paths = lfs::core::UserPaths::resolve();
+    auto library = lfs::vis::input::GamepadProfiles::migrate({}).value;
+    auto future = library;
+    future["schema_version"] = 2;
+    ASSERT_TRUE(paths->ensureDirectories());
+    writePreferences(*paths, {{"schema_version", 1}, {"project_location", ""}, {"gamepad_profiles", future}});
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    const auto before = readPreferences(*paths);
+    EXPECT_FALSE(preferences.setGamepadProfiles(library.dump(), false));
+    EXPECT_FALSE(preferences.setGamepadNavigation(lfs::vis::input::GamepadNavigationSettings{}.json().dump()));
+    EXPECT_EQ(readPreferences(*paths), before);
+}
+
+TEST(PreferencesMigration, SafeModeCannotModifyOrResetSavedGamepadProfiles) {
+    const ScopedLfsHome scoped_home(makeHome("lfs_named_gamepad_safe_mode"));
+    auto& preferences = lfs::vis::UserPreferences::instance();
+    const auto library = preferences.gamepadProfiles();
+    ASSERT_TRUE(preferences.setGamepadProfiles(library, true));
+    const auto paths = lfs::core::UserPaths::resolve();
+    const auto before = readPreferences(*paths);
+    struct SafeMode {
+        std::optional<std::string> previous;
+        SafeMode() {
+            if (const auto* value = std::getenv("LFS_SAFE_MODE"))
+                previous = value;
+#ifdef _WIN32
+            (void)_putenv_s("LFS_SAFE_MODE", "1");
+#else
+            (void)setenv("LFS_SAFE_MODE", "1", 1);
+#endif
+        }
+        ~SafeMode() {
+#ifdef _WIN32
+            (void)_putenv_s("LFS_SAFE_MODE", previous ? previous->c_str() : "");
+#else
+            if (previous)
+                (void)setenv("LFS_SAFE_MODE", previous->c_str(), 1);
+            else
+                (void)unsetenv("LFS_SAFE_MODE");
+#endif
+        }
+    };
+    {
+        const SafeMode safe_mode;
+        EXPECT_FALSE(preferences.setGamepadProfiles(library, false));
+        EXPECT_FALSE(preferences.setGamepadNavigation(lfs::vis::input::GamepadNavigationSettings{}.json().dump()));
+        EXPECT_EQ(readPreferences(*paths), before);
+    }
+    EXPECT_EQ(json::parse(preferences.gamepadProfiles()), json::parse(library));
+    EXPECT_TRUE(json::parse(preferences.gamepadNavigation())["enabled"].get<bool>());
 }

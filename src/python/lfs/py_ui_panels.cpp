@@ -13,6 +13,7 @@
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui/rmlui/rml_theme.hpp"
 #include "visualizer/post_work_utils.hpp"
+#include "visualizer/preferences.hpp"
 
 #include <algorithm>
 #include <array>
@@ -95,11 +96,9 @@ namespace lfs::python {
 
             const auto root_end = module_name.find('.', plugin_prefix.size());
             const std::string root_module_name = module_name.substr(0, root_end);
-
             PyObject* const modules = PyImport_GetModuleDict();
             if (!modules)
                 return false;
-
             PyObject* const module = PyDict_GetItemString(modules, root_module_name.c_str());
             if (!module)
                 return false;
@@ -347,7 +346,7 @@ namespace lfs::python {
                 return true;
 
             for (const auto* hook :
-                 std::array{"on_bind_model", "on_mount", "on_unmount", "on_update", "on_scene_changed"}) {
+                 std::array{"on_bind_model", "on_mount", "on_unmount", "on_update", "on_scene_changed", "on_visibility_changed"}) {
                 if (class_overrides(panel_class, panel_base, hook))
                     return true;
             }
@@ -383,10 +382,13 @@ namespace lfs::python {
         float initial_width = 0.0f;
         float initial_height = 0.0f;
 
+        // A panel without its own id keeps the class id, as unregister_panel expects.
         if (nb::hasattr(panel_class, "id")) {
-            panel_id = parse_string_value(panel_class.attr("id"), "id");
-            if (class_overrides(panel_class, panel_base, "id") && panel_id.empty())
+            auto explicit_id = parse_string_value(panel_class.attr("id"), "id");
+            if (class_overrides(panel_class, panel_base, "id") && explicit_id.empty())
                 throw_value_error("id must not be empty");
+            if (!explicit_id.empty())
+                panel_id = std::move(explicit_id);
         }
 
         if (nb::hasattr(panel_class, "label")) {
@@ -485,7 +487,8 @@ namespace lfs::python {
                 compose_retained_style(style, has_immediate_draw),
                 has_poll,
                 height_mode,
-                has_immediate_draw);
+                has_immediate_draw,
+                to_gui_space(space) == gui::PanelSpace::Floating);
             if (to_gui_space(space) == gui::PanelSpace::Floating)
                 retained_adapter->setForeground(true);
             adapter = retained_adapter;
@@ -592,6 +595,33 @@ namespace lfs::python {
         });
     }
 
+    std::string PyPanelRegistry::module_for_panel(const std::string& panel_id) const {
+        std::lock_guard lock(mutex_);
+        const auto it = panels_.find(panel_id);
+        return it == panels_.end() ? std::string{} : it->second.module_prefix;
+    }
+
+    bool unload_panel_plugin(const std::string& panel_id) {
+        constexpr std::string_view plugin_prefix = "lfs_plugins.";
+        const std::string module_name = PyPanelRegistry::instance().module_for_panel(panel_id);
+        if (!module_name.starts_with(plugin_prefix))
+            return false;
+        const std::string root_module_name = module_name.substr(0, module_name.find('.', plugin_prefix.size()));
+
+        const nb::gil_scoped_acquire acquire;
+        try {
+            const nb::object module = nb::module_::import_("sys").attr("modules").attr("get")(root_module_name);
+            const nb::object plugin_name = nb::getattr(module, "__lfs_plugin_name__", nb::none());
+            if (plugin_name.is_none())
+                return false;
+            const nb::object manager = nb::module_::import_("lfs_plugins").attr("PluginManager").attr("instance")();
+            return nb::cast<bool>(manager.attr("unload")(plugin_name));
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to unload the plugin of panel '{}': {}", panel_id, e.what());
+            return false;
+        }
+    }
+
     void register_ui_panels(nb::module_& m) {
         nb::enum_<PanelSpace>(m, "PanelSpace")
             .value("SIDE_PANEL", PanelSpace::SidePanel)
@@ -670,6 +700,18 @@ namespace lfs::python {
                 });
             },
             nb::arg("panel_id"), nb::arg("enabled"), "Enable or disable a panel by id");
+
+        m.def("save_startup_sidebar", [] { return invoke_on_viewer([] {
+                                               auto* gui_manager = get_gui_manager();
+                                               if (!gui_manager)
+                                                   return false;
+                                               const auto layout = gui_manager->panelLayout().captureProjectState();
+                                               vis::UserPreferences::instance().setSidebarDefaults(
+                                                   layout.right_panel_width, layout.scene_panel_ratio, layout.active_tab_id);
+                                               return true;
+                                           },
+                                                                   false); }, "Save the right sidebar as a startup default; saved .licht workspaces take precedence.");
+        m.def("clear_startup_sidebar", [] { vis::UserPreferences::instance().clearSidebarDefaults(); }, "Clear startup sidebar defaults without changing the current project workspace.");
 
         m.def(
             "reset_layout", []() -> std::string {
