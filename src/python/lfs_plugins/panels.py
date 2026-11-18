@@ -99,6 +99,11 @@ PANEL_SPECS = {
         "rendering_panel.section_simplify", "FLOATING", 13, "rmlui/splat_simplify.rml", "CONTENT", (420, 0),
         update_policy="dirty",
     ),
+    "camera_selection": _PanelSpec(
+        "lfs_plugins.camera_selection_panel", "CameraSelectionPanel", "lfs.camera_selection",
+        "scene.camera_selection", "FLOATING", 15, "rmlui/camera_selection.rml", "CONTENT", (420, 0),
+        update_policy="dirty",
+    ),
     "mesh2splat": _PanelSpec(
         "lfs_plugins.mesh2splat_panel", "Mesh2SplatPanel", "native.mesh2splat",
         "Mesh to Splat", "FLOATING", 12, "rmlui/mesh2splat_panel.rml", "CONTENT",
@@ -249,8 +254,10 @@ def _build_builtin_panel_steps(lf):
 
     def training_panel():
         from .training_panel import TrainingPanel
+        from .external_training_panel import ExternalTrainingPanel
 
         lf.register_class(TrainingPanel)
+        lf.register_class(ExternalTrainingPanel)
 
     def import_panels():
         _register_lazy_panel(lf, "new_project")
@@ -272,6 +279,7 @@ def _build_builtin_panel_steps(lf):
         tools_mod.register()
         _register_lazy_panel(lf, "splat_simplify")
         _register_lazy_panel(lf, "collision")
+        _register_lazy_panel(lf, "camera_selection")
 
     def menus():
         from . import file_menu, edit_menu, tools_menu, view_menu, help_menu
@@ -319,7 +327,12 @@ def _build_builtin_panel_steps(lf):
             from .image_preview_panel import open_camera_preview_by_uid
             return open_camera_preview_by_uid(uid)
 
+        def open_extracted_preview(paths, weights, sequence):
+            from .image_preview_panel import open_extracted_frame_preview
+            return open_extracted_frame_preview(paths, weights, sequence)
+
         lf.ui.on_open_camera_preview(open_camera_preview)
+        lf.ui.on_open_image_preview(open_extracted_preview, include_sequence=True)
 
     def histogram_panel():
         _register_lazy_panel(lf, "histogram")

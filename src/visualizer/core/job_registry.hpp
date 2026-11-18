@@ -23,11 +23,14 @@ namespace lfs::vis {
         VideoExport,
         Mesh2Splat,
         SplatSimplify,
+        CameraSelection,
         ProjectWrite,
         ProjectOpen,
         DatasetEmbed,
         Collision,
         AprilTagScan,
+        AssistedMask,
+        ModelCache,
     };
 
     enum class JobStatus : std::uint8_t {
@@ -98,6 +101,9 @@ namespace lfs::vis {
                         std::optional<lfs::ErrorCode> error_code = std::nullopt,
                         std::optional<lfs::Error> typed_error = std::nullopt,
                         bool published = false);
+        void finishPublishedWork(JobHandle handle, bool published) {
+            finishWork(handle, false, std::string{}, std::nullopt, std::nullopt, published);
+        }
 
         // Main thread: observes and performs lifecycle transitions.
         [[nodiscard]] std::optional<JobSnapshot>

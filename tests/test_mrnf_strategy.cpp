@@ -28,11 +28,13 @@ class MRNFStrategyTest_RemoveGaussiansKeepsGrowthExchangeStateAligned_Test;
 class MRNFStrategyTest_GrowthExchangeFallsBackToCoverageWithoutImpact_Test;
 class MRNFStrategyTest_GrowthExchangeMatchesDemandWithoutDeletingParents_Test;
 class MRNFStrategyTest_GrowthExchangeCosineQuotaAtStartMiddleAndEnd_Test;
+class MRNFStrategyTest_RayDepthStateFollowsItsSplats_Test;
 
 #include "core/camera.hpp"
 #include "core/cuda/memory_arena.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/logger.hpp"
+#include "core/memory_pressure.hpp"
 #include "core/parameters.hpp"
 #include "core/scene.hpp"
 #include "core/sh_value_quant.hpp"
@@ -44,6 +46,8 @@ class MRNFStrategyTest_GrowthExchangeCosineQuotaAtStartMiddleAndEnd_Test;
 #include "lfs/training/joint_adam_codec.hpp"
 #include "lfs/training/live_model_mutation_guard.hpp"
 #include "lfs/training/mean_step_scale.cuh"
+#include "lfs/training/morton_reorder.hpp"
+#include "lfs/training/ray_depth_step.cuh"
 #include "lfs/training/sh_value_codec.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "training/checkpoint.hpp"
@@ -51,10 +55,12 @@ class MRNFStrategyTest_GrowthExchangeCosineQuotaAtStartMiddleAndEnd_Test;
 #include "training/kernels/densification_kernels.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
 #include "training/optimizer/render_output.hpp"
+#include "training/strategies/improved_gs_plus.hpp"
 #include "training/strategies/mrnf.hpp"
 #include "training/strategies/strategy_utils.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -91,33 +97,105 @@ TEST(MRNFStrategyTest, ReplaceParentWeightsMatchesTensorProducts) {
     opacity_values[3] = -0.0f;
     edge_values[4] = std::numeric_limits<float>::quiet_NaN();
     edge_values[5] = -0.0f;
+    edge_values[6] = -2.0f;
 
-    const auto opacities = Tensor::from_vector(opacity_values, TensorShape({n}), Device::CUDA);
+    const auto raw_opacities = Tensor::from_vector(opacity_values, TensorShape({n}), Device::CUDA);
     const auto visibility = Tensor::from_vector(visibility_values, TensorShape({n}), Device::CUDA);
     const auto active = Tensor::from_vector(active_values, TensorShape({n}), Device::CUDA);
     const auto trainable = Tensor::from_vector(trainable_values, TensorShape({n}), Device::CUDA);
     const auto edge = Tensor::from_vector(edge_values, TensorShape({n}), Device::CUDA);
+    // Reference: the factor built from a normalized copy of the scores.
+    auto edge_factor = edge.clone();
+    kernels::launch_normalize_by_positive_median(edge_factor.ptr<float>(), n);
+    edge_factor.mul_(0.25f).add_(1.0f);
+    const mrnf_strategy::EdgeGuidance guidance{
+        .scores = edge.ptr<float>(),
+        .median = kernels::launch_select_positive_median(edge.ptr<float>(), n, nullptr),
+        .weight = 0.25f,
+    };
 
     for (int options = 0; options < 8; ++options) {
-        auto expected = opacities * (visibility > 0.0f);
+        auto expected = raw_opacities.sigmoid() * (visibility > 0.0f);
         if (options & 1)
             expected = expected * active;
         if (options & 2)
             expected = expected * trainable;
         if (options & 4)
-            expected = expected * edge;
+            expected = expected * edge_factor;
 
         auto actual = Tensor::empty({n}, Device::CUDA);
         mrnf_strategy::launch_replace_parent_weights(
-            opacities.ptr<float>(), visibility.ptr<float>(),
+            raw_opacities.ptr<float>(), visibility.ptr<float>(),
             options & 1 ? active.ptr<bool>() : nullptr,
             options & 2 ? trainable.ptr<bool>() : nullptr,
-            options & 4 ? edge.ptr<float>() : nullptr,
+            options & 4 ? guidance : mrnf_strategy::EdgeGuidance{},
             actual.ptr<float>(), n);
         const auto actual_host = actual.cpu();
         const auto expected_host = expected.cpu();
         EXPECT_EQ(std::memcmp(actual_host.ptr<float>(), expected_host.ptr<float>(), n * sizeof(float)), 0)
             << "options=" << options;
+    }
+
+    auto scaled = Tensor::full({n}, 3.0f, Device::CUDA);
+    mrnf_strategy::launch_apply_edge_guidance(scaled.ptr<float>(), guidance, n);
+    const auto scaled_host = scaled.cpu();
+    const auto expected_scaled = (Tensor::full({n}, 3.0f, Device::CUDA) * edge_factor).cpu();
+    EXPECT_EQ(std::memcmp(scaled_host.ptr<float>(), expected_scaled.ptr<float>(), n * sizeof(float)), 0);
+}
+
+// The growth exchange ranks rows by the later of their positions in the two
+// importance orders. The radix ranking must give up exactly the rows the
+// comparator sorts (Tensor::sort) did, with ties, NaN, -0 and +inf present.
+TEST(MRNFStrategyTest, ExchangeRanksMatchComparatorSorts) {
+    constexpr size_t n = 300007;
+    constexpr size_t count = n / 7;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const std::vector<float> palette{0.0f, -0.0f, 0.25f, 0.5f, 1.0f, 3.0f, inf, nan, 1e-30f};
+    std::vector<float> primary(n), secondary(n), eligible(n);
+    uint32_t state = 4321u;
+    const auto next = [&state] {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t r = next();
+        primary[i] = r % 3 == 0 ? palette[r % palette.size()] : static_cast<float>(r % 997) * 0.01f;
+        secondary[i] = palette[next() % palette.size()];
+        eligible[i] = next() % 5 != 0 ? 1.0f : 0.0f;
+    }
+    const auto primary_d = Tensor::from_vector(primary, TensorShape({n}), Device::CUDA);
+    const auto secondary_d = Tensor::from_vector(secondary, TensorShape({n}), Device::CUDA);
+    const auto eligible_d = Tensor::from_vector(eligible, TensorShape({n}), Device::CUDA) > 0.5f;
+
+    for (const bool with_secondary : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "secondary=" << with_secondary);
+        const auto order_of = [&](const Tensor& importance) {
+            return importance.masked_fill(eligible_d.logical_not(), inf).sort(0, false).second.to_vector_int64();
+        };
+        std::vector<int64_t> ranks(n, 0);
+        for (const auto* importance : {&primary_d, with_secondary ? &secondary_d : nullptr}) {
+            if (importance == nullptr)
+                continue;
+            const auto order = order_of(*importance);
+            for (size_t position = 0; position < n; ++position)
+                ranks[order[position]] = std::max<int64_t>(ranks[order[position]], static_cast<int64_t>(position));
+        }
+        std::vector<int64_t> expected(n);
+        for (size_t i = 0; i < n; ++i)
+            expected[i] = static_cast<int64_t>(i);
+        std::stable_sort(expected.begin(), expected.end(), [&](const int64_t a, const int64_t b) {
+            const int64_t rank_a = eligible[a] > 0.5f ? ranks[a] : INT_MAX;
+            const int64_t rank_b = eligible[b] > 0.5f ? ranks[b] : INT_MAX;
+            return rank_a < rank_b;
+        });
+        expected.resize(count);
+
+        auto rows = Tensor::empty({count}, Device::CUDA, DataType::Int64);
+        mrnf_strategy::launch_rank_exchange_rows(
+            primary_d.ptr<float>(), with_secondary ? secondary_d.ptr<float>() : nullptr,
+            eligible_d.ptr<bool>(), n, count, rows.ptr<int64_t>());
+        EXPECT_EQ(rows.to_vector_int64(), expected);
     }
 }
 
@@ -407,7 +485,9 @@ TEST(MRNFStrategyTest, EdgeGuidanceFactorPrefersHigherPrecomputedEdgeScores) {
         Tensor::from_vector(edge_scores_data, TensorShape({10}), Device::CUDA);
     strategy._edge_precompute_valid = true;
 
-    const auto guidance = strategy.edge_guidance_factor().cpu();
+    auto factors = Tensor::ones({10}, Device::CUDA);
+    mrnf_strategy::launch_apply_edge_guidance(factors.ptr<float>(), strategy.edge_guidance(), 10);
+    const auto guidance = factors.cpu();
     const float* guidance_ptr = guidance.ptr<float>();
 
     EXPECT_NEAR(guidance_ptr[2], 1.0f, 1e-5f);
@@ -543,7 +623,7 @@ TEST(CropDampingStrategyTest, RoiGrowthShareSplitsPicksAndSpillsLeftovers) {
     EXPECT_EQ(split(0.0f, 10), (std::pair<int64_t, int64_t>{0, 6}));
 
     optimizer.set_crop_roi_rows(roi_rows({0, 1, 2, 3}, 10), 1.0f);
-    const auto picks = strategy.sample_with_roi_share(weights, 4, 7, 10).cpu().to_vector_int64();
+    const auto picks = strategy.sample_with_roi_share(weights, 4, 7).cpu().to_vector_int64();
     ASSERT_EQ(picks.size(), 4u);
     for (const auto index : picks)
         EXPECT_LT(index, 4) << "a 100 % share picked a row outside the box";
@@ -560,9 +640,6 @@ TEST(CropDampingStrategyTest, RoiGrowthSplitCountsOnlySelectableWeights) {
     auto& optimizer = strategy.get_optimizer();
     optimizer.set_crop_roi_rows(roi_rows({0, 1, 2, 3}, 10), 1.0f);
 
-    // Leaves rows 0..3 in the scratch the next draw reuses.
-    ASSERT_EQ(strategy.sample_with_roi_share(Tensor::ones({10}, Device::CUDA), 4, 7, 10).numel(), 4u);
-
     const float nan = std::numeric_limits<float>::quiet_NaN();
     const auto weights = Tensor::from_vector(
         std::vector<float>{nan, 1.0f, 2.0f, -1.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f}, TensorShape({10}), Device::CUDA);
@@ -572,7 +649,7 @@ TEST(CropDampingStrategyTest, RoiGrowthSplitCountsOnlySelectableWeights) {
     EXPECT_EQ(split->rest_nnz, 6);
     EXPECT_EQ(split->roi_count, 2);
 
-    auto picks = strategy.sample_with_roi_share(weights, 8, 11, 8).cpu().to_vector_int64();
+    auto picks = strategy.sample_with_roi_share(weights, 8, 11).cpu().to_vector_int64();
     std::sort(picks.begin(), picks.end());
     EXPECT_EQ(picks, (std::vector<int64_t>{1, 2}));
 }
@@ -601,6 +678,18 @@ TEST(CropDampingStrategyTest, RoiShareSamplingWeightsHoldTheShareOfTheMass) {
     EXPECT_EQ(masses({0, 1, 2, 3}, 1.0f).second, 0.0f);
     EXPECT_EQ(masses({}, 1.0f), (std::pair{0.0f, 0.0f})) << "a strict share with an empty ROI draws nothing";
     EXPECT_GT(masses({}, 0.8f).second, 0.0f) << "an empty ROI hands a partial share to the rest";
+}
+
+TEST(MRNFStrategyTest, PercentileRankStaysInsideTheSortedValues) {
+    using mrnf_strategy::percentile_bounds_ranks;
+    using Ranks = std::pair<size_t, size_t>;
+    constexpr size_t past_float32 = (size_t{1} << 24) + 4;
+    EXPECT_EQ(percentile_bounds_ranks(past_float32, 1.0f), (Ranks{0, past_float32 - 1}));
+    EXPECT_EQ(percentile_bounds_ranks(20'000'000, 1.0f), (Ranks{0, 19'999'999}));
+    EXPECT_EQ(percentile_bounds_ranks(20'000'000, std::nextafter(1.0f, 0.0f)), (Ranks{0, 19'999'998}));
+    EXPECT_EQ(percentile_bounds_ranks(20'000'000, 0.0f), (Ranks{9'999'999, 9'999'999}));
+    EXPECT_EQ(percentile_bounds_ranks(1, 1.0f), (Ranks{0, 0}));
+    EXPECT_EQ(percentile_bounds_ranks(11, 0.5f), (Ranks{2, 7}));
 }
 
 TEST(MRNFStrategyTest, DegenerateBoundsStayInvalidAndKeepFiniteMeanLearningRate) {
@@ -1268,6 +1357,107 @@ TEST(MRNFStrategyTest, GrowAndSplitReusesFreeSlotsBeforeAppending) {
     EXPECT_EQ(strategy.free_count(), 1u);
 }
 
+TEST(MRNFStrategyTest, FreeSlotCountIsExactPastFloat32Precision) {
+    constexpr size_t b = size_t{1} << 24;
+    const auto all_free = Tensor::ones_bool({b + 3}, Device::CUDA);
+    auto splats = create_mrnf_test_splat_data(1);
+    const auto one_mean = splats.means();
+    MRNF mrnf(splats);
+    ImprovedGSPlus igs(splats);
+    mrnf._free_mask = all_free;
+    igs._free_mask = all_free;
+    for (const size_t rows : {b + 1, b + 3}) {
+        SCOPED_TRACE(rows);
+        // A broadcast view supplies the logical row count without allocating a large model.
+        splats.means() = one_mean.expand({rows, 3});
+        EXPECT_EQ(mrnf.free_count(), rows);
+        EXPECT_EQ(mrnf.active_count(), 0u);
+        EXPECT_EQ(igs.free_count(), rows);
+        EXPECT_EQ(igs.active_count(), 0u);
+    }
+}
+
+// A refine that runs out of VRAM at any allocation must be undone to the rows
+// it started from, and the next refine must grow that model cleanly.
+TEST(MRNFStrategyTest, RefineOutOfVramIsUndoneToTheRowsItStartedFrom) {
+    auto& pressure = lfs::core::MemoryPressureCoordinator::instance();
+    const auto prepare = [](MRNF& strategy, SplatData& splat) {
+        strategy.ensure_densification_info_shape();
+        strategy._refine_weight_max = Tensor::full({static_cast<size_t>(splat.size())}, 1.0f, Device::CUDA);
+        auto visibility = strategy.visibility_accumulator();
+        visibility.fill_(1.0f);
+    };
+    const auto expect_whole = [](MRNF& strategy, SplatData& splat) {
+        const size_t n = splat.size();
+        for (const auto* rows : {&splat.sh0(), &splat.scaling_raw(), &splat.rotation_raw(), &splat.opacity_raw()})
+            EXPECT_EQ(rows->size(0), n);
+        EXPECT_TRUE(!splat.has_deleted_mask() || splat.deleted_mask_matches_size());
+        // The free mask spans the reserved capacity, not just the live rows.
+        EXPECT_GE(strategy._free_mask.numel(), n);
+        for (const auto type : {ParamType::Means, ParamType::Sh0, ParamType::Scaling, ParamType::Rotation,
+                                ParamType::Opacity}) {
+            const auto* state = strategy.get_optimizer().get_state(type);
+            ASSERT_NE(state, nullptr);
+            EXPECT_EQ(state->size, n) << static_cast<int>(type);
+        }
+    };
+
+    bool completed = false;
+    int undone = 0;
+    for (int allowed = 0; !completed && allowed < 256; ++allowed) {
+        SCOPED_TRACE(::testing::Message() << "allocations allowed: " << allowed);
+        auto splat = create_mrnf_test_splat_data(300);
+        MRNF strategy(splat);
+        auto params = vanilla_mrnf_params();
+        params.iterations = 10'000;
+        params.sh_degree_interval = 10'000;
+        params.max_cap = 1000;
+        params.growth_grad_threshold = 0.5f;
+        params.grow_fraction = 1.0f;
+        params.grow_until_iter = 10'000;
+        strategy.initialize(params);
+        prepare(strategy, splat);
+        const size_t before = splat.size();
+        const auto shN_before = splat.shN().numel();
+        const RefineRowSnapshot rows_before(
+            splat, strategy.get_optimizer(),
+            [&](const std::function<void(Tensor&)>& visit) { strategy.for_each_gaussian_row(visit); });
+
+        int calls = 0;
+        pressure.set_allocation_probe([&](const lfs::core::MemoryDomain domain, size_t) {
+            return domain == lfs::core::MemoryDomain::CudaDevice && ++calls > allowed;
+        });
+        bool failed = false;
+        try {
+            strategy.grow_and_split(1, 0);
+        } catch (const lfs::core::MemoryAllocationError&) {
+            failed = true;
+        }
+        pressure.set_allocation_probe(nullptr);
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+        if (failed) {
+            ++undone;
+            ASSERT_TRUE(rows_before.restore());
+            EXPECT_EQ(splat.size(), before);
+            EXPECT_EQ(splat.shN().numel(), shN_before);
+        } else {
+            completed = true;
+            EXPECT_GT(splat.size(), before);
+        }
+        expect_whole(strategy, splat);
+
+        const size_t grown_from = splat.size();
+        prepare(strategy, splat);
+        ASSERT_NO_THROW(strategy.grow_and_split(2, 0));
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        EXPECT_GT(splat.size(), grown_from);
+        expect_whole(strategy, splat);
+    }
+    EXPECT_TRUE(completed);
+    EXPECT_GT(undone, 0);
+}
+
 TEST(MRNFStrategyTest, SerializeRoundTripPreservesFreeMask) {
 
     auto splat_data = create_mrnf_test_splat_data();
@@ -1884,7 +2074,7 @@ TEST(MRNFStrategyTest, PerSplatMeanStepScalesWithExtentAndClamps) {
     EXPECT_NEAR(dx_huge / dx_med, r_max / r_min, 0.02f * (r_max / r_min));
 }
 
-TEST(MRNFStrategyTest, PermutationRepublishesFarMask) {
+TEST(MRNFStrategyTest, MortonReorderKeepsFarMaskPublished) {
     auto splat = create_mrnf_test_splat_data(4, 0);
     auto params = vanilla_mrnf_params();
     params.max_cap = 8;
@@ -1898,28 +2088,153 @@ TEST(MRNFStrategyTest, PermutationRepublishesFarMask) {
     auto& optimizer = strategy.get_optimizer();
     ASSERT_EQ(optimizer.mean_step_far_mask(), strategy._far_field_mask.ptr<bool>());
     ASSERT_EQ(optimizer.mean_step_far_mask_n(), 4);
-    // Keep the old allocation alive so allocator reuse cannot hide a stale pointer.
-    const auto old_mask = strategy._far_field_mask;
-    const auto permutation = Tensor::from_vector(
-                                 std::vector<int>{1, 3, 0, 2}, TensorShape({4}), Device::CUDA)
-                                 .to(DataType::Int64);
+    const auto before = strategy._far_field_mask.cpu();
 
-    strategy.permute_gaussian_rows(permutation);
+    const auto result = morton::apply_morton_reorder(
+        splat, &optimizer, nullptr, [&](const morton::RowVisitor& visit) { strategy.for_each_gaussian_row(visit); });
+    ASSERT_TRUE(result.applied);
 
-    EXPECT_NE(strategy._far_field_mask.ptr<bool>(), old_mask.ptr<bool>());
     EXPECT_EQ(optimizer.mean_step_far_mask(), strategy._far_field_mask.ptr<bool>());
     EXPECT_EQ(optimizer.mean_step_far_mask_n(), strategy._far_field_mask.numel());
+    const auto permutation = result.permutation.cpu();
     const auto reordered = strategy._far_field_mask.cpu();
-    const bool* values = reordered.ptr<bool>();
-    EXPECT_TRUE(values[0]);
-    EXPECT_TRUE(values[1]);
-    EXPECT_FALSE(values[2]);
-    EXPECT_FALSE(values[3]);
+    for (size_t i = 0; i < 4; ++i)
+        EXPECT_EQ(reordered.ptr<bool>()[i], before.ptr<bool>()[permutation.ptr<int64_t>()[i]]) << i;
 
     // A hull refresh with no cameras must clear the borrowed pointer immediately.
     strategy.refresh_camera_hull();
     EXPECT_EQ(optimizer.mean_step_far_mask(), nullptr);
     EXPECT_EQ(optimizer.mean_step_far_mask_n(), 0);
+}
+
+// Row r of the ray-depth state is tagged with the x coordinate of splat r; a reorder, a prune and a split must keep
+// the tag on its splat, and children take their parent's anchor and spread with fresh moments.
+TEST(MRNFStrategyTest, RayDepthStateFollowsItsSplats) {
+    constexpr int n = 10;
+    constexpr int stride = ray_depth::kStateStride;
+    auto splat = create_mrnf_test_splat_data(n, 0);
+    {
+        std::vector<float> reversed(3 * n, 0.0f);
+        for (int i = 0; i < n; ++i)
+            reversed[3 * i] = static_cast<float>(n - 1 - i);
+        splat.means().copy_from(Tensor::from_vector(reversed, TensorShape({size_t{n}, size_t{3}}), Device::CUDA));
+    }
+    auto params = vanilla_mrnf_params();
+    params.iterations = 10'000;
+    params.sh_degree_interval = 10'000;
+    params.max_cap = 32;
+    params.growth_grad_threshold = 0.5f;
+    params.grow_fraction = 1.0f;
+    params.grow_until_iter = 10'000;
+    MRNF strategy(splat);
+    strategy.initialize(params);
+    auto& optimizer = strategy.get_optimizer();
+    const auto expect_bound = [&] {
+        ASSERT_EQ(strategy._ray_depth_state.shape()[0], static_cast<size_t>(splat.size()));
+        EXPECT_EQ(optimizer.ray_depth_state().ptr<float>(), strategy._ray_depth_state.ptr<float>());
+        EXPECT_EQ(optimizer.ray_depth_state().shape()[0], static_cast<size_t>(splat.size()));
+    };
+    ASSERT_TRUE(strategy._ray_depth_state.is_valid());
+    expect_bound();
+    for (const float value : strategy._ray_depth_state.cpu().to_vector())
+        ASSERT_EQ(value, ray_depth::kUnobserved);
+
+    const auto tag = [](const float x, const int k) { return x + 100.0f * static_cast<float>(k) + 1.0f; };
+    {
+        const auto means = splat.means().cpu().to_vector();
+        std::vector<float> rows(n * stride);
+        for (int r = 0; r < n; ++r)
+            for (int k = 0; k < stride; ++k)
+                rows[r * stride + k] = tag(means[3 * r], k);
+        strategy._ray_depth_state.copy_from(
+            Tensor::from_vector(rows, TensorShape({size_t{n}, size_t{stride}}), Device::CUDA));
+    }
+    const auto expect_tags = [&](const char* stage) {
+        SCOPED_TRACE(stage);
+        expect_bound();
+        const auto means = splat.means().cpu().to_vector();
+        const auto rows = strategy._ray_depth_state.cpu().to_vector();
+        for (size_t r = 0; r < static_cast<size_t>(splat.size()); ++r)
+            for (int k = 0; k < stride; ++k)
+                ASSERT_EQ(rows[r * stride + k], tag(means[3 * r], k)) << "row " << r << ", column " << k;
+    };
+
+    const auto reorder = morton::apply_morton_reorder(
+        splat, &optimizer, nullptr, [&](const morton::RowVisitor& visit) { strategy.for_each_gaussian_row(visit); });
+    ASSERT_TRUE(reorder.applied);
+    ASSERT_NE(reorder.permutation.cpu().ptr<int64_t>()[0], 0) << "the reorder must move rows";
+    expect_tags("reorder");
+
+    const auto keep = Tensor::from_vector(std::vector<int>{1, 1, 0, 1, 1, 0, 1, 1, 1, 1}, TensorShape({size_t{n}}),
+                                          Device::CUDA)
+                          .to(DataType::Bool);
+    strategy.compact_splats(keep);
+    ASSERT_EQ(splat.size(), n - 2);
+    expect_tags("prune");
+
+    // Split rows 0 and 1: one child takes the freed row 7, the other is appended.
+    const auto rows_before = strategy._ray_depth_state.cpu().to_vector();
+    const auto freed = Tensor::from_vector(std::vector<int>{7}, TensorShape({1}), Device::CUDA).to(DataType::Int64);
+    strategy.mark_as_free(freed);
+    splat.deleted().index_put_(freed, Tensor::ones_bool({1}, Device::CUDA));
+    strategy._refine_weight_max = Tensor::zeros({static_cast<size_t>(splat.size())}, Device::CUDA);
+    auto visibility = strategy.visibility_accumulator();
+    visibility.zero_();
+    const auto parents = Tensor::from_vector(std::vector<int>{0, 1}, TensorShape({2}), Device::CUDA).to(DataType::Int64);
+    strategy._refine_weight_max.index_put_(parents, Tensor::full({2}, 1.0f, Device::CUDA));
+    visibility.index_put_(parents, Tensor::full({2}, 1.0f, Device::CUDA));
+    const size_t size_before = splat.size();
+    strategy.grow_and_split(1, 0);
+    ASSERT_EQ(splat.size(), size_before + 1);
+    strategy.sync_ray_depth();
+    expect_bound();
+    const auto rows = strategy._ray_depth_state.cpu().to_vector();
+    const auto row = [&](const std::vector<float>& v, const size_t r, const int k) { return v[r * stride + k]; };
+    for (const size_t parent : {size_t{0}, size_t{1}}) {
+        for (int k = 0; k < 4; ++k)
+            EXPECT_EQ(row(rows, parent, k), row(rows_before, parent, k)) << "parent " << parent;
+        EXPECT_EQ(row(rows, parent, 4), 0.0f);
+        EXPECT_EQ(row(rows, parent, 5), 0.0f);
+    }
+    for (const size_t child : {size_t{7}, size_before}) {
+        const size_t parent = row(rows, child, 0) == row(rows_before, 0, 0) ? 0 : 1;
+        for (int k = 0; k < 4; ++k)
+            EXPECT_EQ(row(rows, child, k), row(rows_before, parent, k)) << "child " << child;
+        EXPECT_EQ(row(rows, child, 4), 0.0f);
+        EXPECT_EQ(row(rows, child, 5), 0.0f);
+    }
+    EXPECT_NE(row(rows, 7, 0), row(rows, size_before, 0)) << "each parent has one child";
+    for (size_t r = 2; r < size_before; ++r) {
+        if (r == 7)
+            continue;
+        for (int k = 0; k < stride; ++k)
+            EXPECT_EQ(row(rows, r, k), row(rows_before, r, k)) << "untouched row " << r;
+    }
+
+    auto off = vanilla_mrnf_params();
+    off.ray_depth_lr = 0.0f;
+    auto other = create_mrnf_test_splat_data(4, 0);
+    MRNF disabled(other);
+    disabled.initialize(off);
+    EXPECT_FALSE(disabled._ray_depth_state.is_valid());
+    EXPECT_FALSE(disabled.get_optimizer().ray_depth_state().is_valid());
+}
+
+// Built through a float32 arange, the four rows appended at B = 2^24 came out as B, B, B+2, B+4 and one row as none,
+// so ray_depth_inherit wrote an existing splat's state and read child rows past the end of the list.
+TEST(MRNFStrategyTest, SplitChildRowsAreExactPastFloat32Precision) {
+    constexpr int64_t b = int64_t{1} << 24;
+    const auto reused = Tensor::from_vector(std::vector<int>{7}, TensorShape({1}), Device::CUDA).to(DataType::Int64);
+    const auto expect_rows = [](const Tensor& rows, const std::vector<int64_t>& expected) {
+        ASSERT_EQ(rows.dtype(), DataType::Int64);
+        ASSERT_EQ(rows.device(), Device::CUDA);
+        ASSERT_EQ(rows.shape(), TensorShape({expected.size()}));
+        EXPECT_EQ(rows.cpu().to_vector_int64(), expected);
+    };
+    expect_rows(split_child_rows(reused, static_cast<size_t>(b), 4), {7, b, b + 1, b + 2, b + 3});
+    expect_rows(split_child_rows(Tensor(), static_cast<size_t>(b), 1), {b});
+    expect_rows(split_child_rows(reused, static_cast<size_t>(b), 0), {7});
+    expect_rows(split_child_rows(Tensor(), static_cast<size_t>(b), 0), {});
 }
 
 TEST(MRNFStrategyTest, SetTrainingDatasetBeforeInitialize) {

@@ -2,12 +2,12 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# CUDA library for IO-specific kernels (morton encoding, k-means)
+# CUDA library for IO-specific kernels (morton encoding, e-means)
 add_library(lfs_io_cuda STATIC
         cuda/morton_encoding.hpp
         cuda/morton_encoding.cu
-        cuda/kmeans.hpp
-        cuda/kmeans.cu
+        cuda/emeans.hpp
+        cuda/emeans.cu
         cuda/splat_decimate.cu
         cuda/image_format_kernels.cuh
         cuda/image_format_kernels.cu
@@ -168,6 +168,13 @@ target_link_libraries(lfs_video
         CUDA::cudart
         CUDA::cuda_driver
 )
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # FFmpeg assembly references archive-local data directly. Keep those symbols
+    # local in every ELF consumer, including Python modules reached transitively.
+    target_link_options(lfs_video INTERFACE
+            "LINKER:--exclude-libs,libavcodec.a:libavutil.a")
+endif()
 
 # libplacebo's static pkg-config dependency chain includes shaderc and
 # SPIR-V Tools. GNU ld resolves static archives left-to-right, so rescan the
@@ -422,7 +429,7 @@ target_link_libraries(lfs_io
         OpenSSL::Crypto
         xxHash::xxhash         # REFS fingerprints and embedded-payload provenance
         CUDA::cudart           # CUDA runtime for nvImageCodec
-        lfs_io_cuda            # IO-specific CUDA kernels (morton, k-means)
+        lfs_io_cuda            # IO-specific CUDA kernels (morton, e-means)
         lfs_io_rad_quant_cuda  # RAD encode quantization (bit-exact, no fast math)
         lfs_core_cuda          # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
@@ -490,7 +497,7 @@ if(NOT BUILD_PORTABLE)
 endif()
 
 message(STATUS "I/O module configured with SOG support")
-message(STATUS "  IO CUDA library: lfs_io_cuda (morton, k-means)")
+message(STATUS "  IO CUDA library: lfs_io_cuda (morton, e-means)")
 message(STATUS "  WebP decoder library: ${WEBP_DECODE_LIB}")
 message(STATUS "  Archive library: ${ARCHIVE_LIB}")
 

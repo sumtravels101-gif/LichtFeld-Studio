@@ -28,6 +28,7 @@ set(TENSOR_SOURCES
         tensor/gpu_slab_allocator.cpp
         tensor/size_bucketed_pool.cpp
         tensor/lazy_config.cpp
+        tensor/lazy_device_storage.cpp
         tensor/lazy_ir.cpp
         tensor/lazy_executor.cpp
         tensor/tensor.cpp
@@ -50,6 +51,11 @@ set(TENSOR_SOURCES
         nn/weight_file.cpp
         nn/weight_file_open.cpp
         nn/activation_arena.cpp
+        nn/models/bert_text.cpp
+        nn/models/swin_tiny.cpp
+        nn/models/llmdet_encoder.cpp
+        nn/models/llmdet_decoder.cpp
+        nn/models/llmdet.cpp
         nn/models/moge2.cpp
         nn/models/sam2.cpp
         nn/models/sam2_video.cpp
@@ -81,6 +87,7 @@ set(CORE_SOURCES
         animatable_property.cpp
         argument_parser.cpp
         camera.cpp
+        panorama_views.cpp
         collision_volume.cpp
         collision_walk.cpp
         collision_voxelization.cpp

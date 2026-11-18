@@ -9,6 +9,7 @@
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
 #include "lfs/training/live_model_mutation_guard.hpp"
+#include "noise_infill.hpp"
 #include "popspa_cameras.hpp"
 #include "rasterization/fast_rasterizer.hpp"
 #include "rasterization/gsplat_rasterizer.hpp"
@@ -208,9 +209,11 @@ namespace lfs::training {
                 auto active = compute_near_zero_rotation_mask(model.rotation_raw()).logical_not();
                 if (model.has_deleted_mask())
                     active = active.logical_and(model.deleted().logical_not());
+                // The noise never reaches an export, so it takes no row from the surface.
+                const size_t noise_rows = noise_infill_rows(model);
                 const POPSpaController::Config config{
-                    .target_count = static_cast<size_t>(opt.popspa_target_count),
-                    .first_prune_count = static_cast<size_t>(opt.popspa_first_prune_count),
+                    .target_count = static_cast<size_t>(opt.popspa_target_count) + noise_rows,
+                    .first_prune_count = opt.popspa_first_prune_count == 0 ? 0 : static_cast<size_t>(opt.popspa_first_prune_count) + noise_rows,
                     .sparsify_steps = static_cast<uint32_t>(opt.popspa_sparsify_steps),
                     .refine_steps = static_cast<uint32_t>(opt.popspa_refine_steps),
                     .rho = opt.popspa_rho,
@@ -261,7 +264,7 @@ namespace lfs::training {
                         image_bg = get_random_background_for_camera(cam->image_width(), cam->image_height(), background_step);
                     if (params_.optimization.gut) {
                         auto rendered = gsplat_rasterize_forward(*cam, model, bg, 0, 0, 0, 0,
-                                                                 1.0f, false, GsplatRenderMode::RGB, true, image_bg);
+                                                                 1.0f, params_.optimization.mip_filter, GsplatRenderMode::RGB, true, image_bg);
                         if (!rendered)
                             throw std::runtime_error(rendered.error());
                         const auto scored = gsplat_accumulate_pop_scores(rendered->second, popspa_controller_.scores());

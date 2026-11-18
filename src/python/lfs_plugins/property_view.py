@@ -110,10 +110,12 @@ BOOL_PROPS = (
     "ppisp_use_controller",
     "ppisp_freeze_from_sidecar",
     "ppisp_freeze_gaussians",
+    "pose_opt",
     "random",
     "enable_eval",
     "eval_all",
     "eval_flip",
+    "eval_green_infill",
 )
 
 SELECT_PROPS = ("mask_mode", "bg_mode", "normal_loss_space", "eval_space", "eval_bit_depth")
@@ -130,8 +132,9 @@ BESPOKE_OR_HIDDEN = {
     "ppisp_controller_activation_step": "derived -1 schedule semantics",
     "bg_modulation": "legacy mirror controlled by bg_mode",
     "headless": "runtime-only read-only flag",
-    "steps_scaler": "driven by apply_step_scaling via the iterations lock; raw edits desync step counts",
+    "steps_scaler": "driven by set_scaled_iterations via the iterations lock; raw edits desync step counts",
     "eval_mask": "mesh file browser and path display",
+    "noise_infill_mesh": "mesh file browser and path display",
     "eval_mask_report": "headline set select and also-score checkboxes",
 }
 
@@ -250,6 +253,7 @@ APPEARANCE_RUNS = (
         visibility_condition_id="dep_ppisp_controller",
     ),
     _run("ppisp_registry", visibility_condition_id="dep_ppisp_params"),
+    _run("pose_opt_toggle", "pose_opt"),
 )
 
 REFINEMENT_RUNS = (
@@ -312,6 +316,11 @@ EVALUATION_RUNS = (
     _run("dataset_eval", "enable_eval", visibility_condition_id="has_dataset"),
     _run("dataset_eval_train", "eval_all", visibility_condition_id="dep_eval"),
     _run("dataset_eval_flip", "eval_flip", visibility_condition_id="dep_eval"),
+    _run(
+        "dataset_eval_green_infill",
+        "eval_green_infill",
+        visibility_condition_id="dep_eval_green_infill",
+    ),
     _run("dataset_eval_space", "eval_space", visibility_condition_id="dep_undistort"),
     _run("dataset_eval_bit_depth", "eval_bit_depth", visibility_condition_id="dep_eval"),
     _run(
@@ -352,6 +361,7 @@ REGISTRY_PLACEMENT = {
     ),
     "learning_rates_registry": (
         "means_lr_end",
+        "ray_depth_lr",
         "scaling_lr_end",
         "late_lr_anneal",
         "cropbox_lr_scale",

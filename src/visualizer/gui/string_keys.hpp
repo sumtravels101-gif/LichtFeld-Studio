@@ -247,6 +247,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* DISABLE_FOR_TRAINING = "scene.disable_for_training";
         inline constexpr const char* ENABLE_ALL_TRAINING = "scene.enable_all_training";
         inline constexpr const char* DISABLE_ALL_TRAINING = "scene.disable_all_training";
+        inline constexpr const char* REMOVE_DISABLED_CAMERAS = "scene.remove_disabled_cameras";
         inline constexpr const char* GO_TO_KEYFRAME = "scene.go_to_keyframe";
         inline constexpr const char* UPDATE_KEYFRAME = "scene.update_keyframe";
         inline constexpr const char* SELECT_IN_TIMELINE = "scene.select_in_timeline";
@@ -715,6 +716,8 @@ namespace lichtfeld::Strings {
         inline constexpr const char* SET = "video_extractor.set";
         inline constexpr const char* SET_START = "video_extractor.set_start";
         inline constexpr const char* SET_END = "video_extractor.set_end";
+        inline constexpr const char* REMOVE_SEGMENT = "video_extractor.remove_segment";
+        inline constexpr const char* TIMELINE_HINT = "video_extractor.timeline_hint";
         inline constexpr const char* RESET = "video_extractor.reset";
         inline constexpr const char* ESTIMATED_FRAMES = "video_extractor.estimated_frames";
         inline constexpr const char* INPUT_VIDEO = "video_extractor.input_video";

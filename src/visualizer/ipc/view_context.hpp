@@ -116,6 +116,7 @@ namespace lfs::vis {
         bool show_center_markers = false;
         bool show_camera_frustums = false;
         float camera_frustum_scale = 0.25f;
+        bool hide_disabled_camera_frustums = false;
         std::array<float, 3> train_camera_color{1.0f, 1.0f, 1.0f};
         std::array<float, 3> eval_camera_color{1.0f, 0.0f, 0.0f};
         bool show_pivot = false;
@@ -131,6 +132,7 @@ namespace lfs::vis {
         bool orthographic = false;
         float ortho_scale = 100.0f;
         bool depth_view = false;
+        bool normal_view = false;
         float depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
         float depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
         int depth_visualization_mode = 0;

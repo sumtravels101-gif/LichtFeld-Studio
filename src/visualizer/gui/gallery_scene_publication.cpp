@@ -8,6 +8,7 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/provenance.hpp"
+#include "core/splat_data_transform.hpp"
 #include "core/uuid.hpp"
 #include "io/exporter.hpp"
 #include "io/loader.hpp"
@@ -274,18 +275,14 @@ namespace lfs::vis::gui {
             node.name = record.name;
             node.snapshot.world_transform = world;
             node.metadata_known = false;
-            const auto element = document->scene_graph().dom().array_find("nodes", record.uuid.to_string());
-            if (element) {
-                const auto metadata = element->get_json("publication");
-                if (dsrc && metadata && metadata->is_object() && metadata->contains("count") && metadata->contains("sh_degree") &&
-                    metadata->at("count").is_number_integer() && metadata->at("sh_degree").is_number_integer()) {
-                    const auto count = metadata->at("count").get<int64_t>();
-                    const auto degree = metadata->at("sh_degree").get<int64_t>();
-                    if (count > 0 && degree >= 0 && degree <= 3) {
-                        node.snapshot.row_count = static_cast<size_t>(count);
-                        node.snapshot.active_sh_degree = static_cast<int>(degree);
-                        node.metadata_known = !record.payload_diverged;
-                    }
+            if (dsrc && !record.payload_diverged) {
+                const auto metadata = document->scene_graph().published_splat_metadata(record.uuid);
+                if (!metadata)
+                    throw std::runtime_error("gallery_project_not_supported: " + std::string(metadata.error().user_message()));
+                if (*metadata) {
+                    node.snapshot.row_count = static_cast<size_t>((*metadata)->count);
+                    node.snapshot.active_sh_degree = (*metadata)->sh_degree;
+                    node.metadata_known = true;
                 }
             }
             if (dsrc && galleryEncodedAssetReusable(source.payload_format, binding.source_kind, record.payload_diverged)) {
@@ -477,16 +474,25 @@ namespace lfs::vis::gui {
                                   "Preparing scene for upload"))
                 throw std::runtime_error("Scene preparation canceled.");
             auto& published = request.nodes[i];
+            if (auto& live = published.snapshot; live.data && live.row_count == static_cast<size_t>(live.data->size())) {
+                if (auto without_noise = core::without_noise_infill(*live.data)) {
+                    live.row_count = without_noise->size();
+                    live.data = std::make_shared<core::SplatData>(std::move(*without_noise));
+                }
+            }
             // Metadata-only DSRC snapshots never need tensors. Decode one node
             // at a time when its metadata is absent or its encoding must change.
             std::shared_ptr<core::SplatData> loaded_payload;
             const auto materialize = [&] {
                 request.materialized_payload = true;
                 if (published.load_payload) {
-                    if (!loaded_payload)
+                    if (!loaded_payload) {
                         loaded_payload = published.load_payload();
-                    if (!loaded_payload)
-                        throw std::runtime_error("Embedded asset is not splat data.");
+                        if (!loaded_payload)
+                            throw std::runtime_error("Embedded asset is not splat data.");
+                        if (auto without_noise = core::without_noise_infill(*loaded_payload))
+                            loaded_payload = std::make_shared<core::SplatData>(std::move(*without_noise));
+                    }
                     published.snapshot.row_count = loaded_payload->size();
                     if (published.metadata_known)
                         loaded_payload->set_active_sh_degree(published.snapshot.active_sh_degree);

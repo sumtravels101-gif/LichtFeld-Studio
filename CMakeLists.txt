@@ -40,6 +40,14 @@ endif()
 list(REMOVE_DUPLICATES VCPKG_MANIFEST_FEATURES)
 unset(_lfs_vulkan_validation_feature)
 
+# Opt in to lower vcpkg disk usage at the cost of slower dependency rebuilds.
+# Set this before project() loads the toolchain; keep the appended flag out of
+# the cache so turning the option off restores the original install options.
+option(LFS_VCPKG_CLEAN_AFTER_BUILD "Clean vcpkg build artifacts after installation to save disk space (slower rebuilds)" OFF)
+if(LFS_VCPKG_CLEAN_AFTER_BUILD AND NOT "--clean-after-build" IN_LIST VCPKG_INSTALL_OPTIONS)
+    list(APPEND VCPKG_INSTALL_OPTIONS "--clean-after-build")
+endif()
+
 # vcpkg manifest install runs during CMake configure/regeneration, outside the
 # native build tool's `cmake --build -j ...` limit. Cap vcpkg separately before
 # the toolchain is loaded by project().
@@ -384,17 +392,32 @@ endif()
 if(NVIDIA_SMI)
     execute_process(
             COMMAND ${NVIDIA_SMI} --query-gpu=compute_cap --format=csv,noheader
+            RESULT_VARIABLE NVIDIA_SMI_CAP_RESULT
             OUTPUT_VARIABLE DETECTED_COMPUTE_CAP
+            ERROR_QUIET
             OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     string(REGEX REPLACE "\n.*" "" DETECTED_COMPUTE_CAP "${DETECTED_COMPUTE_CAP}")
 
     execute_process(
             COMMAND ${NVIDIA_SMI} --query-gpu=driver_version --format=csv,noheader
+            RESULT_VARIABLE NVIDIA_SMI_DRIVER_RESULT
             OUTPUT_VARIABLE NVIDIA_DRIVER_VERSION
+            ERROR_QUIET
             OUTPUT_STRIP_TRAILING_WHITESPACE
     )
     string(REGEX REPLACE "\n.*" "" NVIDIA_DRIVER_VERSION "${NVIDIA_DRIVER_VERSION}")
+    # nvidia-smi fails, printing its error to stdout, when the loaded driver and its libraries differ
+    # (a driver update before a reboot) or no GPU answers. CUDA itself may still work: fall back as if
+    # nvidia-smi were missing instead of reading the error as a version.
+    if(NOT NVIDIA_SMI_CAP_RESULT EQUAL 0 OR NOT NVIDIA_SMI_DRIVER_RESULT EQUAL 0 OR
+       NOT DETECTED_COMPUTE_CAP MATCHES "^[0-9]+\\.[0-9]+$" OR NOT NVIDIA_DRIVER_VERSION MATCHES "^[0-9]+(\\.[0-9]+)*$")
+        message(WARNING "nvidia-smi could not query the GPU (${DETECTED_COMPUTE_CAP}); "
+            "skipping the driver check. Reboot after a driver update.")
+        set(NVIDIA_SMI_FAILED TRUE)
+    endif()
+endif()
+if(NVIDIA_SMI AND NOT NVIDIA_SMI_FAILED)
     message(STATUS "Detected NVIDIA driver: ${NVIDIA_DRIVER_VERSION}")
     if(NVIDIA_DRIVER_VERSION VERSION_LESS "570")
         message(FATAL_ERROR "NVIDIA driver ${NVIDIA_DRIVER_VERSION} is too old. "
@@ -409,7 +432,7 @@ if(NVIDIA_SMI)
         set(LichtFeld-Studio_CUDA_ARCH "native")
     endif()
 else()
-    message(STATUS "nvidia-smi not found; using CUDA architecture 8.6 for this build")
+    message(STATUS "No GPU found through nvidia-smi; using CUDA architecture 8.6 for this build")
     set(DETECTED_COMPUTE_CAP 8.6)
     set(LichtFeld-Studio_CUDA_ARCH "86")
 endif()
@@ -630,10 +653,9 @@ if(LFS_HIDDEN_SYMBOLS AND NOT WIN32)
         foreach(_lfs_export_consumer IN ITEMS lfs_logger lfs_core lfs_visualizer lfs_mcp lfs_py)
             target_link_options(${_lfs_export_consumer} PRIVATE "LINKER:--no-undefined")
         endforeach()
-        # FFmpeg assembly uses direct references to archive-local data in the shared visualizer.
-        # SPZ globals must stay local too: the Python module links another copy of its archive.
+        # SPZ globals must stay local: the Python module links another copy of its archive.
         target_link_options(lfs_visualizer PRIVATE
-            "LINKER:--exclude-libs,libavcodec.a:libavutil.a:libspz_lib.a")
+            "LINKER:--exclude-libs,libspz_lib.a")
     endif()
 endif()
 
@@ -878,43 +900,35 @@ if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
     list(FILTER _vcpkg_release_dlls EXCLUDE REGEX "${_lfs_exr_cpp_dll_pattern}")
     list(FILTER _vcpkg_debug_dlls EXCLUDE REGEX "${_lfs_exr_cpp_dll_pattern}")
 
-    # Always copy release DLLs - needed for both Release and Debug builds
-    if(_vcpkg_release_dlls)
-        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${_vcpkg_release_dlls}
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-            COMMENT "Copying vcpkg release DLLs"
-        )
-    endif()
+    # Copy release DLLs first, then Debug overrides when applicable. Batches
+    # keep command lines short without starting a process for every DLL.
+    foreach(_dll_list IN ITEMS _vcpkg_release_dlls _vcpkg_debug_dlls)
+        list(LENGTH ${_dll_list} _dll_count)
+        if(_dll_count EQUAL 0)
+            continue()
+        endif()
+        set(_copy_operation copy_if_different)
+        if(_is_multi_config AND _dll_list STREQUAL "_vcpkg_debug_dlls")
+            set(_copy_operation "$<IF:$<CONFIG:Debug>,copy_if_different,true>")
+        endif()
+        math(EXPR _last_dll "${_dll_count} - 1")
+        foreach(_batch_start RANGE 0 ${_last_dll} 16)
+            list(SUBLIST ${_dll_list} ${_batch_start} 16 _dll_batch)
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E ${_copy_operation}
+                    ${_dll_batch}
+                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+                VERBATIM
+            )
+        endforeach()
+    endforeach()
 
-    # Only copy debug DLLs for Debug builds (they link to debug CRT which breaks Release)
-    # For single-config generators (Ninja, Makefiles): check CMAKE_BUILD_TYPE
-    # For multi-config generators (VS, Xcode): use generator expression
     if(_is_multi_config)
-        # Multi-config: use generator expression to conditionally copy
-        if(_vcpkg_debug_dlls)
-            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E $<IF:$<CONFIG:Debug>,copy_if_different,true>
-                    ${_vcpkg_debug_dlls}
-                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-                COMMENT "Copying vcpkg debug DLLs (Debug config only)"
-            )
-        endif()
         message(STATUS "Post-build: vcpkg DLLs - release always, debug for Debug config only (multi-config)")
+    elseif(CMAKE_BUILD_TYPE STREQUAL "Debug" AND _vcpkg_debug_dlls)
+        message(STATUS "Post-build: vcpkg DLLs - copying both release and debug (Debug build)")
     else()
-        # Single-config: check CMAKE_BUILD_TYPE at configure time
-        if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND _vcpkg_debug_dlls)
-            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${_vcpkg_debug_dlls}
-                    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-                COMMENT "Copying vcpkg debug DLLs"
-            )
-            message(STATUS "Post-build: vcpkg DLLs - copying both release and debug (Debug build)")
-        else()
-            message(STATUS "Post-build: vcpkg DLLs - copying release only (${CMAKE_BUILD_TYPE} build)")
-        endif()
+        message(STATUS "Post-build: vcpkg DLLs - copying release only (${CMAKE_BUILD_TYPE} build)")
     endif()
 endif()
 

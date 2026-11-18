@@ -16,6 +16,7 @@
 #include "core/tensor/internal/tensor_serialization.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
+#include "lfs/training/ray_depth_step.cuh"
 #include "lfs/training/sh_value_storage.hpp"
 #include <algorithm>
 #include <atomic>
@@ -27,6 +28,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace lfs::training {
 
@@ -322,6 +324,41 @@ namespace lfs::training {
         }
     }
 
+    void AdamOptimizer::set_ray_depth(lfs::core::Tensor state, const float lr) {
+        if (!state.is_valid() || state.numel() == 0 || !(lr > 0.0f)) {
+            ray_depth_state_ = {};
+            ray_depth_lr_ = 0.0f;
+            return;
+        }
+        LFS_ASSERT_MSG(state.device() == lfs::core::Device::CUDA &&
+                           state.dtype() == lfs::core::DataType::Float32 && state.ndim() == 2 &&
+                           state.shape()[1] == static_cast<size_t>(ray_depth::kStateStride) &&
+                           state.is_contiguous(),
+                       "AdamOptimizer ray-depth state must be contiguous CUDA float32 [N, 6]");
+        ray_depth_state_ = std::move(state);
+        ray_depth_lr_ = lr;
+    }
+
+    void AdamOptimizer::set_ray_depth_view(const float* camera_position, const float far_limit) noexcept {
+        ray_depth_camera_ = camera_position;
+        ray_depth_far_limit_ = far_limit;
+    }
+
+    bool AdamOptimizer::ray_depth_bound() {
+        if (!ray_depth_state_.is_valid())
+            return false;
+        const auto& means = splat_data_.means();
+        const size_t n = means.is_valid() && means.ndim() > 0 ? means.shape()[0] : 0;
+        if (ray_depth_state_.shape()[0] != n) {
+            LOG_WARN("AdamOptimizer: ray-depth rows ({}) do not match the splats ({}); "
+                     "skipping the coordinate until the strategy republishes them",
+                     ray_depth_state_.shape()[0], n);
+            set_ray_depth({}, 0.0f);
+            return false;
+        }
+        return n > 0;
+    }
+
     void AdamOptimizer::set_screen_share_cap(const float* max_share, const int n,
                                              const float limit, const float penalty) {
         screen_share_max_ = max_share;
@@ -347,6 +384,8 @@ namespace lfs::training {
         LFS_TRACE("kernel.adam.step");
         validate_mean_step_far_mask();
         refresh_screen_share_buffer();
+        const float* const ray_depth_camera = std::exchange(ray_depth_camera_, nullptr);
+        const bool ray_depth_skipped = std::exchange(ray_depth_skip_, false);
         if (fused_step_iteration_ == iteration) {
             last_step_zeroed_gradients_ = true;
             return;
@@ -444,6 +483,44 @@ namespace lfs::training {
             if (crop_damping_mask_.is_valid()) {
                 crop_damping_mask_.sync_to_stream(batch_stream);
             }
+            fast_lfs::optimizer::RayDepthStepArgs ray_depth;
+            bool ray_depth_proposed = false;
+            const auto* means_state = get_state(ParamType::Means);
+            if (ray_depth_camera != nullptr && !ray_depth_skipped && ray_depth_bound() && means_state != nullptr &&
+                means_state->grad.is_valid() && means_state->grad.numel() > 0) {
+                auto& rotations = splat_data_.rotation_raw();
+                const auto n = ray_depth_state_.shape()[0];
+                // One float per row between the two halves: the proposed dt.
+                if (!ray_depth_scratch_.is_valid() || ray_depth_scratch_.numel() != n)
+                    ray_depth_scratch_ = lfs::core::Tensor::empty({n}, lfs::core::Device::CUDA);
+                ray_depth_state_.sync_to_stream(batch_stream);
+                rotations.sync_to_stream(batch_stream);
+                ray_depth_scratch_.sync_to_stream(batch_stream);
+                ray_depth.state = ray_depth_state_.ptr<float>();
+                ray_depth.means = splat_data_.means().ptr<float>();
+                ray_depth.log_scales = splat_data_.scaling_raw().ptr<float>();
+                ray_depth.rotations = rotations.ptr<float>();
+                ray_depth.means_grad = means_state->grad.ptr<float>();
+                ray_depth.camera = ray_depth_camera;
+                ray_depth.far_limit = ray_depth_far_limit_;
+                ray_depth.proposals = ray_depth_scratch_.ptr<float>();
+                ray_depth.n = static_cast<int>(n);
+                ray_depth.lr = ray_depth_lr_;
+                ray_depth.mean_lr = static_cast<float>(get_param_lr(ParamType::Means));
+                ray_depth.frozen_mask = frozen_mask_ptr();
+                ray_depth.frozen_mask_size = frozen_mask_size();
+                ray_depth.frozen_lr_scale = frozen_lr_scale_;
+                ray_depth.crop_damping_mask = crop_damping_mask_ptr();
+                ray_depth.crop_damping_mask_size = crop_damping_mask_size();
+                ray_depth.cropbox_lr_scale = cropbox_lr_scale_;
+                if (per_splat_mean_step_) {
+                    ray_depth.mean_step_far_mask = mean_step_far_mask_;
+                    ray_depth.mean_step_far_mask_n = mean_step_far_mask_n_;
+                    ray_depth.mean_step_median_extent = mean_step_median_extent_;
+                }
+                fast_lfs::optimizer::ray_depth_propose(ray_depth, batch_stream);
+                ray_depth_proposed = true;
+            }
             fast_lfs::optimizer::adam_step_joint_contiguous_batched(
                 entries, n_entries,
                 frozen_mask_ptr(), frozen_mask_size(), frozen_lr_scale_,
@@ -455,6 +532,8 @@ namespace lfs::training {
                 batch_mean_step_scale_raw, batch_mean_step_scale_n,
                 mean_step_median_extent_, mean_step_far_mask_, mean_step_far_mask_n_,
                 screen_share_max_, screen_share_n_, screen_share_limit_, screen_share_penalty_);
+            if (ray_depth_proposed)
+                fast_lfs::optimizer::ray_depth_commit(ray_depth, batch_stream);
         }
         step_param(ParamType::ShN, iteration, apply_sh_warmup);
     }
@@ -1011,6 +1090,8 @@ namespace lfs::training {
                     if (moment_cap_floats >= float_layout && state.size < float_layout) {
                         // Capacity reserved at max_cap: advance logical size (new slots
                         // already zero-initialized under joint bounds when pre-allocated).
+                        state.exp_avg.commit_rows(
+                            joint_adam::packed_bytes(float_layout, state.joint_bits));
                         grow_grad_rows(state.grad, name, state.size, float_layout, moment_cap_floats);
                         state.size = float_layout;
                     } else if (state.size < float_layout) {
@@ -1033,6 +1114,8 @@ namespace lfs::training {
                             // Last resort: force size when capacity allows after extend.
                             const size_t cap2 = state.capacity;
                             if (cap2 >= float_layout && state.size < float_layout) {
+                                state.exp_avg.commit_rows(
+                                    joint_adam::packed_bytes(float_layout, state.joint_bits));
                                 grow_grad_rows(state.grad, name, state.size, float_layout, cap2);
                                 state.size = float_layout;
                             }
@@ -1153,6 +1236,13 @@ namespace lfs::training {
         fused.mean_step_median_extent = mean_step_median_extent_;
         fused.mean_step_far_mask = mean_step_far_mask_;
         fused.mean_step_far_mask_n = mean_step_far_mask_n_;
+        if (fused.means.enabled && !ray_depth_skip_ && ray_depth_bound()) {
+            ray_depth_state_.sync_to_stream(execution_stream);
+            fused.ray_depth_state = ray_depth_state_.ptr<float>();
+            fused.ray_depth_n = static_cast<int>(ray_depth_state_.shape()[0]);
+            fused.ray_depth_lr = ray_depth_lr_;
+            fused.ray_depth_mean_lr = static_cast<float>(get_param_lr(ParamType::Means));
+        }
 
         fused.enabled = fused.means.enabled || fused.sh0.enabled || fused.shN.enabled ||
                         fused.scaling.enabled || fused.rotation.enabled || fused.opacity.enabled;
@@ -1767,13 +1857,30 @@ namespace lfs::training {
             // q16: gather-decode sources and encode only the appended 256-splat
             // blocks. fp32: in-swizzle gather into the grown tail.
             if (q16_param) {
-                lfs::core::Tensor canonical = lfs::core::Tensor::zeros(
-                    {n_new, static_cast<size_t>(layout_rest), size_t{3}},
-                    param.device());
-                lfs::training::sh_value::gather_shN_to_canonical(
-                    splat_data_, indices, canonical, old_N);
-                lfs::training::sh_value::append_canonical_to_shN(
-                    splat_data_, canonical, old_N);
+                // The fp32 staging takes 180 B per new row at SH3, so it goes
+                // a few whole 256-splat blocks at a time. Pieces end on block
+                // starts so each block is encoded once, and append from the
+                // last one back so every gather still reads the source blocks
+                // as they were before this growth.
+                constexpr size_t kStageBytes = size_t{64} << 20;
+                constexpr size_t kBlock = static_cast<size_t>(lfs::core::sh_value_quant::kBlockSize);
+                const size_t row_bytes = static_cast<size_t>(layout_rest) * 3 * sizeof(float);
+                const size_t stage_rows = std::max(kBlock, kStageBytes / row_bytes / kBlock * kBlock);
+                std::vector<size_t> starts{0};
+                for (size_t next = (old_N + stage_rows) / kBlock * kBlock; next < new_N; next += stage_rows) {
+                    starts.push_back(next - old_N);
+                }
+                for (size_t piece = starts.size(); piece-- > 0;) {
+                    const size_t begin = starts[piece];
+                    const size_t end = piece + 1 < starts.size() ? starts[piece + 1] : n_new;
+                    lfs::core::Tensor canonical = lfs::core::Tensor::zeros(
+                        {end - begin, static_cast<size_t>(layout_rest), size_t{3}},
+                        param.device());
+                    lfs::training::sh_value::gather_shN_to_canonical(
+                        splat_data_, indices.slice(0, begin, end), canonical, old_N);
+                    lfs::training::sh_value::append_canonical_to_shN(
+                        splat_data_, canonical, old_N + begin);
+                }
             } else if (param.dtype() == lfs::core::DataType::Float32) {
                 gather_new_swizzled_rows(param);
             }

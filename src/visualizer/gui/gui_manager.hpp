@@ -23,6 +23,7 @@
 #include "gui/rml_status_bar.hpp"
 #include "gui/rml_toast_overlay.hpp"
 #include "gui/rml_viewport_overlay.hpp"
+#include "gui/rmlui/preview_texture_status.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/scene_tree_session.hpp"
 #include "gui/selection_cursor.hpp"
@@ -34,6 +35,7 @@
 #include "rendering/passes/vulkan_viewport_pass.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/gui/video_widget_interface.hpp"
+#include <bitset>
 
 #include <atomic>
 #include <chrono>
@@ -131,6 +133,7 @@ namespace lfs::vis {
             // Called after a bounded main-thread upload batch. The next frame
             // is requested immediately while decoded thumbnails remain ready.
             void notifyCameraThumbnailBatchReady();
+            [[nodiscard]] PreviewTextureStatus previewTextureStatus(const std::string& source, Rml::Context* context = nullptr) const;
             void setRmlResizeDeferring(bool defer) { rmlui_manager_.setResizeDeferring(defer); }
             void prepareInput();
             void prepareLayout();
@@ -158,7 +161,7 @@ namespace lfs::vis {
             [[nodiscard]] PanelLayoutManager& panelLayout() { return panel_layout_; }
             [[nodiscard]] const PanelLayoutManager& panelLayout() const { return panel_layout_; }
             [[nodiscard]] bool isSequencerVisible() const { return !ui_hidden_ && panel_layout_.isShowSequencer(); }
-            void focusMainPanelTab(std::string panel_id) { focus_panel_name_ = std::move(panel_id); }
+            void focusMainPanelTab(std::string panel_id) { revealPanel(panel_id); }
             [[nodiscard]] GlobalContextMenu& globalContextMenu() { return *global_context_menu_; }
 
             // State queries
@@ -372,6 +375,9 @@ namespace lfs::vis {
                 std::chrono::steady_clock::time_point now,
                 bool training_active);
             void queueUiVisibilityToggle();
+            void queueSideDockToggle(lfs::core::SideDock side);
+            bool rightDockRendered() const;
+            void revealPanel(const std::string& id);
             void requestUiVisibilityToggle();
             void updateUiVisibilityTransition();
             void commitUiVisibilityTransition(bool matched_frame);
@@ -421,11 +427,15 @@ namespace lfs::vis {
             bool last_hud_expanded_ = false;
             std::chrono::steady_clock::time_point ui_visibility_deadline_{};
             bool ui_toggle_pending_ = false;
+            std::bitset<2> side_dock_toggle_pending_;
+            bool ui_target_left_collapsed_ = false;
+            bool ui_target_right_collapsed_ = false;
             bool ui_visibility_resize_active_ = false;
             bool ui_visibility_layout_committed_ = false;
             bool ui_visibility_target_ready_ = false;
             bool ui_visibility_target_hidden_ = false;
             ViewportLayout ui_visibility_target_layout_{};
+            float ui_visibility_target_console_width_ = -1.0f;
             std::chrono::steady_clock::time_point fullscreen_toggle_next_allowed_at_{};
             std::chrono::steady_clock::time_point interactive_transition_guard_until_{};
             bool fullscreen_toggle_pending_ = false;
@@ -536,6 +546,8 @@ namespace lfs::vis {
             float last_ui_layout_python_console_w_ = -1.0f;
             float last_ui_layout_bottom_dock_h_ = -1.0f;
             float last_ui_layout_left_dock_w_ = -1.0f;
+            bool last_ui_layout_left_collapsed_ = false;
+            bool last_ui_layout_right_rendered_ = false;
             bool last_ui_layout_show_main_panel_ = false;
             bool last_ui_layout_show_sequencer_ = false;
             bool last_ui_layout_ui_hidden_ = false;

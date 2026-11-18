@@ -314,9 +314,11 @@ namespace lfs::core {
         // to CPU first and unpacks there, avoiding a full canonical SH allocation on CUDA.
         Tensor shN_canonical_cpu() const;
 
-        // Decode selected rows of compact q16 / IEEE-f16 SH directly into a host-side
-        // canonical tensor. Row indices must be a rank-1 CPU integer tensor.
+        // Gather resident FP32/f16/q16 rows into owned canonical Float32 CPU storage.
+        // Indices must be rank-1 CPU integers; call at a model read boundary.
+        // The one-argument form includes all stored SH bands.
         Tensor shN_canonical_cpu_rows(const Tensor& row_indices) const;
+        Tensor shN_canonical_cpu_rows(const Tensor& row_indices, int degree) const;
 
         // Host-side variant for export paths. When resident q16/IEEE-f16 SH is on CUDA,
         // decode it in bands directly into canonical [N, K, 3] host output memory.
@@ -500,8 +502,16 @@ namespace lfs::core {
         }
 
     public:
-        // Holds the magnitude of the screen space gradient (used for densification)
+        // Holds the magnitude of the screen space gradient (used for densification).
+        // [rows >= 2, N] is a weight row, then an error row. [N] is the error
+        // row alone, for strategies that never read the weight.
         Tensor _densification_info;
+        struct DensificationRows {
+            float* weight = nullptr;
+            float* error = nullptr;
+        };
+        // The rows of _densification_info covering n splats; none when it does not.
+        [[nodiscard]] DensificationRows densification_rows(std::size_t n);
         // Per-splat max screen-share over the current refine window. [N] fp32.
         Tensor _max_screen_share;
 

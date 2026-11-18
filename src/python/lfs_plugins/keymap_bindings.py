@@ -21,9 +21,12 @@ class KeymapBindingsSection:
         lf.keymap.ToolMode.WALK,
         lf.keymap.ToolMode.VR,
         lf.keymap.ToolMode.EDITOR,
+        lf.keymap.ToolMode.IMAGE_PREVIEW,
     ]
 
     BINDING_SECTIONS = {
+        "image_preview": [lf.keymap.Action.IMAGE_PREVIEW_DELETE, lf.keymap.Action.IMAGE_PREVIEW_GENERATE,
+                          lf.keymap.Action.IMAGE_PREVIEW_REMOVE_POINT],
         "editor": [lf.keymap.Action.EDITOR_TOGGLE_KIND, lf.keymap.Action.EDITOR_RUN, lf.keymap.Action.EDITOR_STOP],
         "walk": [lf.keymap.Action.EXIT_WALK],
         "vr": [
@@ -130,6 +133,8 @@ class KeymapBindingsSection:
             lf.keymap.Action.NEXT_SIDEBAR_CATEGORY,
             lf.keymap.Action.PREVIOUS_SIDEBAR_CATEGORY,
             lf.keymap.Action.TOGGLE_UI,
+            lf.keymap.Action.TOGGLE_LEFT_DOCK,
+            lf.keymap.Action.TOGGLE_RIGHT_DOCK,
             lf.keymap.Action.TOGGLE_FULLSCREEN,
             lf.keymap.Action.OPEN_PREFERENCES,
             lf.keymap.Action.SELECT_ALL_SCENE_NODES,
@@ -547,6 +552,8 @@ class KeymapBindingsSection:
         tr = lf.ui.tr
         rows = []
 
+        if mode == lf.keymap.ToolMode.IMAGE_PREVIEW:
+            self._append_binding_section(rows, tr("input_settings.mode.image_preview"), self.BINDING_SECTIONS["image_preview"], mode)
         if mode == lf.keymap.ToolMode.EDITOR:
             self._append_binding_section(rows, tr("input_settings.mode.editor"), self.BINDING_SECTIONS["editor"], mode)
         if mode == lf.keymap.ToolMode.WALK:

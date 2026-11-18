@@ -66,6 +66,7 @@ namespace lfs::vis {
         p.show_center_markers = s.show_center_markers;
         p.show_camera_frustums = s.show_camera_frustums;
         p.camera_frustum_scale = s.camera_frustum_scale;
+        p.hide_disabled_camera_frustums = s.hide_disabled_camera_frustums;
         p.train_camera_color = detail::to_array(s.train_camera_color);
         p.eval_camera_color = detail::to_array(s.eval_camera_color);
         p.show_pivot = s.show_pivot;
@@ -81,6 +82,7 @@ namespace lfs::vis {
         p.orthographic = s.orthographic;
         p.ortho_scale = s.ortho_scale;
         p.depth_view = s.depth_view;
+        p.normal_view = s.normal_view;
         p.depth_view_min = s.depth_view_min;
         p.depth_view_max = s.depth_view_max;
         p.depth_visualization_mode = static_cast<int>(s.depth_visualization_mode);
@@ -167,6 +169,7 @@ namespace lfs::vis {
         s.show_center_markers = p.show_center_markers;
         s.show_camera_frustums = p.show_camera_frustums;
         s.camera_frustum_scale = p.camera_frustum_scale;
+        s.hide_disabled_camera_frustums = p.hide_disabled_camera_frustums;
         s.train_camera_color = detail::to_vec3(p.train_camera_color);
         s.eval_camera_color = detail::to_vec3(p.eval_camera_color);
         s.show_pivot = p.show_pivot;
@@ -191,6 +194,7 @@ namespace lfs::vis {
         s.orthographic = p.orthographic;
         s.ortho_scale = p.ortho_scale;
         s.depth_view = p.depth_view;
+        s.normal_view = p.normal_view;
         s.depth_view_min = p.depth_view_min;
         s.depth_view_max = p.depth_view_max;
         s.depth_visualization_mode =

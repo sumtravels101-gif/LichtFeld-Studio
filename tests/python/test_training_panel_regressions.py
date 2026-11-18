@@ -37,6 +37,7 @@ def _install_lf_stub(monkeypatch):
     lf_stub.start_training = lambda: None
     lf_stub.training_start_overwrite_conflict = lambda: None
     lf_stub.loss_buffer = lambda: []
+    lf_stub.trainer_densification_vram = lambda: None
     lf_stub.push_loss_to_element = lambda _element, _data: (0.0, 0.0)
     lf_stub.get_render_settings = lambda: None
     lf_stub.detect_dataset_info = lambda _path: None
@@ -74,6 +75,7 @@ def test_sparsity_toggle_controls_popspa_rows_and_search(
         use_exposure_correction=False, ppisp_use_controller=False,
         use_bilateral_grid=False, strategy="mcmc", random=False,
         enable_sparsity=enabled, enable_eval=False, eval_mask="", undistort=False,
+        noise_infill_mesh="",
     )
     monkeypatch.setattr(module.lf, "optimization_params", lambda: params)
     panel = module.TrainingPanel()
@@ -112,6 +114,28 @@ def training_panel_module(monkeypatch):
     return import_module("lfs_plugins.training_panel")
 
 
+@pytest.mark.parametrize(
+    ("enable_eval", "enabled", "noise_mesh", "eval_mask", "visible"),
+    [
+        (True, False, "scan.obj", "", True),
+        (True, False, "", "scan.obj", True),
+        (True, False, "", "cropbox", False),
+        (True, True, "", "cropbox", True),
+        (False, True, "scan.obj", "", False),
+    ],
+)
+def test_enabled_green_infill_stays_visible_once_its_mesh_is_gone(
+    training_panel_module, enable_eval, enabled, noise_mesh, eval_mask, visible
+):
+    params = SimpleNamespace(
+        enable_eval=enable_eval,
+        eval_green_infill=enabled,
+        noise_infill_mesh=noise_mesh,
+        eval_mask=eval_mask,
+    )
+    assert bool(training_panel_module._green_infill_option_visible(params)) is visible
+
+
 class _HandleStub:
     def __init__(self):
         self.dirty_fields = []
@@ -145,6 +169,8 @@ class _ParamsStub:
         self.sh_degree_interval = 1000
         self.ppisp_controller_activation_step = 5678
         self.enable_eval = False
+        self.noise_infill_mesh = ""
+        self.eval_green_infill = False
         self.eval_mask = ""
         self.eval_mask_report = ""
         self.save_steps = [7000]
@@ -162,10 +188,10 @@ class _ParamsStub:
     def validate(self):
         return ""
 
-    def apply_step_scaling(self, value):
-        scale = value / self.steps_scaler if self.steps_scaler else value
-        self.steps_scaler = value
-        self.iterations = int(self.iterations * scale)
+    def set_scaled_iterations(self, target):
+        scale = target / self.iterations
+        self.steps_scaler *= scale
+        self.iterations = target
         self.start_refine = int(self.start_refine * scale)
         self.stop_refine = int(self.stop_refine * scale)
         self.grow_until_iter = int(self.grow_until_iter * scale)
@@ -368,6 +394,25 @@ def test_auto_scale_marker_survives_reset_but_not_dataset_change(
     assert params.auto_scaled_for == 600
 
 
+def test_failed_auto_scale_retries_same_camera_count(training_panel_module, monkeypatch):
+    monkeypatch.setattr(training_panel_module.lf, "dataset_params", lambda: _DatasetStub())
+    scene = SimpleNamespace(active_camera_count=480)
+    monkeypatch.setattr(training_panel_module.lf, "get_scene", lambda: scene)
+    panel = training_panel_module.TrainingPanel()
+    params = _ParamsStub()
+    assert panel._try_auto_scale_steps(params)
+    scene.active_camera_count = 560
+    with monkeypatch.context() as patch:
+        def reject(count):
+            raise ValueError("iterations out of range")
+        patch.setattr(params, "auto_scale_steps", reject)
+        with pytest.raises(ValueError, match="iterations"):
+            panel._try_auto_scale_steps(params)
+    assert panel._auto_scaled_for_cameras == 480
+    assert panel._try_auto_scale_steps(params)
+    assert params.auto_scaled_for == 560
+
+
 def test_auto_scale_user_override_survives_camera_change_until_relocked(
     training_panel_module, monkeypatch
 ):
@@ -434,6 +479,46 @@ def test_training_panel_progress_updates_bound_value(training_panel_module, monk
     assert panel._update_progress() is True
     assert panel._progress_value == "0.25"
     assert panel._handle.dirty_fields == ["progress_value"]
+
+
+def test_densify_vram_bar_counts_down_the_room_until_vram_is_full(training_panel_module, monkeypatch):
+    module = training_panel_module
+    texts = {
+        "training_panel.densify_vram_left": "+%s Gaussians · %s GiB left",
+        "training_panel.densify_vram_full": "Full at %s Gaussians",
+    }
+    monkeypatch.setattr(module.lf.ui, "tr", lambda key: texts.get(key, key))
+    runtime = SimpleNamespace(
+        trainer_state=_make_signal("running"),
+        iteration=_make_signal(1000),
+        num_gaussians=_make_signal(1_500_000),
+    )
+    monkeypatch.setattr(module, "RuntimeState", runtime)
+    room = None
+    monkeypatch.setattr(module.lf, "trainer_densification_vram", lambda: room)
+    panel = module.TrainingPanel()
+    panel._handle = _HandleStub()
+    model = _ModelStub()
+    panel._bind_status(model, None)
+
+    def value(name):
+        return model.bindings[name][0]()
+
+    # Hidden until a refine measured the room.
+    assert panel._update_densify_vram() is False
+    assert value("show_densify_vram") is False
+
+    room = {"capacity": 2_000_000, "bytes_per_gaussian": 1024}
+    runtime.iteration.value = 1100
+    assert panel._update_densify_vram() is True
+    assert value("show_densify_vram") is True
+    assert value("densify_vram_text") == "+500.0K Gaussians · 0.48 GiB left"
+    assert value("densify_vram_value") == "0.75"
+    assert value("densify_vram_class").endswith("densify-vram--level-2")
+
+    runtime.num_gaussians.value = 2_000_000
+    assert value("densify_vram_text") == "Full at 2,000,000 Gaussians"
+    assert value("densify_vram_class").endswith("densify-vram--level-4")
 
 
 def test_training_panel_uses_dirty_update_policy(training_panel_module):
@@ -2541,14 +2626,19 @@ def test_label_reset_uses_iterations_scaling_path(training_panel_module, monkeyp
     panel = module.TrainingPanel()
     panel._auto_scale_steps_locked = True
     calls = []
-    params = SimpleNamespace(has_params=lambda: True, strategy="mrnf", iterations=60000, steps_scaler=2.,
-        apply_step_scaling=lambda value: calls.append(value))
+    params = SimpleNamespace(has_params=lambda: True, strategy="mrnf", iterations=60000, steps_scaler=2.)
+
+    def set_scaled_iterations(target):
+        calls.append(target)
+        params.iterations = target
+
+    params.set_scaled_iterations = set_scaled_iterations
     params.get = lambda prop: getattr(params, prop)
     monkeypatch.setattr(module.lf, "optimization_params", lambda: params)
     monkeypatch.setattr(panel, "_reset_default", lambda prop: 30000)
     monkeypatch.setattr(panel, "_sync_text_bufs", lambda: None)
     assert panel._apply_reset("iterations", 30000)
-    assert calls == [1.0] and params.iterations == 30000
+    assert calls == [30000] and params.iterations == 30000
 
 
 def test_distorted_images_shows_prompt_and_handles_undistort(training_panel_module, monkeypatch):
@@ -2656,7 +2746,7 @@ def test_distorted_images_shows_prompt_and_handles_cancel(training_panel_module,
     assert len(started) == 0
 
 
-def test_distorted_images_equirectangular_offers_only_gut(training_panel_module, monkeypatch):
+def test_distorted_images_without_undistort_support_offer_only_gut(training_panel_module, monkeypatch):
     module = training_panel_module
     panel = module.TrainingPanel()
     panel._handle = _HandleStub()

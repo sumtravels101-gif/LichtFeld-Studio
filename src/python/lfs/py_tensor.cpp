@@ -370,8 +370,12 @@ namespace lfs::python {
                 "numpy(copy=False): non-contiguous CPU tensors cannot be exported without a copy; "
                 "call contiguous() or use copy=True");
         }
-        Tensor host = tensor_.device() == Device::CUDA ? tensor_.cpu() : tensor_;
-        Tensor cpu_tensor = host.is_contiguous() ? std::move(host) : host.contiguous();
+        Tensor cpu_tensor;
+        {
+            nb::gil_scoped_release release;
+            Tensor host = tensor_.device() == Device::CUDA ? tensor_.cpu() : tensor_;
+            cpu_tensor = host.is_contiguous() ? std::move(host) : host.contiguous();
+        }
 
         const auto& dims = cpu_tensor.shape().dims();
         size_t elem_size = 4;
@@ -392,7 +396,10 @@ namespace lfs::python {
             if (!buffer) {
                 throw std::bad_alloc();
             }
-            std::memcpy(buffer, cpu_tensor.data_ptr(), total_bytes);
+            {
+                nb::gil_scoped_release release;
+                std::memcpy(buffer, cpu_tensor.data_ptr(), total_bytes);
+            }
 
             // Create owner capsule for memory management
             nb::capsule owner(buffer, [](void* p) noexcept { std::free(p); });
@@ -692,6 +699,7 @@ namespace lfs::python {
         }
 
         // Create CPU tensor and copy data
+        nb::gil_scoped_release release;
         Tensor tensor = Tensor::empty(shape, Device::CPU, dtype, false);
 
         size_t elem_size = 4;
@@ -1648,6 +1656,17 @@ namespace lfs::python {
             throw std::runtime_error("Unknown device: " + device);
         }
 
+        bool is_exact_range_integer(nb::handle arg) {
+            if (PyLong_CheckExact(arg.ptr()))
+                return true;
+            PyObject* numpy = PyDict_GetItemString(PyImport_GetModuleDict(), "numpy");
+            if (!numpy || !PyModule_Check(numpy))
+                return false;
+            PyObject* integer = PyDict_GetItemString(PyModule_GetDict(numpy), "integer");
+            return integer && PyType_Check(integer) &&
+                   PyType_IsSubtype(Py_TYPE(arg.ptr()), reinterpret_cast<PyTypeObject*>(integer));
+        }
+
         DataType parse_dtype(const std::string& dtype) {
             if (dtype == "float32" || dtype == "float")
                 return DataType::Float32;
@@ -1700,18 +1719,35 @@ namespace lfs::python {
         return PyTensor(Tensor::full(to_tensor_shape(shape), value, parse_device(device), parse_dtype(dtype)));
     }
 
-    PyTensor PyTensor::arange(float end) {
-        return PyTensor(Tensor::arange(end));
-    }
-
-    PyTensor PyTensor::arange(float start, float end, float step,
+    PyTensor PyTensor::arange(nb::handle start, nb::handle end, nb::handle step,
                               const std::string& device,
                               const std::string& dtype) {
-        auto t = Tensor::arange(start, end, step, parse_device(device));
-        if (dtype != "float32") {
-            t = t.to(parse_dtype(dtype));
+        const auto target = parse_device(device);
+        const auto type = parse_dtype(dtype);
+        if ((type == DataType::Int32 || type == DataType::Int64 || type == DataType::UInt8) &&
+            is_exact_range_integer(start) && is_exact_range_integer(end) && is_exact_range_integer(step)) {
+            const auto fits_int64 = [](nb::handle arg, int64_t& value) {
+                int overflow = 0;
+                value = PyLong_AsLongLongAndOverflow(arg.ptr(), &overflow);
+                if (PyErr_Occurred())
+                    throw nb::python_error();
+                return overflow == 0;
+            };
+            int64_t first, stop, stride;
+            if (fits_int64(start, first) && fits_int64(end, stop) && fits_int64(step, stride))
+                return PyTensor(Tensor::arange(first, stop, stride, target, type));
         }
-        return PyTensor(std::move(t));
+        const auto number = [](nb::handle arg) {
+            const double value = PyFloat_AsDouble(arg.ptr());
+            if (value == -1.0 && PyErr_Occurred())
+                throw nb::python_error();
+            return static_cast<float>(value);
+        };
+        const float first = number(start);
+        const float stop = number(end);
+        const float stride = number(step);
+        auto range = Tensor::arange(first, stop, stride, target);
+        return PyTensor(type == DataType::Float32 ? std::move(range) : range.to(type));
     }
 
     PyTensor PyTensor::linspace(float start, float end, int64_t steps,
@@ -1817,6 +1853,9 @@ namespace lfs::python {
     }
 
     void register_tensor(nb::module_& m) {
+        const auto arange_from_zero = [](nb::handle end, const std::string& device, const std::string& dtype) {
+            return PyTensor::arange(nb::int_(0), end, nb::int_(1), device, dtype);
+        };
         nb::class_<PyTensor>(m, "Tensor")
             .def(nb::init<>())
 
@@ -1831,10 +1870,10 @@ namespace lfs::python {
 
             // Memory operations
             .def("clone", &PyTensor::clone, "Deep copy of tensor")
-            .def("cpu", &PyTensor::cpu, "Move tensor to CPU")
-            .def("cuda", &PyTensor::cuda, "Move tensor to CUDA")
+            .def("cpu", &PyTensor::cpu, nb::call_guard<nb::gil_scoped_release>(), "Move tensor to CPU")
+            .def("cuda", &PyTensor::cuda, nb::call_guard<nb::gil_scoped_release>(), "Move tensor to CUDA")
             .def("contiguous", &PyTensor::contiguous, "Make tensor contiguous")
-            .def("sync", &PyTensor::sync, "Synchronize CUDA stream")
+            .def("sync", &PyTensor::sync, nb::call_guard<nb::gil_scoped_release>(), "Synchronize CUDA stream")
             .def("size", &PyTensor::size, nb::arg("dim"), "Size of dimension")
 
             // Scalar extraction
@@ -1862,11 +1901,14 @@ namespace lfs::python {
             .def_static("full", &PyTensor::full,
                         nb::arg("shape"), nb::arg("value"), nb::arg("device") = "cuda", nb::arg("dtype") = "float32",
                         "Create tensor filled with value")
-            .def_static("arange", static_cast<PyTensor (*)(float)>(&PyTensor::arange),
-                        nb::arg("end"),
+            .def_static("arange", arange_from_zero,
+                        nb::arg("end"), nb::kw_only(), nb::arg("device") = "cuda", nb::arg("dtype") = "float32",
+                        nb::sig("def arange(end: int | float, *, device: str = 'cuda', dtype: str = 'float32') -> lichtfeld.Tensor"),
                         "Create 1D tensor with values from 0 to end")
-            .def_static("arange", static_cast<PyTensor (*)(float, float, float, const std::string&, const std::string&)>(&PyTensor::arange),
-                        nb::arg("start"), nb::arg("end"), nb::arg("step") = 1.0f, nb::arg("device") = "cuda", nb::arg("dtype") = "float32",
+            .def_static("arange", &PyTensor::arange,
+                        nb::arg("start"), nb::arg("end"), nb::arg("step") = 1, nb::arg("device") = "cuda", nb::arg("dtype") = "float32",
+                        nb::sig("def arange(start: int | float, end: int | float, step: int | float = 1, "
+                                "device: str = 'cuda', dtype: str = 'float32') -> lichtfeld.Tensor"),
                         "Create 1D tensor with values from start to end")
             .def_static("linspace", &PyTensor::linspace,
                         nb::arg("start"), nb::arg("end"), nb::arg("steps"), nb::arg("device") = "cuda", nb::arg("dtype") = "float32",
@@ -2013,7 +2055,7 @@ namespace lfs::python {
             .def("sort", &PyTensor::sort, nb::arg("dim") = -1, nb::arg("descending") = false, "Sort tensor values along a dimension and return (values, indices)")
 
             // Advanced indexing
-            .def("index_select", &PyTensor::index_select, nb::arg("dim"), nb::arg("indices"), "Select along dimension by indices")
+            .def("index_select", &PyTensor::index_select, nb::arg("dim"), nb::arg("indices"), nb::call_guard<nb::gil_scoped_release>(), "Select along dimension by indices")
             .def("gather", &PyTensor::gather, nb::arg("dim"), nb::arg("indices"), "Gather values along dimension")
             .def("masked_select", &PyTensor::masked_select, nb::arg("mask"), "Select elements where mask is true")
             .def("masked_fill", &PyTensor::masked_fill, nb::arg("mask"), nb::arg("value"), "Fill elements where mask is true")

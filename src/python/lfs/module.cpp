@@ -15,8 +15,10 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 
 #include "notification_bridge.hpp"
 #include "py_animation.hpp"
@@ -94,6 +96,7 @@
 #include "visualizer/core/editor_context.hpp"
 #include "visualizer/core/parameter_manager.hpp"
 #include "visualizer/core/services.hpp"
+#include "visualizer/gui/async_task_manager.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui_capabilities.hpp"
@@ -130,6 +133,7 @@
 #include <glm/gtx/matrix_decompose.hpp>
 
 namespace nb = nanobind;
+using namespace nb::literals;
 
 enum class RenderMode { Splats,
                         Points,
@@ -585,6 +589,8 @@ namespace {
         d["num_splats"] = ctx.num_gaussians;
         d["num_gaussians"] = ctx.num_gaussians;
         d["is_refining"] = ctx.is_refining;
+        d["is_paused"] = ctx.trainer && ctx.trainer->is_paused();
+        d["iterations"] = ctx.trainer ? ctx.trainer->get_total_iterations() : 0;
         return d;
     }
 
@@ -593,7 +599,16 @@ namespace {
         HookInvocationGuard hook_guard(ctx);
         LOG_DEBUG("Python hook invoke hook={} iter={}", static_cast<int>(hook), ctx.iteration);
         try {
-            callback(build_python_hook_payload(ctx));
+            auto payload = build_python_hook_payload(ctx);
+            if (hook == ControlHook::TrainingEnd) {
+                switch (ctx.terminal_outcome) {
+                case lfs::training::TrainingOutcome::Completed: payload["terminal_state"] = "completed"; break;
+                case lfs::training::TrainingOutcome::Stopped: payload["terminal_state"] = "stopped"; break;
+                case lfs::training::TrainingOutcome::Failed: payload["terminal_state"] = "failed"; break;
+                default: payload["terminal_state"] = "unknown"; break;
+                }
+            }
+            callback(payload);
         } catch (const std::exception& e) {
             LOG_ERROR("Python hook threw: {}", e.what());
         }
@@ -1581,8 +1596,8 @@ NB_MODULE(lichtfeld, m) {
                                 .keep_asset_manager_open =
                                     keep_asset_manager_open}
                                 .emit();
-                        if (const auto* gui = lfs::vis::services().guiOrNull())
-                            deferred = gui->asyncTasks().sceneReplacementPending();
+                        if (const auto* viewer = lfs::python::get_visualizer())
+                            deferred = viewer->projectOpenPending();
                     });
                 return deferred ? lfs::vis::ProjectOpenOutcome::Deferred : lfs::vis::ProjectOpenOutcome::Opened;
             }
@@ -2386,6 +2401,19 @@ NB_MODULE(lichtfeld, m) {
         "Get maximum number of gaussians");
 
     m.def(
+        "trainer_densification_vram", []() -> std::optional<nb::dict> {
+            const auto* tm = lfs::python::get_trainer_manager();
+            const auto room = tm ? tm->getDensificationVramRoom() : std::nullopt;
+            if (!room)
+                return std::nullopt;
+            nb::dict result;
+            result["capacity"] = room->capacity;
+            result["bytes_per_gaussian"] = room->bytes_per_gaussian;
+            return result;
+        },
+        "Gaussians that fit in VRAM and the VRAM each new one takes, as of the last refine (None before the first)");
+
+    m.def(
         "trainer_num_splats", []() -> int {
             const auto* tm = lfs::python::get_trainer_manager();
             return tm ? tm->getNumSplats() : 0;
@@ -2496,6 +2524,160 @@ NB_MODULE(lichtfeld, m) {
             scene->setCameraTrainingEnabled(name, enabled);
         },
         nb::arg("name"), nb::arg("enabled"), "Enable or disable a camera for training by name");
+
+    m.def(
+        "remove_disabled_cameras", [](const int camera_group_id) -> size_t {
+            auto* const viewer = lfs::python::get_visualizer();
+            if (!viewer)
+                throw std::runtime_error("Viewer not available");
+            const auto remove = [camera_group_id]() -> lfs::Result<size_t> {
+                auto* const scene_manager = lfs::python::get_scene_manager();
+                if (!scene_manager)
+                    return lfs::make_error(lfs::ErrorInit{
+                        .code = lfs::ErrorCode::Unavailable,
+                        .domain = lfs::ErrorDomain::Python,
+                        .user_message = "Scene manager not available",
+                        .detection = LFS_SOURCE_SITE_CURRENT()});
+                return scene_manager->removeDisabledCamerasWithResult(
+                    static_cast<lfs::core::NodeId>(camera_group_id));
+            };
+
+            std::optional<lfs::Result<size_t>> removal;
+            if (viewer->isOnViewerThread()) {
+                removal.emplace(remove());
+            } else {
+                nb::gil_scoped_release release;
+                const lfs::core::TaskContext context{.name = "python.remove_disabled_cameras", .domain = lfs::ErrorDomain::Python, .operation_id = lfs::OperationId::generate(), .site = LFS_SOURCE_SITE_CURRENT()};
+                const auto posted = lfs::vis::post_guarded_and_wait<lfs::Result<size_t>>(
+                    *viewer, context, remove, python_viewer_shutdown_error());
+                if (!posted)
+                    throw std::runtime_error(lfs::format_for_developer(posted.error()));
+                removal.emplace(std::move(*posted));
+            }
+            if (!*removal)
+                throw std::runtime_error(lfs::format_for_developer(removal->error()));
+            return **removal;
+        },
+        nb::arg("camera_group_id"), "Remove disabled direct camera children and return their count");
+
+    m.def(
+        "camera_selection_start", [](const std::string& operation, const int camera_group_id, const double percentage, const int every_n, const double overlap, const double coverage, const int cropbox_id) -> nb::dict {
+            using Task = lfs::vis::gui::AsyncTaskManager;
+            const auto type = [&]() -> Task::CameraSelectionOperation {
+                if (operation == "enable_all")
+                    return Task::CameraSelectionOperation::EnableAll;
+                if (operation == "disable_all")
+                    return Task::CameraSelectionOperation::DisableAll;
+                if (operation == "invert")
+                    return Task::CameraSelectionOperation::Invert;
+                if (operation == "random")
+                    return Task::CameraSelectionOperation::Random;
+                if (operation == "every_n")
+                    return Task::CameraSelectionOperation::EveryN;
+                if (operation == "distinct")
+                    return Task::CameraSelectionOperation::Distinct;
+                if (operation == "cropbox_visibility")
+                    return Task::CameraSelectionOperation::CropBoxVisibility;
+                throw std::invalid_argument("Unknown camera selection operation: " + operation);
+            }();
+            auto* viewer = lfs::python::get_visualizer();
+            if (!viewer)
+                throw std::runtime_error("Viewer not available");
+            const Task::CameraSelectionOptions options{.operation = type, .percentage = static_cast<float>(percentage), .every_n = every_n, .overlap = static_cast<float>(overlap), .coverage = static_cast<float>(coverage), .camera_group_id = static_cast<lfs::core::NodeId>(camera_group_id), .cropbox_id = static_cast<lfs::core::NodeId>(cropbox_id)};
+            const auto start = [&]() -> std::expected<lfs::vis::JobHandle, lfs::Error> {
+                auto* gui = lfs::python::get_gui_manager();
+                if (!gui)
+                    return std::unexpected(lfs::make_error(lfs::ErrorInit{
+                        .code = lfs::ErrorCode::Unavailable,
+                        .domain = lfs::ErrorDomain::Python,
+                        .user_message = "GUI is unavailable",
+                        .detection = LFS_SOURCE_SITE_CURRENT()}));
+                return gui->asyncTasks().startCameraSelection(options);
+            };
+            std::optional<std::expected<lfs::vis::JobHandle, lfs::Error>> handle;
+            if (viewer->isOnViewerThread())
+                handle = start();
+            else {
+                nb::gil_scoped_release release;
+                const lfs::core::TaskContext context{.name = "python.camera_selection_start", .domain = lfs::ErrorDomain::Python, .operation_id = lfs::OperationId::generate(), .site = LFS_SOURCE_SITE_CURRENT()};
+                auto result = lfs::vis::post_guarded_and_wait<std::expected<lfs::vis::JobHandle, lfs::Error>>(*viewer, context, start, python_viewer_shutdown_error());
+                if (!result)
+                    throw std::runtime_error(lfs::format_for_developer(result.error()));
+                handle = *result;
+            }
+            if (!*handle)
+                throw std::runtime_error(lfs::format_for_developer(handle->error()));
+            nb::dict result;
+            result["job_id"] = "camera.selection";
+            result["handle"] = handle->value().id;
+            result["operation"] = operation;
+            return result;
+        },
+        nb::arg("operation"), nb::arg("camera_group_id"), nb::arg("percentage") = 25.0, nb::arg("every_n") = 2, nb::arg("overlap") = 65.0, nb::arg("coverage") = 40.0, nb::arg("cropbox_id") = 0, "Start a cancellable camera-group selection job. Returns its runtime id and opaque handle; no training selection changes until it finishes.");
+
+    m.def(
+        "camera_selection_status", []() -> nb::dict {
+            const auto query = [] {
+                auto* gui = lfs::python::get_gui_manager();
+                return gui ? gui->asyncTasks().cameraSelectionStatus() : std::nullopt;
+            };
+            auto* const viewer = lfs::python::get_visualizer();
+            std::optional<lfs::vis::JobSnapshot> status;
+            if (!viewer || viewer->isOnViewerThread()) {
+                status = query();
+            } else {
+                nb::gil_scoped_release release;
+                const lfs::core::TaskContext context{.name = "python.camera_selection_status", .domain = lfs::ErrorDomain::Python, .operation_id = lfs::OperationId::generate(), .site = LFS_SOURCE_SITE_CURRENT()};
+                const auto result = lfs::vis::post_guarded_and_wait<std::optional<lfs::vis::JobSnapshot>>(*viewer, context, query, python_viewer_shutdown_error());
+                if (!result)
+                    throw std::runtime_error(lfs::format_for_developer(result.error()));
+                status = *result;
+            }
+            if (!status) {
+                nb::dict result;
+                result["job_id"] = "camera.selection";
+                result["status"] = "idle";
+                result["active"] = false;
+                return result;
+            }
+            const char* state = status->running() ? "running" : status->status == lfs::vis::JobStatus::Completed ? "completed"
+                                                            : status->status == lfs::vis::JobStatus::Canceled    ? "cancelled"
+                                                            : status->status == lfs::vis::JobStatus::Failed      ? "failed"
+                                                                                                                 : "idle";
+            nb::dict result;
+            result["job_id"] = "camera.selection";
+            result["handle"] = status->handle.id;
+            result["status"] = state;
+            result["active"] = status->running();
+            result["progress"] = status->progress;
+            result["stage"] = status->stage;
+            result["error"] = status->error;
+            result["cancel_requested"] = status->cancel_requested;
+            return result;
+        },
+        "Return the camera-selection job status without changing the scene.");
+
+    m.def(
+        "camera_selection_cancel", []() -> bool {
+            const auto cancel = [] {
+                auto* gui = lfs::python::get_gui_manager();
+                const auto status = gui ? gui->asyncTasks().cameraSelectionStatus() : std::nullopt;
+                if (!status || !status->running())
+                    return false;
+                gui->asyncTasks().cancelCameraSelection();
+                return true;
+            };
+            auto* const viewer = lfs::python::get_visualizer();
+            if (!viewer || viewer->isOnViewerThread())
+                return cancel();
+            nb::gil_scoped_release release;
+            const lfs::core::TaskContext context{.name = "python.camera_selection_cancel", .domain = lfs::ErrorDomain::Python, .operation_id = lfs::OperationId::generate(), .site = LFS_SOURCE_SITE_CURRENT()};
+            const auto result = lfs::vis::post_guarded_and_wait<bool>(*viewer, context, cancel, python_viewer_shutdown_error());
+            if (!result)
+                throw std::runtime_error(lfs::format_for_developer(result.error()));
+            return *result;
+        },
+        "Request cancellation. Returns true only when a running job accepted the request.");
 
     m.def(
         "remove_node", [](const std::string& name, bool keep_children) {
@@ -3140,6 +3322,11 @@ NB_MODULE(lichtfeld, m) {
             return capabilities;
         },
         "Return Vulkan device capabilities used to gate rendering controls");
+    m.def("toggle_side_dock", [](const std::string& side) {
+        if (side != "left" && side != "right")
+            throw nb::value_error("side must be 'left' or 'right'");
+        lfs::core::events::ui::ToggleSideDock{.side = side == "left" ? lfs::core::SideDock::Left : lfs::core::SideDock::Right}.emit(); }, nb::arg("side"), "Toggle the left or right side dock.");
+
     m.def(
         "toggle_ui", []() { lfs::core::events::ui::ToggleUI{}.emit(); },
         "Toggle UI overlay visibility");
@@ -3212,6 +3399,58 @@ NB_MODULE(lichtfeld, m) {
         "Check if orthographic projection is active");
 
     m.def(
+        "get_viewport_display_mode", []() -> std::string {
+            const auto* rm = lfs::python::get_rendering_manager();
+            if (!rm)
+                return "rgb";
+            const auto settings = rm->getSettings();
+            switch (lfs::vis::viewportDisplayMode(settings)) {
+            case lfs::vis::ViewportDisplayMode::Depth:
+                return "depth";
+            case lfs::vis::ViewportDisplayMode::Normal:
+                return "normal";
+            case lfs::vis::ViewportDisplayMode::RGB:
+                return "rgb";
+            }
+            return "rgb";
+        },
+        "Get viewport display mode: rgb, depth, or normal");
+    m.def(
+        "set_viewport_display_mode", [](const std::string& mode) {
+            if (mode != "rgb" && mode != "depth" && mode != "normal")
+                throw nb::value_error("Viewport display mode must be 'rgb', 'depth', or 'normal'");
+            auto* rm = lfs::python::get_rendering_manager();
+            if (!rm)
+                return;
+            auto settings = rm->getSettings();
+            const auto before = std::tuple{settings.depth_view, settings.normal_view, settings.split_view_mode, settings.point_cloud_mode};
+            settings.depth_view = mode == "depth";
+            settings.normal_view = mode == "normal";
+            if (settings.normal_view)
+                settings.point_cloud_mode = false;
+            if (lfs::vis::splitViewUsesGTComparison(settings.split_view_mode))
+                settings.split_view_mode = lfs::vis::SplitViewMode::Disabled;
+            rm->updateSettings(settings, lfs::vis::DirtyFlag::ALL);
+            markViewSettingIfChanged(before, std::tuple{settings.depth_view, settings.normal_view, settings.split_view_mode, settings.point_cloud_mode});
+        },
+        nb::arg("mode"), "Set viewport display mode independently of the selector visibility");
+    m.def(
+        "get_render_mode_controls_open", [] {
+            const auto* rm = lfs::python::get_rendering_manager();
+            return rm && rm->getSettings().render_mode_controls_open;
+        },
+        "Return whether the viewport render-mode selector is open.");
+    m.def(
+        "set_render_mode_controls_open", [](bool open) {
+            if (auto* rm = lfs::python::get_rendering_manager()) {
+                auto settings = rm->getSettings();
+                settings.render_mode_controls_open = open;
+                rm->updateSettings(settings, lfs::vis::DirtyFlag::OVERLAY);
+            }
+        },
+        nb::arg("open"), "Open or close the render-mode selector without changing the view");
+
+    m.def(
         "get_depth_view", []() -> bool {
             const auto* rm = lfs::python::get_rendering_manager();
             return rm ? rm->getSettings().depth_view : false;
@@ -3226,6 +3465,10 @@ NB_MODULE(lichtfeld, m) {
             const bool before = rm->getSettings().depth_view;
             auto settings = rm->getSettings();
             settings.depth_view = enabled;
+            settings.render_mode_controls_open = enabled;
+            if (enabled) {
+                settings.normal_view = false;
+            }
             rm->updateSettings(settings, lfs::vis::DirtyFlag::ALL);
             markViewSettingIfChanged(before, rm->getSettings().depth_view);
         },

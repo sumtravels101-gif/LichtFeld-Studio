@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Tests for lichtfeld training hooks."""
 
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 
@@ -243,3 +250,95 @@ class TestFrameCallback:
         """Test stop_animation function exists."""
         assert hasattr(lf, "stop_animation")
         assert callable(lf.stop_animation)
+
+
+@pytest.mark.gpu
+@pytest.mark.integration
+@pytest.mark.parametrize("outcome", ["completed", "stopped", "failed"])
+def test_headless_training_hook_outcome(tmp_path, gpu_available, outcome):
+    if not gpu_available:
+        pytest.skip("CUDA GPU required for training")
+    from test_mcp_dataset_load_training import _dataset
+
+    root = Path(__file__).resolve().parents[2]
+    build = Path(os.environ.get("LFS_TEST_BUILD_DIR", os.environ.get("LFS_BUILD_DIR", root / "build")))
+    executable = Path(os.environ.get("LFS_EXECUTABLE", build / ("LichtFeld-Studio.exe" if os.name == "nt" else "LichtFeld-Studio")))
+    assert executable.is_file(), f"Build the executable first: {executable}"
+    dataset = _dataset(tmp_path / "dataset", 60)
+    script = tmp_path / "hooks.py"
+    script.write_text(textwrap.dedent('''\
+        import json, os
+        from pathlib import Path
+        import lichtfeld as lf
+        steps = []
+        @lf.on_post_step
+        def step(context):
+            steps.append(dict(context))
+            if os.environ["LFS_TEST_OUTCOME"] == "stopped":
+                lf.session().request_stop()
+        @lf.on_training_end
+        def end(context):
+            Path(os.environ["LFS_TEST_HOOK_OUTPUT"]).write_text(
+                json.dumps({"end": dict(context), "steps": steps}), encoding="utf-8")
+    '''), encoding="utf-8")
+    checkpoint = tmp_path / "project.licht"
+    if outcome == "failed":
+        blocked = tmp_path / "not-a-directory"
+        blocked.write_text("Block the terminal project save", encoding="utf-8")
+        checkpoint = blocked / "project.licht"
+    proof = tmp_path / "hooks.json"
+    environment = {**os.environ, "LFS_HOME": str(tmp_path / "runtime-\u00e0-\u6e2c"),
+                   "LFS_TEST_OUTCOME": outcome, "LFS_TEST_HOOK_OUTPUT": str(proof)}
+    for name in ("PYTHONHOME", "PYTHONPATH"):
+        environment.pop(name, None)
+    command = [str(executable), "--headless", "-d", dataset, "-o", str(tmp_path / "output"),
+               "--iter", "4", "--max-cap", "1000", "--sh-degree", "1", "--strategy", "mcmc",
+               "--min-track-length", "0", "--centralize", "off", "--no-download",
+               "--save-project-at-iter", "4", "--save-project-path", str(checkpoint),
+               "--python-script", str(script)]
+    with (tmp_path / "trainer.log").open("w", encoding="utf-8") as log:
+        process = subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT, timeout=60,
+                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    assert proof.is_file(), (tmp_path / "trainer.log").read_text(encoding="utf-8")[-8000:]
+    payload = json.loads(proof.read_text(encoding="utf-8"))
+    assert payload["end"]["terminal_state"] == outcome
+    assert payload["end"]["iterations"] == 4
+    assert type(payload["end"]["is_paused"]) is bool
+    if outcome == "stopped":
+        assert 0 <= payload["end"]["iteration"] < 4
+    else:
+        assert payload["end"]["iteration"] == 4
+    assert payload["steps"]
+    for step in payload["steps"]:
+        assert step["iterations"] == 4
+        assert type(step["is_paused"]) is bool
+        assert "terminal_state" not in step
+    assert (process.returncode != 0) == (outcome == "failed")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("exit_code", [None, 0, 7, "failure"])
+def test_headless_scripts_handle_exit_without_dataset(tmp_path, exit_code):
+    root = Path(__file__).resolve().parents[2]
+    build = Path(os.environ.get("LFS_TEST_BUILD_DIR", os.environ.get("LFS_BUILD_DIR", root / "build")))
+    executable = Path(os.environ.get("LFS_EXECUTABLE", build / ("LichtFeld-Studio.exe" if os.name == "nt" else "LichtFeld-Studio")))
+    assert executable.is_file(), f"Build the executable first: {executable}"
+    first = tmp_path / "script-café.py"
+    second = tmp_path / "second.py"
+    proof = tmp_path / "order.txt"
+    first.write_text(
+        "import sys\nfrom pathlib import Path\n"
+        f"proof = Path({str(proof)!r})\n"
+        "assert Path(__file__).name == 'script-café.py'\n"
+        "proof.write_text('first', encoding='utf-8')\n"
+        f"sys.exit({exit_code!r})\n", encoding="utf-8")
+    second.write_text("proof.write_text(proof.read_text(encoding='utf-8') + ':second', encoding='utf-8')\n", encoding="utf-8")
+    environment = {**os.environ, "CUDA_VISIBLE_DEVICES": "-1", "LFS_HOME": str(tmp_path / "home")}
+    for name in ("PYTHONHOME", "PYTHONPATH"):
+        environment.pop(name, None)
+    process = subprocess.run([str(executable), "--headless", "--python-script", str(first),
+                              "--python-script", str(second)], env=environment,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+    success = exit_code in (None, 0)
+    assert (process.returncode == 0) == success, process.stdout.decode("utf-8", errors="replace")
+    assert proof.read_text(encoding="utf-8") == ("first:second" if success else "first")

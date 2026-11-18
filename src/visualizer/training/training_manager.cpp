@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "training/training_manager.hpp"
+#include "core/cuda/memory_arena.hpp"
 #include "core/error.hpp"
 #include "core/error_envelope.hpp"
 #include "core/error_reporter.hpp"
@@ -560,8 +561,10 @@ namespace lfs::vis {
         splat_storage_.reset();
         lfs::core::SplatTensorAllocator tensor_allocator;
 
+        // Noise infill rows come on top of max_cap and are known only once the mesh is voxelized, so the reserve then
+        // follows device memory, as without a cap.
         const std::size_t configured_capacity =
-            params.optimization.max_cap > 0
+            params.optimization.max_cap > 0 && params.optimization.noise_infill_mesh.empty()
                 ? static_cast<std::size_t>(params.optimization.max_cap)
                 : 0;
         const int sh_degree = params.optimization.sh_degree;
@@ -738,12 +741,24 @@ namespace lfs::vis {
         if (splat_storage_->capacity() >= needed_rows) {
             return true;
         }
-        const std::size_t want = lfs::core::SplatExportableStorage::growthCapacity(
-            needed_rows, splat_storage_->reservedCapacity());
-
         auto* model_ptr = scene_ ? scene_->getTrainingModel() : nullptr;
         if (!model_ptr) {
             return false;
+        }
+
+        std::size_t want = lfs::core::SplatExportableStorage::growthCapacity(
+            needed_rows, splat_storage_->reservedCapacity());
+        // Densification grows the model up to the VRAM limit; headroom past
+        // needed_rows must not take the free VRAM the rasterizer arena needs.
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        if (want > needed_rows && cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+            const std::size_t headroom_bytes =
+                (want - splat_storage_->capacity()) *
+                lfs::core::SplatExportableStorage::layoutBytesPerSplat(model_ptr->get_max_sh_degree());
+            if (free_bytes < headroom_bytes + 2 * lfs::core::RasterizerMemoryArena::growth_headroom_bytes(total_bytes)) {
+                want = needed_rows;
+            }
         }
 
         const std::size_t old_capacity = splat_storage_->capacity();
@@ -970,21 +985,35 @@ namespace lfs::vis {
         return trainer_ != nullptr;
     }
 
+    std::string_view TrainerManager::getResourceBlockedReason() const {
+        if (viewer_ && viewer_->jobs().anyRunning(JobType::AssistedMask))
+            return LOC("image_preview.sam_training_blocked");
+        return {};
+    }
+
+    std::string_view TrainerManager::getActionBlockedReason(const TrainingAction action) const {
+        if (action == TrainingAction::Start || action == TrainingAction::Resume)
+            if (const auto blocked = getResourceBlockedReason(); !blocked.empty())
+                return blocked;
+        if (action == TrainingAction::Resume && !trainer_ && viewer_ && getState() == TrainingState::Paused) {
+            const auto session = viewer_->projectTrainingSessionState();
+            if (session.available && !session.hydrated && !session.restoring && session.error.empty())
+                return {};
+            return LOC("runtime.training_session_not_ready");
+        }
+        return state_machine_.getActionBlockedReason(action);
+    }
+
     bool TrainerManager::canPerform(const TrainingAction action) const {
         if (viewer_ && viewer_->isTrainingStartPending()) {
             return action == TrainingAction::Stop;
         }
-        if ((action == TrainingAction::Stop || action == TrainingAction::Resume) && !trainer_ && viewer_ &&
+        if (action == TrainingAction::Stop && !trainer_ && viewer_ &&
             getState() == TrainingState::Paused) {
             const auto session = viewer_->projectTrainingSessionState();
-            if (action == TrainingAction::Stop) {
-                return session.available && !session.hydrated &&
-                       !session.restoring;
-            }
-            return session.available && !session.hydrated &&
-                   !session.restoring && session.error.empty();
+            return session.available && !session.hydrated && !session.restoring;
         }
-        return state_machine_.canPerform(action);
+        return getActionBlockedReason(action).empty();
     }
 
     TrainingState TrainerManager::getState() const {
@@ -1274,6 +1303,20 @@ namespace lfs::vis {
         return lfs::training::resolve_training_cropbox_geom(*scene_);
     }
 
+    void TrainerManager::notifyUnusedCameraMasks() {
+        auto* const gui = viewer_ ? viewer_->getGuiManager() : nullptr;
+        if (!gui || !scene_ || !trainer_)
+            return;
+        detail::dispatch_unused_camera_mask_notice(*scene_, trainer_->getParams().optimization.mask_mode, [gui] {
+            gui->enqueueToast({
+                .title = LOC("window.training"),
+                .message = LOC("toast.camera_masks_disabled"),
+                .level = gui::ErrorNoticeLevel::Warning,
+                .fingerprint = 0x4c46534d41530001ULL,
+            });
+        });
+    }
+
     bool TrainerManager::startTraining() {
         LOG_TIMER("TrainerManager::startTraining");
 
@@ -1396,7 +1439,7 @@ namespace lfs::vis {
         applyPendingParams();
 
         if (evaluation_weights_preparer_ && trainer_->getParams().optimization.enable_eval)
-            trainer_->set_lpips_weights_path(evaluation_weights_preparer_(!trainer_->getParams().no_download));
+            trainer_->set_lpips_weights_preparer([preparer = evaluation_weights_preparer_, allow_download = !trainer_->getParams().no_download] { return preparer(allow_download); });
 
         std::optional<TrainingSceneInitializationRollback> scene_rollback;
         std::optional<lfs::training::TrainingModelGraphCapture> graph_capture;
@@ -1592,6 +1635,11 @@ namespace lfs::vis {
                     }
                 }
 
+                // Initialization has applied the editable parameters and the
+                // worker is still behind this handoff's gate.
+                if (!stop_token.stop_requested() && !trainer_->has_stopped()) {
+                    notifyUnusedCameraMasks();
+                }
                 if (state_machine_.getState() == TrainingState::Starting &&
                     !stop_token.stop_requested() &&
                     !trainer_->has_stopped()) {
@@ -1666,6 +1714,10 @@ namespace lfs::vis {
     }
 
     void TrainerManager::resumeTraining() {
+        if (!canResume()) {
+            LOG_TRACE("Cannot resume: {}", getActionBlockedReason(TrainingAction::Resume));
+            return;
+        }
         if (!trainer_ && viewer_) {
             const auto session =
                 viewer_->projectTrainingSessionState();
@@ -1681,10 +1733,6 @@ namespace lfs::vis {
                 return;
             }
         }
-        if (!canResume()) {
-            LOG_TRACE("Cannot resume: {}", getActionBlockedReason(TrainingAction::Resume));
-            return;
-        }
         if (!trainer_)
             return;
 
@@ -1692,6 +1740,7 @@ namespace lfs::vis {
         const bool need_thread = !isCompletionPending();
 
         if (!need_thread) {
+            notifyUnusedCameraMasks();
             trainer_->request_resume();
         }
 
@@ -2063,14 +2112,18 @@ namespace lfs::vis {
 
         // Prefer scene metadata so UI polling does not dereference the live
         // training model while topology-changing refinement is in progress.
+        const auto without_noise = [this](const std::size_t rows) {
+            const std::size_t noise_rows = trainer_->noise_infill_row_count();
+            return static_cast<int>(rows > noise_rows ? rows - noise_rows : 0);
+        };
         if (scene_) {
-            return static_cast<int>(scene_->getTrainingModelGaussianCount());
+            return without_noise(scene_->getTrainingModelGaussianCount());
         }
 
         // Legacy fallback for non-scene-backed trainers.
         if (trainer_->isInitialized()) {
             const std::shared_lock lock(trainer_->getRenderMutex());
-            return static_cast<int>(trainer_->get_strategy().get_model().size());
+            return without_noise(trainer_->get_strategy().get_model().size());
         }
         return 0;
     }
@@ -2084,6 +2137,12 @@ namespace lfs::vis {
             return 0;
         }
         return trainer_->getParams().optimization.max_cap;
+    }
+
+    std::optional<lfs::training::DensificationVramRoom> TrainerManager::getDensificationVramRoom() const {
+        if (!trainer_)
+            return std::nullopt;
+        return lfs::training::densification_vram_room();
     }
 
     std::vector<size_t> TrainerManager::getSaveSteps() const {

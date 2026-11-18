@@ -18,9 +18,10 @@
 #include "kernels/densification_kernels.hpp"
 #include "kernels/mrnf_kernels.hpp"
 #include "lfs/training/mean_step_scale.cuh"
-#include "lfs/training/morton_reorder.hpp"
 #include "lfs/training/perf_bench.hpp"
+#include "lfs/training/ray_depth_step.cuh"
 #include "lfs/training/sh_value_storage.hpp"
+#include "noise_infill.hpp"
 #include "strategy_utils.hpp"
 #include "training/dataset.hpp"
 #include <algorithm>
@@ -119,7 +120,7 @@ namespace lfs::training {
             for (std::size_t dim = 1; dim < tensor.ndim(); ++dim) {
                 row_elements *= tensor.shape()[dim];
             }
-            return tensor.capacity() * row_elements * lfs::core::dtype_size(tensor.dtype());
+            return tensor.committed_rows() * row_elements * lfs::core::dtype_size(tensor.dtype());
         }
 
         void publish_required_allocated_pair(
@@ -496,12 +497,23 @@ namespace lfs::training {
             tensor.div_(std::max(median, 1e-9f));
         }
 
-        [[nodiscard]] lfs::core::Tensor normalized_by_positive_median(const lfs::core::Tensor& tensor) {
-            auto normalized = tensor.clone();
-            normalize_by_positive_median_inplace(normalized);
-            return normalized;
-        }
     } // namespace
+
+    lfs::core::Tensor split_child_rows(const lfs::core::Tensor& reused_rows, const size_t first_appended_row,
+                                       const size_t appended) {
+        using namespace lfs::core;
+        assert(!reused_rows.is_valid() || (reused_rows.ndim() == 1 && reused_rows.dtype() == DataType::Int64));
+        std::vector<Tensor> rows;
+        if (reused_rows.is_valid() && reused_rows.numel() > 0)
+            rows.push_back(reused_rows);
+        if (appended > 0)
+            rows.push_back(Tensor::arange(static_cast<int64_t>(first_appended_row),
+                                          static_cast<int64_t>(first_appended_row + appended), 1,
+                                          Device::CUDA, DataType::Int64));
+        if (rows.empty())
+            return Tensor::empty({0}, Device::CUDA, DataType::Int64);
+        return (rows.size() == 1 ? rows[0] : Tensor::cat(rows, 0)).contiguous();
+    }
 
     MRNF::MRNF(lfs::core::SplatData& splat_data) : _splat_data(&splat_data) {}
 
@@ -521,7 +533,7 @@ namespace lfs::training {
         auto resolved_params = optimParams;
         resolved_params.resolve_mrnf_capacity_defaults();
         _params = std::make_unique<const lfs::core::param::OptimizationParameters>(
-            std::move(resolved_params));
+            with_noise_outside_cap(resolved_params, _splat_data));
 
         if (_params->max_cap > 0) {
             const size_t capacity = static_cast<size_t>(_params->max_cap);
@@ -627,6 +639,7 @@ namespace lfs::training {
         publish_vram_attribution();
         compute_bounds();
         refresh_camera_hull();
+        sync_ray_depth();
 
         cancel_blob_seeding();
         // A point cloud that already fills the capacity leaves no room for seeds, so skip capturing views for them.
@@ -781,6 +794,7 @@ namespace lfs::training {
             account_tensor("edge.score_sum", _edge_score_sum);
             account_tensor("edge.view_scores", _edge_view_scores);
             account_tensor("far_field_mask", _far_field_mask);
+            account_tensor("ray_depth_state", _ray_depth_state);
 
             _strategy_required_peak_bytes =
                 std::max(_strategy_required_peak_bytes, strategy_required);
@@ -855,12 +869,10 @@ namespace lfs::training {
                 lfs::training::sh_value::commit_shN_after_mutation(*_splat_data);
             }
             _refine_weight_max = Tensor();
-            _gumbel_scratch.release();
             _densify_n_scratch.release();
             reset_exchange_state();
             _topology_frozen = true;
             assert(!_refine_weight_max.is_valid());
-            assert(_gumbel_scratch.resident_bytes() == 0);
             assert(_densify_n_scratch.resident_bytes() == 0);
             Tensor::trim_memory_pool();
             publish_vram_attribution();
@@ -913,20 +925,13 @@ namespace lfs::training {
         publish_vram_attribution();
     }
 
-    void MRNF::permute_gaussian_rows(const lfs::core::Tensor& perm) {
-        morton::permute_row_tensor(_refine_weight_max, perm);
-        if (_rendered_count.is_valid())
-            morton::permute_row_tensor(_rendered_count, perm);
-        morton::permute_row_tensor(_precomputed_edge_scores, perm);
-        morton::permute_row_tensor(_edge_score_sum, perm);
-        morton::permute_row_tensor(_free_mask, perm);
-        morton::permute_row_tensor(_exchange_importance_sum, perm);
-        morton::permute_row_tensor(_exchange_importance_peak, perm);
-        morton::permute_row_tensor(_exchange_birth, perm);
-        morton::permute_row_tensor(_exchange_window_impact_sum, perm);
-        morton::permute_row_tensor(_exchange_window_impact_peak, perm);
-        morton::permute_row_tensor(_far_field_mask, perm);
-        publish_mean_step_far_mask();
+    void MRNF::for_each_gaussian_row(const std::function<void(lfs::core::Tensor&)>& visit) {
+        for (auto* rows : {&_refine_weight_max, &_rendered_count, &_precomputed_edge_scores, &_edge_score_sum,
+                           &_free_mask, &_exchange_importance_sum, &_exchange_importance_peak, &_exchange_birth,
+                           &_exchange_window_impact_sum, &_exchange_window_impact_peak, &_far_field_mask,
+                           &_ray_depth_state}) {
+            visit(*rows);
+        }
     }
 
     bool MRNF::is_refining(int iter) const {
@@ -943,6 +948,7 @@ namespace lfs::training {
         lfs::core::alloc_counter::ScopedSite densify_site("densify");
         LOG_TIMER("MRNF::refine");
         LFS_VRAM_SCOPE("MRNF::refine");
+        const RefineVramWindow vram_window(*_splat_data);
         using namespace lfs::core;
         // q16 stays authoritative for the refine window (gather/scatter/append
         // re-encode only touched 256-splat blocks). IEEE-f16 still expands.
@@ -1058,6 +1064,7 @@ namespace lfs::training {
         }
         apply_decay(iter);
         ensure_mean_step_far_mask();
+        sync_ray_depth();
 
         const size_t new_n = static_cast<size_t>(_splat_data->size());
         const size_t tracking_capacity = splat_reserved_capacity(*_splat_data);
@@ -1079,7 +1086,6 @@ namespace lfs::training {
             lfs::training::sh_value::commit_shN_after_mutation(*_splat_data);
         }
 
-        _gumbel_scratch.release();
         _densify_n_scratch.release();
         publish_vram_attribution();
 
@@ -1258,28 +1264,12 @@ namespace lfs::training {
         if (count == 0) {
             return {};
         }
-        LFS_ASSERT_MSG(n <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
-                       "MRNF growth exchange exceeds int32 rank capacity");
-        const auto ineligible = eligible.logical_not();
-        const auto primary_order = _exchange_importance_sum
-                                       .masked_fill(ineligible, std::numeric_limits<float>::infinity())
-                                       .sort(0, /*descending=*/false)
-                                       .second;
-        Tensor secondary_order;
-        if (_exchange_importance_peak.is_valid()) {
-            secondary_order = _exchange_importance_peak
-                                  .masked_fill(ineligible, std::numeric_limits<float>::infinity())
-                                  .sort(0, /*descending=*/false)
-                                  .second;
-        }
-        Tensor ranks = Tensor::empty({n}, Device::CUDA, DataType::Int32);
-        Tensor ranked_rows = Tensor::empty({n}, Device::CUDA, DataType::Int64);
-        mrnf_strategy::launch_fused_exchange_ranks(
-            primary_order.ptr<int64_t>(),
-            secondary_order.is_valid() ? secondary_order.ptr<int64_t>() : nullptr,
-            eligible.ptr<bool>(), ranks.ptr<int32_t>(), ranked_rows.ptr<int64_t>(), n);
-        mrnf_strategy::launch_sort_exchange_ranks(ranks.ptr<int32_t>(), ranked_rows.ptr<int64_t>(), n);
-        return ranked_rows.slice(0, 0, count).contiguous();
+        Tensor victims = Tensor::empty({count}, Device::CUDA, DataType::Int64);
+        mrnf_strategy::launch_rank_exchange_rows(
+            _exchange_importance_sum.ptr<float>(),
+            _exchange_importance_peak.is_valid() ? _exchange_importance_peak.ptr<float>() : nullptr,
+            eligible.ptr<bool>(), n, count, victims.ptr<int64_t>());
+        return victims;
     }
 
     void MRNF::record_exchange_births(const lfs::core::Tensor& split_parents) {
@@ -1444,8 +1434,7 @@ namespace lfs::training {
     lfs::core::Tensor MRNF::sample_gumbel_topk(
         const lfs::core::Tensor& weights,
         const int k,
-        const uint64_t seed,
-        const size_t known_nnz) {
+        const uint64_t seed) {
         using namespace lfs::core;
         if (_topology_frozen || k <= 0 || !weights.is_valid() || weights.numel() == 0) {
             return {};
@@ -1453,26 +1442,23 @@ namespace lfs::training {
 
         auto indices = Tensor::empty({static_cast<size_t>(k)}, Device::CUDA, DataType::Int64);
         mrnf_strategy::launch_gumbel_topk(
-            weights.ptr<float>(), weights.numel(), static_cast<size_t>(k), seed, indices.ptr<int64_t>(),
-            nullptr, true, &_gumbel_scratch, known_nnz);
+            weights.ptr<float>(), weights.numel(), static_cast<size_t>(k), seed, indices.ptr<int64_t>());
         return indices;
     }
 
     lfs::core::Tensor MRNF::sample_with_roi_share(
         const lfs::core::Tensor& weights,
         const int k,
-        const uint64_t seed,
-        const size_t known_nnz) {
+        const uint64_t seed) {
         const auto split = split_growth_by_roi(*_optimizer, weights, k);
         if (!split)
-            return sample_gumbel_topk(weights, k, seed, known_nnz);
+            return sample_gumbel_topk(weights, k, seed);
         std::vector<lfs::core::Tensor> parts;
         if (split->roi_count > 0)
-            parts.push_back(sample_gumbel_topk(split->roi_weights, static_cast<int>(split->roi_count), seed,
-                                               static_cast<size_t>(split->roi_nnz)));
+            parts.push_back(sample_gumbel_topk(split->roi_weights, static_cast<int>(split->roi_count), seed));
         if (split->rest_count > 0)
             parts.push_back(sample_gumbel_topk(split->rest_weights, static_cast<int>(split->rest_count),
-                                               seed ^ 0x9e3779b97f4a7c15ull, static_cast<size_t>(split->rest_nnz)));
+                                               seed ^ 0x9e3779b97f4a7c15ull));
         if (parts.empty())
             return {};
         return parts.size() == 1 ? parts[0] : lfs::core::Tensor::cat(parts, 0);
@@ -1511,9 +1497,14 @@ namespace lfs::training {
             refine_candidates = refine_candidates.logical_and(trainable_mask);
         }
 
-        const int physical_budget = (_params->max_cap > 0)
-                                        ? std::max(0, _params->max_cap - static_cast<int>(current_active))
-                                        : INT_MAX;
+        // Free slots are reused in place; only rows appended past N need VRAM.
+        const size_t vram_budget = std::min<size_t>(
+            INT_MAX, (n - current_active) +
+                         vram_growth_limit(*_splat_data, _optimizer.get()));
+        const int cap_budget = (_params->max_cap > 0)
+                                   ? std::max(0, _params->max_cap - static_cast<int>(current_active))
+                                   : INT_MAX;
+        const int physical_budget = std::min(cap_budget, static_cast<int>(vram_budget));
         const int exchange_extra = static_cast<int>(std::min(
             exchange_quota,
             static_cast<size_t>(INT_MAX - physical_budget)));
@@ -1525,7 +1516,7 @@ namespace lfs::training {
         auto seed = static_cast<uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count());
 
-        const auto edge_guidance = edge_guidance_factor();
+        const auto edge_guidance = this->edge_guidance();
 
         Tensor split_indices;
         Tensor replace_inds;
@@ -1564,8 +1555,7 @@ namespace lfs::training {
             if (actual_replace > 0) {
                 // grow-only index/mask scratch (no per-refine driver alloc).
                 _densify_n_scratch.ensure_n(n, Device::CUDA);
-                replace_inds = sample_with_roi_share(replace_weights, actual_replace, seed,
-                                                     static_cast<size_t>(selectable_replace));
+                replace_inds = sample_with_roi_share(replace_weights, actual_replace, seed);
                 actual_replace = replace_inds.is_valid() ? static_cast<int>(replace_inds.numel()) : 0;
                 if (actual_replace > 0) {
                     replace_mask = _densify_n_scratch.bool_a_view(n);
@@ -1579,19 +1569,23 @@ namespace lfs::training {
         if (iter < static_cast<int>(_params->grow_until_iter)) {
             above_threshold = refine_candidates;
             n_grow = std::max(0, desired_total - actual_replace);
+            if (physical_budget < cap_budget && n_grow > budget - actual_replace) {
+                note_vram_growth_limit(*_splat_data, _optimizer.get(),
+                                       static_cast<size_t>(std::max(0, budget - actual_replace)),
+                                       static_cast<size_t>(n_grow));
+            }
             n_grow = std::min(n_grow, budget - actual_replace);
         }
 
         if (n_grow > 0) {
             Tensor growth_weights = above_threshold * _refine_weight_max;
-            if (edge_guidance.is_valid()) {
-                growth_weights = growth_weights * edge_guidance;
-            }
+            mrnf_strategy::launch_apply_edge_guidance(growth_weights.ptr<float>(), edge_guidance,
+                                                      static_cast<size_t>(growth_weights.numel()));
 
             if (replace_mask.is_valid()) {
                 // Keep replacement and growth disjoint on device instead of
                 // deduplicating sampled indices on the host.
-                growth_weights = growth_weights.masked_fill(replace_mask, 0.0f);
+                growth_weights.masked_fill_(replace_mask, 0.0f);
             }
 
             // Growth nnz is data-dependent on replace_mask — second packed slot.
@@ -1607,8 +1601,7 @@ namespace lfs::training {
             const int selectable_growth = static_cast<int>(host_counts[2]);
             if (selectable_growth > 0) {
                 const int growth_budget = std::min(n_grow, selectable_growth);
-                growth_inds = sample_with_roi_share(growth_weights, growth_budget, seed + 1,
-                                                    static_cast<size_t>(selectable_growth));
+                growth_inds = sample_with_roi_share(growth_weights, growth_budget, seed + 1);
             }
         }
 
@@ -1773,6 +1766,7 @@ namespace lfs::training {
             }
 
             size_t append_start = 0;
+            Tensor filled;
             lfs::training::sh_value::ShNMutationBatch shn_batch(*_splat_data);
             if (free_count() > 0) {
                 auto [filled_indices, remaining_after_fill] = fill_free_slots_with_data(
@@ -1785,9 +1779,11 @@ namespace lfs::training {
                     static_cast<int64_t>(count),
                     &shn_batch);
                 append_start = count - static_cast<size_t>(remaining_after_fill);
+                filled = std::move(filled_indices);
             }
 
-            n_append += append_child_rows(
+            const size_t rows_before_append = static_cast<size_t>(_splat_data->size());
+            const size_t appended = append_child_rows(
                 child_means,
                 child_rotations,
                 child_log_scales,
@@ -1797,6 +1793,19 @@ namespace lfs::training {
                 append_start,
                 count,
                 &shn_batch);
+            n_append += appended;
+            if (_ray_depth_state.is_valid() && append_start + appended > 0) {
+                const Tensor child_rows = split_child_rows(filled, rows_before_append, appended);
+                const size_t inherited = append_start + appended;
+                const Tensor parents = chunk_indices.slice(0, 0, inherited).contiguous();
+                LFS_ASSERT_MSG(child_rows.ndim() == 1 && child_rows.numel() == inherited &&
+                                   child_rows.dtype() == DataType::Int64 &&
+                                   parents.ndim() == 1 && parents.numel() == inherited,
+                               "MRNF ray-depth inheritance needs one parent and one child row per split");
+                mrnf_strategy::launch_ray_depth_inherit(
+                    _ray_depth_state.ptr<float>(), parents.ptr<int64_t>(), child_rows.ptr<int64_t>(),
+                    inherited);
+            }
             clear_rendered_support(chunk_indices);
             shn_batch.flush();
             reused += append_start;
@@ -1809,25 +1818,21 @@ namespace lfs::training {
         const size_t n,
         const lfs::core::Tensor& active_mask,
         const lfs::core::Tensor& trainable_mask,
-        const lfs::core::Tensor& edge_guidance) const {
+        const mrnf_strategy::EdgeGuidance& edge_guidance) const {
         using namespace lfs::core;
 
-        auto opacities = _splat_data->get_opacity();
-        if (opacities.ndim() == 2 && opacities.shape()[1] == 1)
-            opacities = opacities.squeeze(-1);
+        const auto& raw_opacities = _splat_data->opacity_raw();
         const auto visibility = visibility_accumulator();
-        assert(opacities.ndim() == 1 && opacities.numel() == n);
+        assert(raw_opacities.is_contiguous() && raw_opacities.numel() == n);
         assert(visibility.ndim() == 1 && visibility.numel() == n);
         assert(!active_mask.is_valid() || (active_mask.ndim() == 1 && active_mask.numel() == n));
         assert(!trainable_mask.is_valid() || (trainable_mask.ndim() == 1 && trainable_mask.numel() == n));
-        assert(!edge_guidance.is_valid() || (edge_guidance.ndim() == 1 && edge_guidance.numel() == n));
         auto w_view = _densify_n_scratch.f32_a_view(n);
         mrnf_strategy::launch_replace_parent_weights(
-            opacities.ptr<float>(), visibility.ptr<float>(),
+            raw_opacities.ptr<float>(), visibility.ptr<float>(),
             active_mask.is_valid() ? active_mask.ptr<bool>() : nullptr,
             trainable_mask.is_valid() ? trainable_mask.ptr<bool>() : nullptr,
-            edge_guidance.is_valid() ? edge_guidance.ptr<float>() : nullptr,
-            w_view.ptr<float>(), n);
+            edge_guidance, w_view.ptr<float>(), n);
         return w_view;
     }
 
@@ -1881,6 +1886,7 @@ namespace lfs::training {
                     idx_i32.ptr<int>(), new_size, 0, layout_rest_u32);
             } else if (t.dtype() == DataType::UInt8 || t.dtype() == DataType::Bool) {
                 if (uint8_fill >= 0 && cap_floats > 0) {
+                    fresh.commit_rows(cap_floats);
                     const cudaError_t err = cudaMemsetAsync(
                         fresh.ptr<uint8_t>(),
                         static_cast<unsigned char>(uint8_fill),
@@ -2068,6 +2074,10 @@ namespace lfs::training {
         }
         if (_refine_weight_max.is_valid() && _refine_weight_max.numel() > new_size)
             compact(_refine_weight_max);
+        if (_ray_depth_state.is_valid() && _ray_depth_state.shape()[0] == old_size)
+            compact(_ray_depth_state);
+        else
+            _ray_depth_state = Tensor();
         if (_rendered_count.is_valid() && _rendered_count.numel() > new_size)
             compact(_rendered_count);
         if (_precomputed_edge_scores.is_valid() && _precomputed_edge_scores.numel() > new_size)
@@ -2118,6 +2128,7 @@ namespace lfs::training {
         remap_frozen_ranges_after_compaction(*_splat_data, valid_indices, old_size);
         apply_frozen_ranges_to_optimizer(*_splat_data, *_optimizer);
         ensure_mean_step_far_mask();
+        sync_ray_depth();
     }
 
     void MRNF::inject_noise(int iter) {
@@ -2205,24 +2216,9 @@ namespace lfs::training {
         }
 
         if (keep_budget > 0) {
-            if (!_refine_counts_dev.is_valid() || _refine_counts_dev.numel() < 4) {
-                _refine_counts_dev = Tensor::zeros({4}, Device::CUDA, DataType::Int64);
-            }
-            kernels::launch_packed_refine_counts(
-                nullptr, 0, nullptr, 0,
-                opacities.ptr<float>(), n,
-                nullptr, 0,
-                _refine_counts_dev.ptr<int64_t>());
-            int64_t host_counts[4] = {0, 0, 0, 0};
-            LFS_CUDA_CHECK_MSG(
-                cudaMemcpy(host_counts, _refine_counts_dev.ptr<int64_t>(),
-                           4 * sizeof(int64_t), cudaMemcpyDeviceToHost),
-                "MRNF enforce_max_cap nnz D2H");
             auto keep_indices = Tensor::empty({keep_budget}, Device::CUDA, DataType::Int64);
             mrnf_strategy::launch_gumbel_topk(
-                opacities.ptr<float>(), n, keep_budget, seed,
-                keep_indices.ptr<int64_t>(), nullptr, true, &_gumbel_scratch,
-                static_cast<size_t>(host_counts[2]));
+                opacities.ptr<float>(), n, keep_budget, seed, keep_indices.ptr<int64_t>());
 
             auto true_vals = Tensor::ones_bool({keep_budget}, opacities.device());
             keep_mask.index_put_(keep_indices, true_vals);
@@ -2241,9 +2237,8 @@ namespace lfs::training {
         if (current_size == 0)
             return 0;
 
-        auto active_region = _free_mask.slice(0, 0, current_size);
-        const size_t free_count_val = static_cast<size_t>(active_region.sum_scalar());
-        return current_size - free_count_val;
+        const auto active_region = _free_mask.slice(0, 0, current_size);
+        return current_size - active_region.count_nonzero();
     }
 
     size_t MRNF::free_count() const {
@@ -2255,8 +2250,8 @@ namespace lfs::training {
         if (current_size == 0)
             return 0;
 
-        auto active_region = _free_mask.slice(0, 0, current_size);
-        return static_cast<size_t>(active_region.sum_scalar());
+        const auto active_region = _free_mask.slice(0, 0, current_size);
+        return active_region.count_nonzero();
     }
 
     lfs::core::Tensor MRNF::get_active_indices() const {
@@ -2372,6 +2367,11 @@ namespace lfs::training {
         // Zero residual grads so the post-densify Adam step does not use
         // previous-occupant / pre-split gradients on rewritten rows.
         zero_adam_grads_at_indices(*_optimizer, target_indices, layout_rest);
+        if (_ray_depth_state.is_valid())
+            _ray_depth_state.index_put_(
+                target_indices,
+                Tensor::full({static_cast<size_t>(slots_to_fill), static_cast<size_t>(ray_depth::kStateStride)},
+                             ray_depth::kUnobserved, Device::CUDA));
 
         clear_rendered_support(target_indices);
         set_deleted_mask_rows(*_splat_data, _free_mask, target_indices, false);
@@ -2488,6 +2488,8 @@ namespace lfs::training {
             ensure(_rendered_count, DataType::Float32);
         ensure(_free_mask, DataType::Bool);
         ensure(_refine_weight_max, DataType::Float32);
+        if (_ray_depth_state.is_valid())
+            ensure_ray_depth_rows(target_size);
     }
 
     void MRNF::start_blob_seeding() {
@@ -2509,7 +2511,7 @@ namespace lfs::training {
                 if (stream) {
                     LFS_CUDA_LOG_TEARDOWN(cudaStreamSynchronize(stream), stream, "blob seeding: synchronize worker stream");
                     lfs::core::CudaMemoryPool::instance().release_stream(stream);
-                    LFS_CUDA_LOG_TEARDOWN(cudaStreamDestroy(stream), stream, "blob seeding: destroy worker stream");
+                    LFS_CUDA_LOG_STREAM_DESTROY(stream, "blob seeding: destroy worker stream");
                 }
                 promise.set_value(std::move(seeds));
             });
@@ -2528,7 +2530,7 @@ namespace lfs::training {
                                   ? std::min(static_cast<size_t>(std::max<int64_t>(0, int64_t{_params->max_cap} - static_cast<int64_t>(active_count()))),
                                              static_cast<size_t>(kBlobSeedCapacityFraction * _params->max_cap))
                                   : seeds.size();
-        const size_t count = std::min(seeds.size(), budget);
+        const size_t count = clamp_growth_to_vram(std::min(seeds.size(), budget), *_splat_data, _optimizer.get());
         if (count == 0) {
             return;
         }
@@ -2661,7 +2663,41 @@ namespace lfs::training {
         sync_mean_learning_rate();
     }
 
+    void MRNF::sync_ray_depth() {
+        if (!_optimizer || !_splat_data)
+            return;
+        const bool on = _params && _params->ray_depth_lr > 0.0f && _params->means_lr > 0.0f;
+        if (!on) {
+            _ray_depth_state = lfs::core::Tensor();
+            _optimizer->set_ray_depth({}, 0.0f);
+            return;
+        }
+        ensure_ray_depth_rows(static_cast<size_t>(_splat_data->size()));
+    }
+
+    // Sizes the rows to n (new rows unobserved) and hands them to the optimizer with the
+    // current bound, which decays with the position learning rate.
+    void MRNF::ensure_ray_depth_rows(const size_t n) {
+        using namespace lfs::core;
+        constexpr size_t stride = static_cast<size_t>(ray_depth::kStateStride);
+        const size_t reserved = std::max(n, splat_reserved_capacity(*_splat_data));
+        auto& state = _ray_depth_state;
+        if (!state.is_valid() || state.ndim() != 2 || state.shape()[1] != stride ||
+            state.device() != Device::CUDA || state.shape()[0] > n) {
+            state = Tensor::zeros_direct(TensorShape({n, stride}), reserved, Device::CUDA, DataType::Float32);
+            state.fill_(ray_depth::kUnobserved);
+        } else if (const size_t rows = state.shape()[0]; rows < n) {
+            if (state.capacity() < reserved)
+                grow_tensor_preserving_prefix(state, reserved);
+            state.append_zeros(n - rows);
+            state.slice(0, rows, n).fill_(ray_depth::kUnobserved);
+        }
+        const double decay = _mean_lr_unscaled / static_cast<double>(_params->means_lr);
+        _optimizer->set_ray_depth(state, static_cast<float>(_params->ray_depth_lr * decay));
+    }
+
     void MRNF::sync_mean_learning_rate() {
+        sync_ray_depth();
         if (!_optimizer || !_bounds_valid)
             return;
         _optimizer->set_param_lr(ParamType::Means, _mean_lr_unscaled * _bounds.median_size);
@@ -2749,7 +2785,7 @@ namespace lfs::training {
         }
     }
 
-    lfs::core::Tensor MRNF::edge_guidance_factor() {
+    mrnf_strategy::EdgeGuidance MRNF::edge_guidance() {
         if (_topology_frozen || !_params || !_params->use_edge_map || !_edge_precompute_valid) {
             return {};
         }
@@ -2761,8 +2797,12 @@ namespace lfs::training {
             return {};
         }
 
-        auto normalized_edge = normalized_by_positive_median(_precomputed_edge_scores);
-        return normalized_edge.mul(MRNF_EDGE_SCORE_WEIGHT).add(1.0f);
+        return {
+            .scores = _precomputed_edge_scores.ptr<float>(),
+            .median = kernels::launch_select_positive_median(_precomputed_edge_scores.ptr<float>(), n,
+                                                             _precomputed_edge_scores.stream()),
+            .weight = MRNF_EDGE_SCORE_WEIGHT,
+        };
     }
 
     namespace {
@@ -2804,6 +2844,7 @@ namespace lfs::training {
 
     void MRNF::deserialize(std::istream& is) {
         cancel_blob_seeding();
+        _ray_depth_state = lfs::core::Tensor();
         // Growth exchange importance is transient: after a resume it warms up again.
         reset_exchange_state();
         uint32_t magic = 0, version = 0;
@@ -2958,6 +2999,8 @@ namespace lfs::training {
         std::swap(_scale_lr_current, source._scale_lr_current);
         std::swap(_mean_lr_gamma, source._mean_lr_gamma);
         std::swap(_scale_lr_gamma, source._scale_lr_gamma);
+        _ray_depth_state = lfs::core::Tensor();
+        sync_ray_depth();
         publish_vram_attribution();
     }
 
@@ -2973,7 +3016,7 @@ namespace lfs::training {
         const bool support_changed = !_params || _params->opacity_decay_rendered_only != params.opacity_decay_rendered_only;
         auto resolved_params = params;
         resolved_params.resolve_mrnf_capacity_defaults();
-        _params = std::make_unique<const lfs::core::param::OptimizationParameters>(std::move(resolved_params));
+        _params = std::make_unique<const lfs::core::param::OptimizationParameters>(with_noise_outside_cap(resolved_params, _splat_data));
         if (renderer_changed)
             reset_exchange_state();
         if ((support_changed || renderer_changed) && params.gut && params.opacity_decay_rendered_only)
@@ -3006,6 +3049,14 @@ namespace lfs::training {
             _optimizer->set_param_lr(ParamType::Scaling, _scale_lr_current);
             sync_mean_learning_rate();
         }
+    }
+
+    void MRNF::restart_mean_lr() {
+        if (!_params)
+            return;
+        _mean_lr_unscaled = _params->means_lr;
+        refresh_decay_schedule_from_current_state();
+        sync_mean_learning_rate();
     }
 
     void MRNF::refresh_decay_schedule_from_current_state() {

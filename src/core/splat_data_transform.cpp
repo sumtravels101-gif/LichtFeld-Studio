@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <format>
 #include <glm/gtc/matrix_transform.hpp>
@@ -759,6 +760,36 @@ namespace lfs::core {
         return splat_data.soft_delete(delete_mask);
     }
 
+    std::optional<NoiseInfillRange> find_noise_infill(const SplatData& model) {
+        for (const auto& range : model.frozen_ranges()) {
+            if (range.start != 0 || range.count == 0)
+                continue;
+            const float opacity = model.opacity_raw().slice(0, 0, 1).item<float>();
+            if (opacity == kHiddenOpacity || opacity == kShownNoiseOpacity)
+                return NoiseInfillRange{range.count, opacity == kHiddenOpacity};
+        }
+        return std::nullopt;
+    }
+
+    std::size_t noise_infill_rows(const SplatData& model) {
+        const auto noise = find_noise_infill(model);
+        return noise ? noise->count : 0;
+    }
+
+    std::optional<SplatData> without_noise_infill(const SplatData& model) {
+        const std::size_t noise_rows = noise_infill_rows(model);
+        if (noise_rows == 0)
+            return std::nullopt;
+        const auto rows = static_cast<std::size_t>(model.size());
+        assert(noise_rows <= rows);
+        std::vector<bool> keep(rows, true);
+        std::fill_n(keep.begin(), noise_rows, false);
+        auto keep_mask = Tensor::from_vector(keep, TensorShape({rows}), model.means().device());
+        if (model.deleted_mask_matches_size())
+            keep_mask = keep_mask.logical_and(model.deleted().logical_not());
+        return extract_by_mask(model, keep_mask);
+    }
+
     void random_choose(SplatData& splat_data, int num_required_splat, int seed) {
         LOG_TIMER("random_choose");
 
@@ -835,6 +866,8 @@ namespace lfs::core {
                 }
                 selected_indices.push_back(idx);
             }
+            // In their order, so each frozen range stays whole and keeps its place among the others.
+            std::ranges::sort(selected_indices);
         }
 
         auto indices_tensor = Tensor::from_vector(
@@ -980,6 +1013,33 @@ namespace lfs::core {
         const auto& means = splat_data.means();
         if (!means.is_valid() || means.size(0) == 0) {
             return false;
+        }
+
+        const auto& deleted = splat_data.deleted();
+        const bool masked = splat_data.has_deleted_mask();
+        if (!use_percentile && means.device() == Device::CUDA && means.dtype() == DataType::Float32 &&
+            means.is_contiguous() && (!masked || (deleted.is_contiguous() && deleted.numel() >= means.size(0)))) {
+            // Reduce in place: an index list plus a gathered copy cost 20 bytes per
+            // Gaussian, which a viewport pick cannot take from a training run at the
+            // VRAM limit.
+            const auto stream = means.stream();
+            means.sync_to_stream(stream);
+            if (masked)
+                deleted.sync_to_stream(stream);
+            auto scratch = Tensor::empty({6}, Device::CUDA, DataType::UInt32);
+            scratch.set_stream(stream);
+            float lo[3], hi[3];
+            const bool found = cuda::splat_position_bounds(
+                means.ptr<float>(), masked ? deleted.ptr<uint8_t>() : nullptr, static_cast<std::size_t>(means.size(0)),
+                scratch.ptr<uint32_t>(), lo, hi, stream);
+            scratch.record_stream(stream);
+            if (!found)
+                return false;
+            for (int i = 0; i < 3; ++i) {
+                min_bounds[i] = lo[i] - padding;
+                max_bounds[i] = hi[i] + padding;
+            }
+            return true;
         }
 
         // Filter deleted gaussians (index_select preserves [N,3] shape)

@@ -85,14 +85,29 @@ namespace {
 
     struct PreviewTextureRequest {
         std::filesystem::path path;
+        std::string memory_key;
         int max_size = 0;
         int width = 0;
         int height = 0;
         bool embedded_project_preview = false;
+        bool mask_overlay = false;
     };
 
     bool IsPreviewTextureSource(std::string_view source) {
         return source.rfind("preview://", 0) == 0;
+    }
+
+    void PremultiplyImagePixels(unsigned char* pixels, const std::size_t count, const bool grayscale_coverage) {
+        for (std::size_t i = 0; i < count; ++i) {
+            auto* pixel = pixels + i * 4;
+            if (grayscale_coverage) {
+                pixel[1] = pixel[2] = pixel[3] = pixel[0];
+            } else {
+                const unsigned int alpha = pixel[3];
+                for (int c = 0; c < 3; ++c)
+                    pixel[c] = static_cast<unsigned char>((pixel[c] * alpha + 127) / 255);
+            }
+        }
     }
 
     bool IsLfsVkTextureSource(std::string_view source) {
@@ -210,8 +225,12 @@ namespace {
                 const std::string_view value = part.substr(eq + 1);
                 if (key == "path") {
                     request.path = lfs::core::utf8_to_path(PercentDecode(value));
+                } else if (key == "memory") {
+                    request.memory_key = PercentDecode(value);
                 } else if (key == "kind") {
                     request.embedded_project_preview = value == "licht";
+                } else if (key == "mode") {
+                    request.mask_overlay = value == "mask";
                 } else if (key == "thumb") {
                     thumb_size = ParseIntParam(value);
                 } else if (key == "pmw") {
@@ -230,10 +249,12 @@ namespace {
             source.remove_prefix(sep + 1);
         }
 
-        if (request.path.empty())
+        if (request.path.empty() == request.memory_key.empty())
             return std::nullopt;
 
         request.max_size = thumb_size > 0 ? thumb_size : (preview_size > 0 ? preview_size : dataset_size);
+        if (!request.memory_key.empty() && (!request.mask_overlay || request.embedded_project_preview || request.max_size <= 0))
+            return std::nullopt;
         return request;
     }
 
@@ -997,29 +1018,7 @@ Rml::TextureHandle RenderInterface_VK::LoadTexture(Rml::Vector2i& texture_dimens
             lfs::core::stb_file::stb_info(lfs::core::utf8_to_path(path), &probe_w, &probe_h, &probe_channels) &&
             probe_channels == 1;
 
-        const int pixel_count = width * height;
-        if (is_single_channel) {
-            // Mask: the gray value becomes the alpha. RGB is set to the same value so
-            // the texture is premultiplied (matching the non-mask branch below and the
-            // backend's premultiplied-alpha blend), which keeps alpha==0 pixels fully
-            // transparent instead of adding their color over the image.
-            for (int i = 0; i < pixel_count; ++i) {
-                unsigned char* p = data + i * 4;
-                const unsigned char gray = p[0];
-                p[0] = gray;
-                p[1] = gray;
-                p[2] = gray;
-                p[3] = gray;
-            }
-        } else {
-            for (int i = 0; i < pixel_count; ++i) {
-                unsigned char* p = data + i * 4;
-                const unsigned int alpha = p[3];
-                p[0] = static_cast<unsigned char>((p[0] * alpha + 127) / 255);
-                p[1] = static_cast<unsigned char>((p[1] * alpha + 127) / 255);
-                p[2] = static_cast<unsigned char>((p[2] * alpha + 127) / 255);
-            }
-        }
+        PremultiplyImagePixels(data, static_cast<std::size_t>(width) * height, is_single_channel);
 
         const size_t image_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
         const Rml::TextureHandle handle = CreateTexture({data, image_size}, texture_dimensions, path);
@@ -1165,6 +1164,9 @@ Rml::TextureHandle RenderInterface_VK::LoadAsyncPreviewTexture(Rml::Vector2i& te
     if (!texture)
         return 0;
     texture->m_is_async_preview = true;
+    texture->m_preview_source = source;
+    texture->m_preview_status = PreviewTextureStatus::Pending;
+    m_preview_textures_by_source[source] = texture;
 
     auto state = std::make_shared<async_preview_state_t>();
     state->texture = texture;
@@ -1172,16 +1174,27 @@ Rml::TextureHandle RenderInterface_VK::LoadAsyncPreviewTexture(Rml::Vector2i& te
     m_async_preview_textures.push_back(state);
 
     try {
+        const bool memory_preview = !request->memory_key.empty();
+        const auto encoded = memory_preview && m_preview_memory_provider
+                                 ? m_preview_memory_provider(request->memory_key)
+                                 : std::weak_ptr<const std::vector<std::byte>>{};
         EnsurePreviewWorkerPool();
         EnqueuePreviewWork(preview_work_t{
-            state, request->path, request->max_size, request->embedded_project_preview});
+            state, request->path, request->max_size, request->embedded_project_preview, request->mask_overlay,
+            encoded});
     } catch (const std::exception& e) {
         LOG_WARN("Failed to queue async preview texture worker for '{}': {}",
                  lfs::core::path_to_utf8(request->path), e.what());
         DropAsyncPreviewTexture(texture);
+        texture->m_preview_status = PreviewTextureStatus::Error;
     }
 
     return handle;
+}
+
+RenderInterface_VK::PreviewTextureStatus RenderInterface_VK::previewTextureStatus(const std::string& source) const {
+    const auto it = m_preview_textures_by_source.find(source);
+    return it == m_preview_textures_by_source.end() ? PreviewTextureStatus::Unknown : it->second->m_preview_status;
 }
 
 void RenderInterface_VK::EnsurePreviewWorkerPool() {
@@ -1206,8 +1219,8 @@ void RenderInterface_VK::EnsurePreviewWorkerPool() {
                 }
                 if (!work.state || work.state->cancelled.load(std::memory_order_acquire))
                     continue;
-                auto result = DecodePreviewTexture(
-                    std::move(work.path), work.max_size, work.embedded_project_preview);
+                const auto encoded = work.encoded.lock();
+                auto result = DecodePreviewTexture(std::move(work.path), work.max_size, work.embedded_project_preview, work.mask_overlay, encoded);
                 if (work.state->cancelled.load(std::memory_order_acquire))
                     continue;
                 {
@@ -1248,15 +1261,32 @@ void RenderInterface_VK::StopPreviewWorkerPool() noexcept {
 RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewTexture(
     std::filesystem::path path,
     const int max_size,
-    const bool embedded_project_preview) {
+    const bool embedded_project_preview,
+    const bool mask_overlay,
+    std::shared_ptr<const std::vector<std::byte>> encoded) {
     async_preview_result_t result;
+    // Memory-preview URLs have no file path. A revoked weak payload must not
+    // fall through to a file decode or become a persistent decode error.
+    if (path.empty() && mask_overlay && !encoded) {
+        result.expired = true;
+        return result;
+    }
     unsigned char* data = nullptr;
     try {
         int width = 0;
         int height = 0;
         int channels = 0;
+        bool premultiplied_alpha = false;
         unsigned char* pixels = nullptr;
-        if (embedded_project_preview) {
+        if (encoded) {
+            std::tie(pixels, width, height, channels) = lfs::core::load_image_from_memory(
+                reinterpret_cast<const std::uint8_t*>(encoded->data()), encoded->size());
+            if (pixels && mask_overlay) {
+                // The shared codec expands grayscale PNGs to RGB. Convert their
+                // coverage to RGBA below, using the same sampling as file masks.
+                premultiplied_alpha = true;
+            }
+        } else if (embedded_project_preview) {
             auto reader = lfs::io::project::ProjectReader::open(path);
             if (!reader) {
                 // A catalog entry can outlive its file until the catalog marks it missing.
@@ -1276,6 +1306,16 @@ RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewText
             const auto* bytes = reinterpret_cast<const std::uint8_t*>(preview->data());
             std::tie(pixels, width, height, channels) =
                 lfs::core::load_image_from_memory(bytes, preview->size());
+        } else if (mask_overlay) {
+            int source_channels = 0;
+            pixels = lfs::core::stb_file::stb_load(path, &width, &height, &source_channels, 4);
+            channels = 4;
+            if (pixels) {
+                // Match ordinary mask textures and interpolate premultiplied
+                // colors, so transparent pixels do not bleed when downscaled.
+                PremultiplyImagePixels(pixels, static_cast<std::size_t>(width) * height, source_channels == 1);
+                premultiplied_alpha = true;
+            }
         } else {
             std::tie(pixels, width, height, channels) =
                 lfs::core::load_image_thumbnail(path, max_size);
@@ -1284,7 +1324,7 @@ RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewText
         if (pixels && width > 0 && height > 0 && channels > 0) {
             int output_width = width;
             int output_height = height;
-            if (embedded_project_preview && max_size > 0 &&
+            if ((embedded_project_preview || mask_overlay) && max_size > 0 &&
                 std::max(width, height) > max_size) {
                 const double scale = static_cast<double>(max_size) /
                                      static_cast<double>(std::max(width, height));
@@ -1317,18 +1357,19 @@ RenderInterface_VK::async_preview_result_t RenderInterface_VK::DecodePreviewText
                     const unsigned char r = static_cast<unsigned char>(std::lround(sample(source_x, source_y, 0)));
                     const unsigned char g = static_cast<unsigned char>(std::lround(sample(source_x, source_y, channels > 1 ? 1 : 0)));
                     const unsigned char b = static_cast<unsigned char>(std::lround(sample(source_x, source_y, channels > 2 ? 2 : 0)));
-                    const unsigned char a = channels > 3 ? static_cast<unsigned char>(std::lround(sample(source_x, source_y, 3))) : 255;
+                    const unsigned char a = encoded && mask_overlay ? r : channels > 3 ? static_cast<unsigned char>(std::lround(sample(source_x, source_y, 3)))
+                                                                                       : 255;
                     Rml::byte* dst = result.pixels.data() +
                                      (static_cast<std::size_t>(y) *
                                           static_cast<std::size_t>(output_width) +
                                       static_cast<std::size_t>(x)) *
                                          4u;
                     dst[0] = static_cast<Rml::byte>(
-                        (static_cast<unsigned int>(r) * a + 127u) / 255u);
+                        premultiplied_alpha ? r : (static_cast<unsigned int>(r) * a + 127u) / 255u);
                     dst[1] = static_cast<Rml::byte>(
-                        (static_cast<unsigned int>(g) * a + 127u) / 255u);
+                        premultiplied_alpha ? g : (static_cast<unsigned int>(g) * a + 127u) / 255u);
                     dst[2] = static_cast<Rml::byte>(
-                        (static_cast<unsigned int>(b) * a + 127u) / 255u);
+                        premultiplied_alpha ? b : (static_cast<unsigned int>(b) * a + 127u) / 255u);
                     dst[3] = static_cast<Rml::byte>(a);
                 }
             }
@@ -1395,19 +1436,27 @@ void RenderInterface_VK::ProcessAsyncPreviewUploads() {
             result = std::move(state->result);
         }
 
-        if (!result.pixels.empty() && result.width > 0 && result.height > 0) {
+        if (result.expired) {
+            state->texture->m_preview_status = PreviewTextureStatus::Unknown;
+        } else if (!result.pixels.empty() && result.width > 0 && result.height > 0) {
             Rml::Vector2i dimensions{result.width, result.height};
             const Rml::TextureHandle replacement_handle = CreateTexture({result.pixels.data(), result.pixels.size()}, dimensions, state->source);
             auto* replacement = reinterpret_cast<texture_data_t*>(replacement_handle);
             if (replacement) {
                 replacement->m_is_async_preview = true;
+                replacement->m_preview_source = state->source;
+                replacement->m_preview_status = PreviewTextureStatus::Ready;
                 QueueTextureForDeferredDeletion(new texture_data_t(*state->texture));
                 *state->texture = *replacement;
                 UnregisterLiveTexture(replacement);
                 delete replacement;
                 --uploads_remaining;
                 uploaded_any = true;
+            } else {
+                state->texture->m_preview_status = PreviewTextureStatus::Error;
             }
+        } else {
+            state->texture->m_preview_status = PreviewTextureStatus::Error;
         }
 
         it = m_async_preview_textures.erase(it);
@@ -2686,6 +2735,7 @@ void RenderInterface_VK::Destroy_Textures() noexcept {
 void RenderInterface_VK::Destroy_LiveTextures() noexcept {
     auto live_textures = std::move(m_live_textures);
     m_live_textures.clear();
+    m_preview_textures_by_source.clear();
 
     for (texture_data_t* texture : live_textures) {
         if (!texture)
@@ -2701,8 +2751,12 @@ void RenderInterface_VK::RegisterLiveTexture(texture_data_t* texture) {
 }
 
 void RenderInterface_VK::UnregisterLiveTexture(texture_data_t* texture) {
-    if (texture)
+    if (texture) {
+        const auto it = m_preview_textures_by_source.find(texture->m_preview_source);
+        if (it != m_preview_textures_by_source.end() && it->second == texture)
+            m_preview_textures_by_source.erase(it);
         m_live_textures.erase(texture);
+    }
 }
 
 uint32_t RenderInterface_VK::ActiveResourceSlot() const noexcept {

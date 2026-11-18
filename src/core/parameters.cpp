@@ -10,6 +10,7 @@
 #include "core/path_utils.hpp"
 #include "core/property_registry.hpp"
 #include "io/project_path.hpp"
+#include <algorithm>
 #include <any>
 #include <array>
 #include <cassert>
@@ -563,30 +564,68 @@ namespace lfs::core {
             }
         } // namespace
 
-        void OptimizationParameters::scale_steps(const float ratio) {
-            const auto apply = [ratio](const size_t v) {
-                return static_cast<size_t>(std::lround(static_cast<float>(v) * ratio));
-            };
-            // Intervals must stay at least one step, or a short --iter run fails validation.
-            const auto apply_interval = [&apply](const size_t v) { return std::max<size_t>(1, apply(v)); };
-            iterations = apply(iterations);
-            start_refine = apply(start_refine);
-            stop_refine = apply(stop_refine);
-            reset_every = apply_interval(reset_every);
-            refine_every = apply_interval(refine_every);
-            morton_reorder_interval = apply(morton_reorder_interval);
-            sh_degree_interval = apply_interval(sh_degree_interval);
-            grow_until_iter = apply(grow_until_iter);
-            color_variance_warmup_iters = apply(color_variance_warmup_iters);
-
-            for (auto* steps : {&eval_steps, &save_steps}) {
-                std::set<size_t> unique;
-                for (const auto s : *steps) {
-                    if (const size_t scaled = apply(s); scaled > 0)
-                        unique.insert(scaled);
+        namespace {
+            template <typename Scale>
+            void scale_schedule(OptimizationParameters& p, Scale scale) {
+                const auto interval = [&](size_t v) { return std::max<size_t>(1, scale(v)); };
+                p.iterations = scale(p.iterations);
+                p.start_refine = scale(p.start_refine);
+                p.stop_refine = scale(p.stop_refine);
+                p.reset_every = interval(p.reset_every);
+                p.refine_every = interval(p.refine_every);
+                p.morton_reorder_interval = scale(p.morton_reorder_interval);
+                p.sh_degree_interval = interval(p.sh_degree_interval);
+                p.grow_until_iter = scale(p.grow_until_iter);
+                p.color_variance_warmup_iters = scale(p.color_variance_warmup_iters);
+                for (auto* steps : {&p.eval_steps, &p.save_steps}) {
+                    std::set<size_t> unique;
+                    for (const size_t step : *steps) {
+                        if (const size_t scaled = scale(step); scaled > 0)
+                            unique.insert(scaled);
+                    }
+                    steps->assign(unique.begin(), unique.end());
                 }
-                steps->assign(unique.begin(), unique.end());
             }
+        } // namespace
+
+        void OptimizationParameters::scale_steps(const float ratio) {
+            scale_schedule(*this, [ratio](const size_t step) {
+                const float product = static_cast<float>(step) * ratio;
+                if (!std::isfinite(product) || product >= 0x1p63f || product < -0x1p63f)
+                    return std::numeric_limits<size_t>::max();
+                return static_cast<size_t>(std::llround(product));
+            });
+        }
+
+        OptimizationParameters OptimizationParameters::scaled_to_iterations(const size_t target) const {
+            constexpr uint64_t limit = std::numeric_limits<int>::max();
+            if (!iterations || iterations > limit || !target || target > limit)
+                throw std::invalid_argument("Iteration count is outside the trainer range");
+            const float previous_factor = steps_scaler > 0.0f ? steps_scaler : 1.0f;
+            const double factor = previous_factor * (static_cast<double>(target) / iterations);
+            if (!std::isfinite(factor) || factor > std::numeric_limits<float>::max())
+                throw std::invalid_argument("Step scaling factor is outside the supported range");
+            auto scaled = *this;
+            scaled.steps_scaler = static_cast<float>(factor);
+            const float legacy_ratio = scaled.steps_scaler / previous_factor;
+            const uint64_t half = iterations / 2;
+            // Largest input whose rounded product still fits a signed trainer step.
+            const uint64_t last_reachable = ((limit + 1) * iterations - 1 - half) / target;
+            const auto unreachable = [&](size_t step) { return step > last_reachable; };
+            std::erase_if(scaled.eval_steps, unreachable);
+            std::erase_if(scaled.save_steps, unreachable);
+            scale_schedule(scaled, [&](const size_t step) {
+                if (unreachable(step))
+                    throw std::invalid_argument("Scaled step exceeds the trainer limit");
+                if (step == iterations)
+                    return target;
+                const uint64_t value = (static_cast<uint64_t>(step) * target + half) / iterations;
+                constexpr size_t consecutive_float_integers = size_t{1} << std::numeric_limits<float>::digits;
+                if (std::max({iterations, target, step}) <= consecutive_float_integers && value <= consecutive_float_integers)
+                    return static_cast<size_t>(std::llround(static_cast<float>(step) * legacy_ratio));
+                return static_cast<size_t>(value);
+            });
+            return scaled;
         }
 
         float OptimizationParameters::color_variance_weight_at(const int iteration) const {
@@ -618,7 +657,10 @@ namespace lfs::core {
         bool OptimizationParameters::normal_supervision_active(const int iter) const {
             if (!use_normal_loss)
                 return false;
-            const float total_f = static_cast<float>(std::max(1, resolved_total_iterations()));
+            const int total = std::max(1, resolved_total_iterations());
+            if (normal_start_fraction == 1.0f)
+                return iter >= total;
+            const float total_f = static_cast<float>(total);
             const int start_iter = static_cast<int>(normal_start_fraction * total_f);
             if (iter < start_iter)
                 return false;
@@ -651,8 +693,8 @@ namespace lfs::core {
                 return ppisp_controller_activation_step;
 
             const float clamped_scaler = std::max(steps_scaler, 1.0f);
-            const int tail_iters = static_cast<int>(std::lround(5000.0f * clamped_scaler));
-            return std::max(0, total_iterations - tail_iters);
+            const double tail = std::round(static_cast<double>(5000.0f * clamped_scaler));
+            return tail >= total_iterations ? 0 : total_iterations - static_cast<int>(tail);
         }
 
         bool is_eval_mask_box(const std::string_view spec) {
@@ -759,6 +801,20 @@ namespace lfs::core {
             if (!range || !((*range)[0] >= 0.0f) || !((*range)[0] < (*range)[1]))
                 return std::nullopt;
             return range;
+        }
+
+        std::optional<std::string_view> eval_mask_mesh_file(const std::string_view spec) {
+            if (spec.empty() || spec == "none" || is_eval_mask_box(spec) || is_eval_mask_cropbox(spec) || is_eval_mask_folder(spec) ||
+                is_eval_mask_depth(spec) || is_eval_mask_points(spec) || eval_mask_points_file(spec) ||
+                eval_mask_splat_file(spec))
+                return std::nullopt;
+            return spec.starts_with("mesh:") ? spec.substr(5) : spec;
+        }
+
+        std::optional<std::string_view> eval_green_infill_mesh(const OptimizationParameters& params) {
+            if (!params.noise_infill_mesh.empty())
+                return std::string_view{params.noise_infill_mesh};
+            return eval_mask_mesh_file(params.eval_mask);
         }
 
         std::string normalize_eval_mask(const std::string_view spec) {
@@ -892,6 +948,10 @@ namespace lfs::core {
             }
             if (iterations == 0 || iterations > MAX_ITERATION_VALUE)
                 return std::format("iterations must be within [1, {}] (got {})", MAX_ITERATION_VALUE, iterations);
+            for (const auto* steps : {&eval_steps, &save_steps}) {
+                if (std::ranges::find(*steps, std::numeric_limits<size_t>::max()) != steps->end())
+                    return "Evaluation and save steps must fit the supported step range";
+            }
             if (refine_every == 0 || refine_every > MAX_ITERATION_VALUE)
                 return std::format("refine_every must be within [1, {}] (got {})", MAX_ITERATION_VALUE, refine_every);
             if (morton_reorder_interval > MAX_ITERATION_VALUE)
@@ -1001,6 +1061,7 @@ namespace lfs::core {
             const std::array nonnegative_fields{
                 std::pair{"means_lr", means_lr},
                 std::pair{"means_lr_end", means_lr_end},
+                std::pair{"ray_depth_lr", ray_depth_lr},
                 std::pair{"shs_lr", shs_lr},
                 std::pair{"opacity_lr", opacity_lr},
                 std::pair{"scaling_lr", scaling_lr},
@@ -1067,6 +1128,9 @@ namespace lfs::core {
                                    bilateral_grid_X, bilateral_grid_Y, bilateral_grid_W);
             if (gut && canonical_strategy_name(strategy) == kStrategyIGSPlus)
                 return "GUT and igs+ strategy cannot be used together";
+            if (gut && pose_opt)
+                return "pose_opt needs the standard rasterizer and cannot be combined with GUT "
+                       "(train distorted cameras with --undistort instead)";
             if (use_exposure_correction &&
                 (use_bilateral_grid || use_ppisp || ppisp_use_controller || ppisp_freeze_from_sidecar)) {
                 return "use_exposure_correction cannot be combined with use_bilateral_grid, "
@@ -1189,18 +1253,22 @@ namespace lfs::core {
                         *resume_project);
                 }
             }
-            if (save_project_at_iteration && *save_project_at_iteration == 0) {
+            if (std::ranges::contains(save_project_at_iteration, size_t{0})) {
                 return "--save-project-at-iter must be positive";
             }
             const auto project_snapshot_limit = optimization.enable_sparsity
                                                     ? static_cast<size_t>(optimization.resolved_total_iterations())
                                                     : optimization.iterations;
-            if (save_project_at_iteration && *save_project_at_iteration > project_snapshot_limit) {
+            if (!save_project_at_iteration.empty() &&
+                std::ranges::max(save_project_at_iteration) > project_snapshot_limit) {
                 return "--save-project-at-iter cannot exceed the training iteration limit";
             }
-            if (!save_project_at_iteration &&
+            if (save_project_at_iteration.empty() &&
                 !save_project_path.empty()) {
                 return "--save-project-path requires --save-project-at-iter";
+            }
+            if (save_project_at_iteration.size() > 1 && save_project_path.empty()) {
+                return "Several --save-project-at-iter iterations require --save-project-path";
             }
             if (!save_project_path.empty() &&
                 save_project_path.extension() != ".licht") {
@@ -1695,14 +1763,14 @@ namespace lfs::core {
             DatasetConfig dataset;
 
             // Use utf8_to_path for proper Unicode handling since JSON is UTF-8 encoded
-            dataset.data_path = utf8_to_path(j["data_path"].get<std::string>());
-            dataset.images = j["images"].get<std::string>();
-            dataset.resize_factor = j["resize_factor"].get<int>();
-            dataset.max_width = j["max_width"].get<int>();
+            dataset.data_path = utf8_to_path(j.at("data_path").get<std::string>());
+            dataset.images = j.at("images").get<std::string>();
+            dataset.resize_factor = j.at("resize_factor").get<int>();
+            dataset.max_width = j.at("max_width").get<int>();
             if (j.contains("min_track_length")) {
                 dataset.min_track_length = j["min_track_length"].get<int>();
             }
-            dataset.test_every = j["test_every"].get<int>();
+            dataset.test_every = j.at("test_every").get<int>();
             if (j.contains("timelapse_images")) {
                 dataset.timelapse_images =
                     j["timelapse_images"]
@@ -1712,7 +1780,7 @@ namespace lfs::core {
                 dataset.timelapse_every =
                     j["timelapse_every"].get<int>();
             }
-            dataset.output_path = utf8_to_path(j["output_folder"].get<std::string>());
+            dataset.output_path = utf8_to_path(j.at("output_folder").get<std::string>());
 
             if (j.contains("output_name")) {
                 dataset.output_name = j["output_name"].get<std::string>();

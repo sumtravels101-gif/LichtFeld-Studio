@@ -87,6 +87,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/native_panels.cpp
         gui/layout_state.cpp
         gui/async_task_manager.cpp
+        gui/assisted_masking.cpp
         gui/gallery_scene_publication.cpp
         gui/bounds_gizmo.cpp
         gui/rotation_gizmo.cpp
@@ -244,12 +245,13 @@ target_include_directories(lfs_visualizer
 find_package(OpenXR CONFIG REQUIRED)
 
 target_link_libraries(lfs_visualizer
+        PUBLIC
+        lfs_preprocessing
         PRIVATE
         lfs_core
         lfs_diagnostics
         lfs_video
         lfs_geometry
-        lfs_preprocessing
         lfs_io
         lfs_rendering_tensor
         lfs_training
@@ -349,7 +351,8 @@ compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_wireframe.
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_wireframe.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_wireframe.frag.spv.h" kMeshWireframeFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/environment.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/environment.frag.spv.h" kEnvironmentFragSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/depth_blit.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/depth_blit.frag.spv.h" kDepthBlitFragSpv)
-compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/split_view.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/split_view.frag.spv.h" kSplitViewFragSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/split_view.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/split_view.frag.spv.h" kSplitViewFragSpv
+    "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/shader/src/slang/gt_loss_heatmap.inc")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/vksplat_compose.comp" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/vksplat_compose.comp.spv.h" kVkSplatComposeCompSpv
     "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/shader/src/slang/display_color.inc")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/point_cloud.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/point_cloud.vert.spv.h" kPointCloudVertSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")

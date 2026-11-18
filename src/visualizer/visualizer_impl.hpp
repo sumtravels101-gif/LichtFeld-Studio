@@ -113,7 +113,7 @@ namespace lfs::vis {
         }
         void setShutdownRequestedCallback(std::function<void()> callback) override;
         void set_evaluation_weights_preparer(
-            std::function<std::optional<std::filesystem::path>(bool allow_download)> preparer) override;
+            std::function<std::optional<core::nn::WeightFile>(bool allow_download)> preparer) override;
         std::expected<void, std::string> startTraining() override;
         [[nodiscard]] bool isTrainingStartPending() const {
             return project_lifecycle_ && project_lifecycle_->isTrainingStartPending();
@@ -191,11 +191,13 @@ namespace lfs::vis {
             std::string expected_project_uuid = {}) override;
         lfs::Result<ProjectWritePoll>
         projectPollWrite() override;
+        lfs::Result<void> applyCameraMask(const lfs::core::Uuid& camera_uuid, const std::filesystem::path& image, std::shared_ptr<const std::vector<std::byte>> png, int mask_width, int mask_height) override;
         lfs::Result<ProjectTrainingSource>
         projectTrainingSource() override;
         bool consumeProjectSaveStarted() override;
         bool consumeProjectCreateSucceeded() override;
         bool projectCreatePending() const override;
+        [[nodiscard]] bool projectOpenPending() const override;
         void projectWaitWrite() override;
         lfs::Result<ProjectMenuInfo>
         projectGetMenuInfo() override;
@@ -326,6 +328,7 @@ namespace lfs::vis {
         friend class AlignDepthIntegrationTest;
         friend class gui::GuiManager;
         friend class project::ProjectLifecycle;
+        friend class CollisionProjectOpenTest;
         friend void installSessionTestInputController(VisualizerImpl& viewer);
         friend class VisualizerImplResetTest_AprilTagJobShutdownSettlesPendingRequestWaiter_Test;
         friend class VisualizerImplResetTest_DirectSplatLoadRejectsActiveTrainingWithoutConsent_Test;

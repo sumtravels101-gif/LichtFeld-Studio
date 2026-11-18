@@ -30,6 +30,14 @@ namespace gsplat_lfs {
         cudaStream_t stream = nullptr,
         const float* sh_value_bounds = nullptr);
 
+    // Optimizer gradients the SH backward adds into, instead of writing a
+    // canonical [N, K, 3] buffer for a separate accumulate pass.
+    struct ShGradientTarget {
+        float* sh0 = nullptr;   // [N, 1, 3]
+        float* shN = nullptr;   // swizzled FP32 shN gradient, optional
+        uint32_t shN_slots = 0; // float4 slots per primitive of shN
+    };
+
     void spherical_harmonics_swizzled_bwd(
         uint32_t K,
         uint32_t degrees_to_use,
@@ -41,11 +49,12 @@ namespace gsplat_lfs {
         const float* v_colors,         // [..., 3] gradient
         int64_t total_elements,
         bool compute_v_dirs,
-        float* v_coeffs, // [..., K, 3] canonical output for accumulation
+        float* v_coeffs, // [..., K, 3] canonical output; unused with sh_grads
         float* v_dirs,   // [..., 3] optional output
         uint32_t color_stride = 3,
         cudaStream_t stream = nullptr,
-        const float* sh_value_bounds = nullptr);
+        const float* sh_value_bounds = nullptr,
+        const ShGradientTarget& sh_grads = {});
 
     //=========================================================================
     // Tile Intersection
@@ -171,6 +180,7 @@ namespace gsplat_lfs {
         float* depths,        // [C, N]
         float* conics,        // [C, N, 3]
         float* compensations, // [C, N] optional
+        float* dilations,     // [C, N] optional, mip filter
         cudaStream_t stream = nullptr);
 
     //=========================================================================
@@ -187,6 +197,9 @@ namespace gsplat_lfs {
         const float* backgrounds, // [C, channels] (can be nullptr) - solid color
         const float* bg_images,   // [C, channels, H, W] (can be nullptr) - per-pixel background
         const bool* masks,        // [C, tile_height, tile_width] (can be nullptr)
+        // [C, N] mip filter: opacity factor and world variance added to every squared scale (nullptr: off)
+        const float* compensations,
+        const float* dilations,
         // dimensions
         uint32_t C,
         uint32_t N,
@@ -228,6 +241,9 @@ namespace gsplat_lfs {
         const float* backgrounds, // [C, channels] optional - solid color
         const float* bg_images,   // [C, channels, H, W] optional - per-pixel background
         const bool* masks,        // optional
+        // [C, N] mip filter: opacity factor and world variance added to every squared scale (nullptr: off)
+        const float* compensations,
+        const float* dilations,
         // dimensions
         uint32_t C,
         uint32_t N,
@@ -261,7 +277,8 @@ namespace gsplat_lfs {
         float* v_scales,                      // [N, 3]
         float* v_colors,                      // [C, N, channels]
         float* v_opacities,                   // [C, N]
-        float* densification_info,            // [2, N] flattened or nullptr
+        float* densification_weight,          // [N] or nullptr
+        float* densification_error,           // [N] or nullptr
         const float* densification_error_map, // [H, W] or nullptr
         const float* edge_weight_map,         // [H, W] or nullptr
         float* edge_score_out,                // [N] or nullptr
@@ -285,6 +302,7 @@ namespace gsplat_lfs {
         int32_t* tile_offsets;    // [C, tile_height, tile_width]
         int32_t* last_ids;        // [C, H, W]
         float* compensations;     // [C, N] optional (can be nullptr)
+        float* dilations;         // [C, N] optional (can be nullptr)
         // Borrowed from TLS high-water isect cache — do NOT cudaFree.
         int64_t* isect_ids;   // [n_isects]
         int32_t* flatten_ids; // [n_sort]
@@ -386,6 +404,7 @@ namespace gsplat_lfs {
         const float* means2d,       // [C, N, 2]
         const float* depths,        // [C, N]
         const float* compensations, // [C, N]
+        const float* dilations,     // [C, N]
         // gradients of outputs
         const float* v_render_colors, // [C, H, W, channels]
         const float* v_render_alphas, // [C, H, W, 1]
@@ -394,13 +413,15 @@ namespace gsplat_lfs {
         float* v_quats,                       // [N, 4]
         float* v_scales,                      // [N, 3]
         float* v_opacities,                   // [N]
-        float* v_sh_coeffs,                   // [N, K, 3]
-        float* densification_info,            // [2, N] flattened or nullptr
+        float* v_sh_coeffs,                   // [N, K, 3]; nullptr with sh_grads
+        float* densification_weight,          // [N] or nullptr
+        float* densification_error,           // [N] or nullptr
         const float* densification_error_map, // [H, W] or nullptr
         const float* edge_weight_map,         // [H, W] or nullptr
         float* edge_score_out,                // [N] or nullptr
         cudaStream_t stream = nullptr,
         const std::vector<TileBatch>& batches = {}, int32_t* tiles_per_gauss = nullptr,
-        const float* sh_value_bounds = nullptr);
+        const float* sh_value_bounds = nullptr,
+        const ShGradientTarget& sh_grads = {});
 
 } // namespace gsplat_lfs

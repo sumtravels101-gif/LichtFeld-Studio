@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,9 @@ namespace lfs::core {
                const std::filesystem::path& depth_path = {},
                const std::filesystem::path& normal_path = {});
         Camera(const Camera&, const Tensor& transform);
+
+        std::shared_ptr<Camera> make_pinhole_view(const UndistortParams& params, int uid,
+                                                  const std::string& image_name) const;
 
         // Destructor to clean up CUDA stream
         ~Camera();
@@ -176,7 +180,11 @@ namespace lfs::core {
         const std::filesystem::path& normal_path() const noexcept { return _normal_path; }
         void set_depth_path(std::filesystem::path path);
         void set_normal_path(std::filesystem::path path);
-        void set_mask_path(std::filesystem::path path);
+        // A project mask retains its cache-file lease independently of the document.
+        void set_mask_path(std::filesystem::path path, std::optional<Uuid> asset_uuid = std::nullopt,
+                           std::shared_ptr<const void> asset_owner = {});
+        const std::optional<Uuid>& mask_asset_uuid() const noexcept { return _mask_asset_uuid; }
+        const std::shared_ptr<const void>& mask_asset_owner() const noexcept { return _mask_asset_owner; }
 
         // Sparse SfM observations for this image (COLMAP 2D points with a 3D id).
         // Pixel coordinates are in the camera's native width/height at load
@@ -261,6 +269,13 @@ namespace lfs::core {
         // Translate the camera by trans in world space (cam_pos += trans, T updated accordingly)
         void translate(const Tensor& trans);
 
+        // Moves the camera to the world-to-camera pose [R | T] (R 3x3, T 3), finished on `stream` when this returns.
+        // The device transform and position are rewritten in place, so their device pointers stay valid.
+        void set_pose(const Tensor& R, const Tensor& T, cudaStream_t stream);
+        // Moves only the device transform (float [16], row-major) and position (float [3]), ordered on `stream`
+        // without a host sync. R() and T() keep the previous pose until set_pose.
+        void set_device_pose(const float* w2c, const float* cam_position, cudaStream_t stream);
+
         void precompute_undistortion(float blank_pixels = 0.0f);
         enum class UndistortDestination { Calibration,
                                           Explicit };
@@ -280,6 +295,7 @@ namespace lfs::core {
         // IDs
         float _FoVx = 0.f;
         float _FoVy = 0.f;
+        friend class Scene;
         int _uid = -1;
         int _camera_id = 0;
         float _focal_x = 0.f;
@@ -335,6 +351,8 @@ namespace lfs::core {
         // takes precedence over _mask_path when set. Processed on first use.
         Tensor _in_memory_mask_raw;
         std::uint64_t _mask_revision = 0;
+        std::optional<Uuid> _mask_asset_uuid;
+        std::shared_ptr<const void> _mask_asset_owner;
 
         // Depth caching (processed depth stored on GPU)
         Tensor _cached_depth;

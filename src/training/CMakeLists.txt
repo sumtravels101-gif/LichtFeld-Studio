@@ -37,6 +37,7 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/roi_weight_map.cu
     kernels/image_kernels.cu
     kernels/mask_preprocess.cu
+    kernels/camera_pose.cu
 )
 
 # Create CUDA kernels library
@@ -107,6 +108,7 @@ set(TRAINING_NEW_SOURCES
     components/config_serialization.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
+    components/camera_pose_refinement.cpp
     components/ppisp_controller.cu
     components/ppisp_controller_pool.cu
     components/ppisp_file.cpp
@@ -126,6 +128,7 @@ set(TRAINING_NEW_SOURCES
         training_cropbox_mask.cpp
         trainer.cpp
         trainer_popspa.cpp
+        noise_infill.cpp
         normal_auto_generate.cpp
         vram_ledger.cpp
         perf_bench.cpp

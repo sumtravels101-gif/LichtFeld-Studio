@@ -8,9 +8,11 @@
 #include "core/error_latch.hpp"
 #include "core/event_bridge/event_bridge.hpp"
 #include "core/export.hpp"
+#include "core/nn/weight_file.hpp"
 #include "core/parameters.hpp"
 #include "core/splat_exportable_storage.hpp"
 #include "io/session_chapters.hpp"
+#include "lfs/training/vram_ledger.hpp"
 #include "training/trainer.hpp"
 #include "training_state.hpp"
 #include <atomic>
@@ -104,7 +106,7 @@ namespace lfs::vis {
 
         // Training control
         using EvaluationWeightsPreparer =
-            std::function<std::optional<std::filesystem::path>(bool allow_download)>;
+            std::function<std::optional<core::nn::WeightFile>(bool allow_download)>;
 
         void set_evaluation_weights_preparer(EvaluationWeightsPreparer preparer) {
             evaluation_weights_preparer_ = std::move(preparer);
@@ -131,9 +133,8 @@ namespace lfs::vis {
         // State machine access
         [[nodiscard]] const TrainingStateMachine& getStateMachine() const { return state_machine_; }
         [[nodiscard]] bool canPerform(TrainingAction action) const;
-        [[nodiscard]] std::string_view getActionBlockedReason(TrainingAction action) const {
-            return state_machine_.getActionBlockedReason(action);
-        }
+        [[nodiscard]] std::string_view getActionBlockedReason(TrainingAction action) const;
+        [[nodiscard]] std::string_view getResourceBlockedReason() const;
 
         // State queries (delegate to the state machine). getState() overlays
         // a stored, not-yet-hydrated project session as Paused or Finished.
@@ -169,6 +170,8 @@ namespace lfs::vis {
         int getTotalIterations() const;
         int getNumSplats() const;
         int getMaxGaussians() const;
+        // VRAM densification can still grow into, while a trainer runs.
+        std::optional<lfs::training::DensificationVramRoom> getDensificationVramRoom() const;
         std::vector<size_t> getSaveSteps() const;
         void setSaveSteps(std::vector<size_t> save_steps);
         const char* getStrategyType() const;
@@ -245,6 +248,8 @@ namespace lfs::vis {
         void applyPendingParams();
 
     private:
+        void notifyUnusedCameraMasks();
+
         struct TrainingCompletionData {
             int iteration = 0;
             float final_loss = 0.0f;

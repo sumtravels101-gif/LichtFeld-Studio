@@ -333,6 +333,42 @@ callbacks, and `clear()` unregisters that session's callbacks on unload.
 The module-level decorators register callbacks until app shutdown; setting a
 Python variable to `None` does not unregister them.
 
+Hook payloads are dictionaries containing `iteration`, `loss`, `num_splats`
+(`num_gaussians` is an alias), `is_refining`, `is_paused`, and `iterations`
+(the planned total). `on_training_end` additionally receives `terminal_state`:
+`"completed"`, `"stopped"`, or `"failed"`. An unspecified native outcome is
+reported as `"unknown"`; adapters must not treat it as successful completion.
+
+Inside a model read boundary, `SplatData.shN_rows(rows, degree)` copies only the
+requested SH-rest rows and bands into owned Float32 CPU storage with shape
+`[len(rows), (degree + 1)**2 - 1, 3]`. It excludes SH0. `rows` must be a rank-1
+CPU Int32 or Int64 tensor; order and duplicates are preserved. Empty selections
+and degree zero produce correctly shaped empty results. Invalid rows/degrees
+are rejected. The model's SH storage is not modified or fully decoded.
+Long native transfers in `Tensor.cpu()`, `cuda()`, `sync()`, `index_select()`,
+and `numpy()` release the GIL; Python object construction retains it.
+
+### Local training sessions
+
+`lichtfeld_sessions` is the shared pure Python package for local, navigable
+Gaussian snapshots and camera calibration. Enable its publisher through an
+explicit `--python-script` containing:
+
+```python
+from lichtfeld_sessions.publisher import install
+install(dataset="/path/to/dataset", limit=100000, degree=1, interval=2.0)
+```
+
+Readers use `transport.discover()`, `SessionClient(directory, label)`,
+`client.status()` and `read_snapshot(status["snapshot"])`.
+`geometry.load(directory, status.get("geometry"))` reads camera and coordinate
+metadata. Close the client lease when finished. Expired generations can be retried;
+snapshot reads return owned NumPy arrays.
+
+The local protocol version is 1. Publication does not grant control over another
+trainer, detach its process or replace saved checkpoints. The Blender extension
+builds its bundled dependency from these canonical sources.
+
 ## Rendering
 
 | Function                                              | Returns          | Description                |
@@ -412,12 +448,12 @@ live application scene.
 | `lf.io.load_point_cloud(path)` | `(Tensor, Tensor)` | Load PLY point cloud as positions/colors |
 | `lf.io.save_ply(data, path, binary=True, progress=None, extra_attributes=None, include_provenance=True)` | `None` | Save `SplatData` as PLY (`False` still embeds a minimal build stamp) |
 | `lf.io.save_point_cloud_ply(point_cloud, path, extra_attributes=None, include_provenance=True)` | `None` | Save `PointCloud` as PLY (`False` still embeds a minimal build stamp) |
-| `lf.io.save_sog(data, path, kmeans_iterations=10, use_gpu=True, progress=None, include_provenance=True)` | `None` | Save SOG-compressed splats (`False` still embeds a minimal build stamp) |
+| `lf.io.save_sog(data, path, kmeans_iterations=10, use_gpu=True, progress=None, include_provenance=True)` | `None` | Save SOG-compressed splats; the SH palette uses 10 e-means epochs (`False` still embeds a minimal build stamp) |
 | `lf.io.save_ssog(splat, path, lod_levels=4, lod_ratio=0.5, chunk_count_k=512, chunk_extent=16.0, chunk_min_k=8, kmeans_iterations=10, use_gpu=True, progress=None, include_provenance=True)` | `None` | Save a PlayCanvas SSOG bundle/directory with LODs and chunks |
 | `lf.io.save_spz(data, path, version=4, include_provenance=True)` | `None` | Save SPZ splats (`version` 4=zstd, 3=legacy gzip; `include_provenance` ignored for v3) |
 | `lf.io.save_usd(data, path, include_provenance=True)` | `None` | Save OpenUSD gaussian file (`False` still embeds a minimal build stamp) |
 | `lf.io.save_nurec_usdz(data, path, include_provenance=True)` | `None` | Save NuRec-compatible USDZ (`False` still embeds a minimal build stamp) |
-| `lf.io.export_html(data, path, kmeans_iterations=10, progress=None, include_provenance=True)` | `None` | Self-contained HTML viewer (`False` still embeds a minimal build stamp) |
+| `lf.io.export_html(data, path, kmeans_iterations=10, progress=None, include_provenance=True, background_color=None)` | `None` | Self-contained HTML viewer (`False` still embeds a minimal build stamp) |
 | `lf.io.save_image(path, image, include_provenance=True)` | `None` | Save PNG/JPG/TIFF/EXR from `[H,W,C]` or `[C,H,W]` tensor (`False` still embeds a minimal build stamp on PNG/JPEG) |
 | `lf.io.is_dataset_path(path)` | `bool` | Dataset directory detection |
 | `lf.io.is_gaussian_splat_ply(path)` | `bool` | PLY schema check for gaussian splat attributes |

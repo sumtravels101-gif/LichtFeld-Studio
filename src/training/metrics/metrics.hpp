@@ -7,6 +7,7 @@
 #include "../dataset.hpp"
 #include "core/error.hpp"
 #include "core/nn/models/lpips.hpp"
+#include "core/nn/weight_file.hpp"
 #include "core/parameters.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
@@ -330,6 +331,7 @@ namespace lfs::training {
         int warp_supersample = kEvaluationWarpSupersample;
         std::filesystem::path image_dir;                                   // Where images are saved; empty = <output>/eval_step_<iteration>
         std::array<std::string, 2> image_labels{"Ground Truth", "Render"}; // Captions in saved images, left first
+        bool report_scores = true;                                         // False: only the caller sees the scores, not the report or the GUI
     };
 
     [[nodiscard]] lfs::Error evaluation_error(std::string detail, lfs::core::SourceSite site);
@@ -420,8 +422,8 @@ namespace lfs::training {
         void set_appearance(AppearanceFn fn) { appearance_ = std::move(fn); }
         [[nodiscard]] bool has_appearance() const { return static_cast<bool>(appearance_); }
 
-        void set_lpips_weights_path(std::optional<std::filesystem::path> path) {
-            _lpips_weights_path = std::move(path);
+        void set_lpips_weights_preparer(std::function<std::optional<core::nn::WeightFile>()> preparer) {
+            _lpips_weights_preparer = std::move(preparer);
             _lpips_metric.reset();
             _lpips_load_attempted = false;
         }
@@ -466,6 +468,9 @@ namespace lfs::training {
                              lfs::io::PipelinedImageLoader* image_loader = nullptr,
                              std::function<bool()> on_view_boundary = {});
 
+        // Where a green infill's mesh sits relative to the training model.
+        void set_training_origin(const std::array<float, 3>& origin) { _training_origin = origin; }
+
         // Scores what source.render returns for each view against the view's reference image.
         EvalMetrics evaluate_views(int iteration,
                                    std::shared_ptr<CameraDataset> val_dataset,
@@ -487,6 +492,7 @@ namespace lfs::training {
         }
 
     private:
+        std::array<float, 3> _training_origin{0.0f, 0.0f, 0.0f};
         [[nodiscard]] std::string_view evaluated_split() const {
             return _params.optimization.eval_all ? "train" : "test";
         }
@@ -499,7 +505,7 @@ namespace lfs::training {
         std::unique_ptr<PSNR> _psnr_metric;
         std::unique_ptr<SSIM> _ssim_metric;
         std::optional<lfs::core::nn::models::Lpips> _lpips_metric;
-        std::optional<std::filesystem::path> _lpips_weights_path;
+        std::function<std::optional<core::nn::WeightFile>()> _lpips_weights_preparer;
         bool _lpips_load_attempted = false;
         std::unique_ptr<MetricsReporter> _reporter;
         AppearanceFn appearance_;

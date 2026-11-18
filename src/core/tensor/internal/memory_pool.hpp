@@ -121,6 +121,20 @@ namespace lfs::core {
         void* try_allocate(size_t bytes,
                            cudaStream_t stream = nullptr,
                            cudaError_t* failure_status = nullptr) {
+            void* ptr = try_allocate_from_tiers(bytes, stream, failure_status);
+            // A tier that ran out falls through to the next one. If that one
+            // succeeds, its out-of-memory error must not stay pending: CUB
+            // returns any pending error as its own, so the next scan, sort or
+            // reduction would fail.
+            if (ptr != nullptr && cudaPeekAtLastError() == cudaErrorMemoryAllocation) {
+                (void)cudaGetLastError();
+            }
+            return ptr;
+        }
+
+        void* try_allocate_from_tiers(size_t bytes,
+                                      cudaStream_t stream,
+                                      cudaError_t* failure_status) {
             unretire_stream(stream);
             LFS_CUDA_BREADCRUMB_STREAM("tensor.pool.allocate", stream);
             if (failure_status) {
@@ -166,7 +180,7 @@ namespace lfs::core {
                 }
             }
 
-            if (bytes <= BUCKET_ALLOC_THRESHOLD) {
+            if (bytes <= BUCKET_ALLOC_THRESHOLD && SizeBucketedPool::instance().may_cache(bytes)) {
                 ptr = SizeBucketedPool::instance().try_allocate_cached(bytes, stream);
                 if (ptr) {
                     stats_.bucket_cache_hits.fetch_add(1, std::memory_order_relaxed);
@@ -557,26 +571,24 @@ namespace lfs::core {
             if (suspend_deallocations_.load(std::memory_order_acquire)) {
                 return;
             }
+            // The device sync only waits for work submitted before it. Another
+            // thread can free a block during the sync whose last use it queued
+            // after the sync began, so only blocks free before the sync may lose
+            // their stream: take them out of the caches first.
+            auto slab_blocks = GPUSlabAllocator::instance().take_stream_free_lists();
+            const auto bucket_blocks = SizeBucketedPool::instance().take_cache();
             const cudaError_t sync_status = cudaDeviceSynchronize();
-            if (sync_status != cudaSuccess) {
+            const bool synchronized = sync_status == cudaSuccess;
+            GPUSlabAllocator::instance().return_stream_free_lists(std::move(slab_blocks), synchronized);
+            SizeBucketedPool::free_taken(bucket_blocks, synchronized);
+            if (!synchronized) {
                 ensure_cuda_success(
                     sync_status, "cudaDeviceSynchronize(memory-pool trim)", {},
                     LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
                 return;
             }
-            {
-                std::lock_guard<std::mutex> lock(map_mutex_);
-                for (auto& entry : allocation_map_) {
-                    auto& info = entry.second;
-                    info.extra_streams.clear();
-                }
-            }
-            GPUSlabAllocator::instance().merge_all_streams_into_virgin();
             // Return fully-empty slabs to the driver (steady-state VRAM hygiene).
-            // Device is synchronized above; free lists are stream-merged into virgin.
             GPUSlabAllocator::instance().reclaim_empty_slabs();
-            SizeBucketedPool::instance().retag_all_streams(nullptr);
-            SizeBucketedPool::instance().trim_cache();
 
 #if CUDART_VERSION >= 12080
             trim_default_pool("cached-memory trim");

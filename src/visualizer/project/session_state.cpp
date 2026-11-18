@@ -743,6 +743,7 @@ namespace lfs::vis::project {
                 required_field("show_center_markers", &RenderSettings::show_center_markers),
                 required_field("show_camera_frustums", &RenderSettings::show_camera_frustums),
                 required_field("camera_frustum_scale", &RenderSettings::camera_frustum_scale),
+                optional_field("hide_disabled_camera_frustums", &RenderSettings::hide_disabled_camera_frustums),
                 vec3_field("train_camera_color", &RenderSettings::train_camera_color),
                 vec3_field("eval_camera_color", &RenderSettings::eval_camera_color),
                 required_field("show_pivot", &RenderSettings::show_pivot),
@@ -816,6 +817,7 @@ namespace lfs::vis::project {
                 required_field("orthographic", &RenderSettings::orthographic),
                 required_field("ortho_scale", &RenderSettings::ortho_scale),
                 required_field("depth_view", &RenderSettings::depth_view),
+                optional_field("normal_view", &RenderSettings::normal_view),
                 required_field("depth_view_min", &RenderSettings::depth_view_min),
                 required_field("depth_view_max", &RenderSettings::depth_view_max),
                 enum_field("depth_visualization_mode", &RenderSettings::depth_visualization_mode,
@@ -1722,6 +1724,8 @@ namespace lfs::vis::project {
                     optional_field("python_console_width", &gui::PanelLayoutProjectState::python_console_width),
                     optional_field("bottom_dock_height", &gui::PanelLayoutProjectState::bottom_dock_height),
                     optional_field("left_dock_width", &gui::PanelLayoutProjectState::left_dock_width),
+                    optional_field("left_dock_collapsed", &gui::PanelLayoutProjectState::left_dock_collapsed),
+                    optional_field("right_dock_collapsed", &gui::PanelLayoutProjectState::right_dock_collapsed),
                     optional_field("sequencer_visible", &gui::PanelLayoutProjectState::show_sequencer),
                     optional_field("bottom_dock_active_tab", &gui::PanelLayoutProjectState::bottom_dock_active_tab_id),
                     optional_field("tab_scroll_offset", &gui::PanelLayoutProjectState::tab_scroll_offset),
@@ -2050,7 +2054,7 @@ namespace lfs::vis::project {
                 {"VIEW", "render_settings.ppisp_mode", integers({0, 1}), static_cast<int>(PPISP::AUTO)},
                 {"VIEW", "render_settings.environment_mode", integers({0, 1}), static_cast<int>(Environment::SolidColor)},
                 {"VIEW", "render_settings.split_view_mode", integers({0, 1, 2, 3}), static_cast<int>(SplitViewMode::Disabled)},
-                {"VIEW", "render_settings.gt_comparison_mode", integers({0, 1, 2}), static_cast<int>(Comparison::RGB)},
+                {"VIEW", "render_settings.gt_comparison_mode", integers({0, 1, 2, 3}), static_cast<int>(Comparison::RGB)},
                 {"VIEW", "render_settings.depth_visualization_mode", integers({0, 1}), static_cast<int>(Depth::Palette)},
                 {"VIEW", "tools.selection_submode", string_parser([](const std::string_view value) {
                      return selection_submode_from_name(value).has_value();
@@ -3364,6 +3368,9 @@ namespace lfs::vis::project {
             gui::PanelLayoutProjectState layout =
                 gui_manager->panelLayout()
                     .captureProjectState();
+            // Older projects have no collapse flags: start their docks expanded.
+            layout.left_dock_collapsed = false;
+            layout.right_dock_collapsed = false;
             (void)read_fields(
                 fixed,
                 layout,

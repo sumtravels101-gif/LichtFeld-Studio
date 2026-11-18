@@ -20,10 +20,14 @@
 
 namespace lfs::core::nn::models {
 
+    enum class Sam2MaskOutput { OriginalResolution,
+                                LowResolutionOnly,
+                                RawLowResolution };
+
     struct Sam2Prediction {
-        Tensor masks;          // [num_masks, H, W] fp32 logits, original image size
+        Tensor masks;          // [num_masks, H, W] fp32 logits; absent for LowResolutionOnly
         Tensor iou;            // [num_masks] fp32 predicted mask quality
-        Tensor low_res_logits; // [num_masks, 256, 256] fp32
+        Tensor low_res_logits; // [num_masks, 256, 256] fp32; unclamped for RawLowResolution
         Tensor object_pointer;
         Tensor object_score_logits;
     };
@@ -41,6 +45,8 @@ namespace lfs::core::nn::models {
     public:
         static lfs::Result<Sam2> load(const std::filesystem::path& weights, Device device,
                                       std::optional<DataType> compute = std::nullopt);
+        static lfs::Result<Sam2> load(const WeightFile& file, Device device,
+                                      std::optional<DataType> compute = std::nullopt);
 
         // NCHW RGB in [0, 1], any H/W. Resizes to 1024x1024 internally (squash, like the
         // official predictor), normalizes, runs the image encoder, caches embeddings.
@@ -51,12 +57,17 @@ namespace lfs::core::nn::models {
         // prediction (1 x 1 x 256 x 256) to refine. Requires set_image first.
         lfs::Result<Sam2Prediction> predict(const std::vector<Sam2PointPrompt>& points,
                                             const std::optional<std::array<float, 4>>& box,
-                                            bool multimask = true, const Tensor* mask_logits = nullptr);
+                                            bool multimask = true, const Tensor* mask_logits = nullptr,
+                                            Sam2MaskOutput output = Sam2MaskOutput::OriginalResolution);
+
+        // Upsample unclamped [num_masks, 256, 256] logits for the current image.
+        // Compare low-resolution proposals first, then upsample only the selected one.
+        lfs::Result<Tensor> postprocess_masks(const Tensor& logits) const;
 
         // One object and one automatic seed per sequence. A reverse pass starts a fresh bank from that seed.
         lfs::Result<void> set_video_image(const Tensor& image);
         lfs::Result<Sam2Prediction> seed_video(const Tensor& mask, int frame_index, int frame_count,
-                                               bool reverse);
+                                               bool reverse, float max_area = kSam2MaxArea);
         lfs::Result<Sam2Prediction> track_video(int frame_index);
         void reset_video();
         [[nodiscard]] bool supports_video() const;
@@ -64,12 +75,15 @@ namespace lfs::core::nn::models {
         // Runs the image encoder in `dtype` (tensor cores for Float16) while prompts, the mask decoder and video
         // tracking keep the compute dtype; the encoder's features are converted on the way out.
         void set_encoder_dtype(DataType dtype);
+        [[nodiscard]] std::size_t weights_bytes() const;
+        [[nodiscard]] std::size_t arena_bytes() const { return arena_.capacity(); }
 
     private:
         lfs::Result<void> run_encoder(const Tensor& image, bool video = false);
         lfs::Result<Sam2Prediction> run_decoder(const std::vector<Sam2PointPrompt>& points,
                                                 const std::optional<std::array<float, 4>>& box,
-                                                bool multimask, bool video = false, const Tensor* mask_input = nullptr);
+                                                bool multimask, bool video = false, const Tensor* mask_input = nullptr,
+                                                Sam2MaskOutput output = Sam2MaskOutput::OriginalResolution);
 
         const Tensor& w(std::string_view name) const;
         Tensor conv1x1(const Tensor& x, std::string_view weight, std::string_view bias);
@@ -111,6 +125,7 @@ namespace lfs::core::nn::models {
         bool video_reverse_ = false;
         bool video_image_ = false;
         bool video_oversized_ = false;
+        float video_max_area_ = kSam2MaxArea;
         Tensor raw_image_embed_;
         Tensor video_image_position_;
         Tensor video_memory_position_;

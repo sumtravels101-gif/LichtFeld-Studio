@@ -5,6 +5,7 @@
 #include "core/cuda/sh_layout.cuh"
 #include "core/error.hpp"
 #include "core/event_bridge/control_boundary.hpp"
+#include "core/memory_pressure.hpp"
 #include "core/parameters.hpp"
 #include "core/scene.hpp"
 #include "core/sh_value_quant.hpp"
@@ -251,6 +252,49 @@ TEST(MortonReorderTest, CadenceMatchesStopRefineAndZeroDisables) {
     EXPECT_FALSE(morton::should_reorder(4999, 5000, 25000));
 }
 
+// A few splats far outside the scene must not stretch the grid until the rest shares one Morton cell: equal codes
+// would keep the near points in their (random) input order, and neighbouring rows would sit far apart in space.
+TEST(MortonReorderTest, DistantOutliersKeepTheNearPointsSpreadOverManyCells) {
+    constexpr size_t kNear = 32768;
+    constexpr size_t kFar = 8;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    std::vector<float> means;
+    means.reserve((kNear + kFar) * 3);
+    for (size_t i = 0; i < kNear * 3; ++i)
+        means.push_back(unit(rng));
+    for (size_t i = 0; i < kFar; ++i) {
+        const float sign = (i % 2 == 0) ? 1.0f : -1.0f;
+        means.insert(means.end(), {sign * 1e5f, sign * 2e5f * static_cast<float>(i + 1), -sign * 5e4f});
+    }
+    const auto n = kNear + kFar;
+    const auto perm = kernels::launch_morton_permutation(Tensor::from_vector(means, {n, size_t{3}}, Device::CUDA))
+                          .to(DataType::Float32)
+                          .cpu()
+                          .to_vector();
+    ASSERT_EQ(perm.size(), n);
+
+    double step_sum = 0.0;
+    size_t steps = 0;
+    int64_t previous = -1;
+    for (const float value : perm) {
+        const auto row = static_cast<int64_t>(value);
+        if (row >= static_cast<int64_t>(kNear))
+            continue;
+        if (previous >= 0) {
+            const float* a = means.data() + previous * 3;
+            const float* b = means.data() + row * 3;
+            step_sum += std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) +
+                                  (a[2] - b[2]) * (a[2] - b[2]));
+            ++steps;
+        }
+        previous = row;
+    }
+    ASSERT_EQ(steps, kNear - 1);
+    // Unsorted, consecutive near points lie about 0.66 apart; sorted over a fine grid a few hundredths.
+    EXPECT_LT(step_sum / static_cast<double>(steps), 0.1);
+}
+
 TEST(MortonReorderTest, PreservesPerRowAttributesAndAdamMoments) {
     const ShValueQuantGuard quant_guard{true};
     constexpr size_t n = 2048;
@@ -366,6 +410,48 @@ TEST(MortonReorderTest, PreservesPerRowAttributesAndAdamMoments) {
     }
 
     ASSERT_TRUE(splat.shN_value_quantized());
+}
+
+// Three bound blocks leave the q16 SH bounds two floats past a float4
+// boundary; the Adam bounds the reorder takes after them must stay aligned.
+TEST(MortonReorderTest, OddBoundBlockCountKeepsAdamMomentsAligned) {
+    const ShValueQuantGuard quant_guard{true};
+    constexpr size_t n = 3 * joint_adam::kBlockSize - 100;
+    auto splat = make_mixed_splat(n, 3);
+    ASSERT_TRUE(sh_value::apply_shN_value_quant(splat));
+
+    AdamConfig cfg;
+    cfg.initial_capacity = n;
+    AdamOptimizer opt(splat, cfg);
+    opt.allocate_gradients(n);
+    auto* means_state = opt.get_state_mutable(ParamType::Means);
+    ASSERT_NE(means_state, nullptr);
+    fill_joint_contiguous(
+        *means_state, n, 3,
+        [](size_t i, int a) { return 0.01f * static_cast<float>(i + 1) * static_cast<float>(a + 1); },
+        [](size_t i, int a) { return 1.0e-4f * static_cast<float>(i + 1) * static_cast<float>(a + 1); });
+    std::vector<float> m_before;
+    std::vector<float> v_before;
+    decode_joint_contiguous_host(*means_state, n, 3, m_before, v_before);
+
+    const auto result = morton::apply_morton_reorder(splat, &opt);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_TRUE(result.applied);
+    const auto perm = result.permutation.cpu().contiguous();
+    const auto* ip = perm.ptr<std::int64_t>();
+
+    std::vector<float> m_after;
+    std::vector<float> v_after;
+    decode_joint_contiguous_host(*opt.get_state(ParamType::Means), n, 3, m_after, v_after);
+    for (size_t i = 0; i < n; ++i) {
+        const auto src = static_cast<size_t>(ip[i]);
+        for (int a = 0; a < 3; ++a) {
+            const size_t di = i * 3 + static_cast<size_t>(a);
+            const size_t si = src * 3 + static_cast<size_t>(a);
+            EXPECT_NEAR(m_after[di], m_before[si], std::max(0.02f, 2.0e-4f * std::abs(m_before[si]))) << i;
+            EXPECT_NEAR(v_after[di], v_before[si], std::max(0.01f, 2.0e-4f * std::abs(v_before[si]))) << i;
+        }
+    }
 }
 
 TEST(MortonReorderTest, FrozenRangesSkipLeavesRowsUntouched) {
@@ -887,6 +973,7 @@ TEST(MortonReorderTest, ArenaScratchMatchesAllocationFallbackBytewise) {
     EXPECT_EQ(device_bytes(arena_splat.shN()), device_bytes(fallback_splat.shN()));
     EXPECT_EQ(device_bytes(arena_splat.shN_value_bounds()), device_bytes(fallback_splat.shN_value_bounds()));
     EXPECT_EQ(device_bytes(arena_splat.means()), device_bytes(fallback_splat.means()));
+    EXPECT_EQ(device_bytes(arena_splat.rotation_raw()), device_bytes(fallback_splat.rotation_raw()));
     for (const auto type : AdamOptimizer::all_param_types()) {
         const auto* a = arena_opt.get_state(type);
         const auto* f = fallback_opt.get_state(type);
@@ -895,6 +982,105 @@ TEST(MortonReorderTest, ArenaScratchMatchesAllocationFallbackBytewise) {
         EXPECT_EQ(device_bytes(a->exp_avg), device_bytes(f->exp_avg)) << static_cast<int>(type);
         EXPECT_EQ(device_bytes(a->joint_bounds), device_bytes(f->joint_bounds)) << static_cast<int>(type);
     }
+}
+
+namespace {
+    // Holds the arena's frame so the reorder cannot borrow it.
+    struct HeldArenaFrame {
+        RasterizerMemoryArena& arena;
+        cudaStream_t stream;
+        uint64_t frame;
+        HeldArenaFrame(RasterizerMemoryArena& a, cudaStream_t s)
+            : arena(a),
+              stream(s),
+              frame(a.begin_frame(s)) {}
+        ~HeldArenaFrame() { arena.end_frame(frame, stream); }
+    };
+} // namespace
+
+// The reorder only improves locality: with too little free VRAM for its
+// copies it must leave the model untouched instead of failing halfway.
+TEST(MortonReorderTest, SkipsInsteadOfRunningOutOfVram) {
+    constexpr size_t n = 70000;
+    const cudaStream_t stream = getCurrentCUDAStream();
+    auto splat = make_mixed_splat(n, 3);
+    AdamConfig cfg;
+    cfg.initial_capacity = n;
+    AdamOptimizer opt(splat, cfg);
+    ASSERT_TRUE(morton::apply_morton_reorder(splat, &opt, stream).applied);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    const auto means = device_bytes(splat.means());
+    const auto shN = device_bytes(splat.shN());
+
+    auto& arena = GlobalArenaManager::instance().get_arena();
+    auto& pressure = MemoryPressureCoordinator::instance();
+    morton::ReorderResult skipped;
+    {
+        const HeldArenaFrame held(arena, stream);
+        // No room for the 13 MiB SH copy.
+        pressure.set_allocation_probe(
+            [](const MemoryDomain domain, const size_t bytes) {
+                return domain == MemoryDomain::CudaDevice && bytes >= (size_t{8} << 20);
+            });
+        EXPECT_NO_THROW(skipped = morton::apply_morton_reorder(splat, &opt, stream));
+        pressure.set_allocation_probe(nullptr);
+        EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    }
+    EXPECT_FALSE(skipped.applied);
+    EXPECT_FALSE(skipped.permutation.is_valid());
+    EXPECT_EQ(device_bytes(splat.means()), means);
+    EXPECT_EQ(device_bytes(splat.shN()), shN);
+
+    EXPECT_TRUE(morton::apply_morton_reorder(splat, &opt, stream).applied);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+}
+
+// Running out of VRAM at any allocation of a reorder must leave the model as it
+// was or finish the reorder, never move only some of its rows.
+TEST(MortonReorderTest, RunningOutOfVramNeverLeavesAPartialReorder) {
+    constexpr size_t n = 70000;
+    const cudaStream_t stream = getCurrentCUDAStream();
+    AdamConfig cfg;
+    cfg.initial_capacity = n;
+    auto reference = make_mixed_splat(n, 3);
+    AdamOptimizer reference_opt(reference, cfg);
+    ASSERT_TRUE(morton::apply_morton_reorder(reference, &reference_opt, stream).applied);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    auto& arena = GlobalArenaManager::instance().get_arena();
+    auto& pressure = MemoryPressureCoordinator::instance();
+    bool completed = false;
+    for (int allowed = 0; !completed && allowed < 64; ++allowed) {
+        SCOPED_TRACE(::testing::Message() << "allocations allowed: " << allowed);
+        auto splat = make_mixed_splat(n, 3);
+        AdamOptimizer opt(splat, cfg);
+        const auto means = device_bytes(splat.means());
+        const auto rotation = device_bytes(splat.rotation_raw());
+        const auto shN = device_bytes(splat.shN());
+        int calls = 0;
+        morton::ReorderResult result;
+        {
+            // Without the arena every copy needs VRAM of its own.
+            const HeldArenaFrame held(arena, stream);
+            pressure.set_allocation_probe([&](const MemoryDomain domain, size_t) {
+                return domain == MemoryDomain::CudaDevice && ++calls > allowed;
+            });
+            EXPECT_NO_THROW(result = morton::apply_morton_reorder(splat, &opt, stream));
+            pressure.set_allocation_probe(nullptr);
+        }
+        ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        if (!result.applied) {
+            EXPECT_EQ(device_bytes(splat.means()), means);
+            EXPECT_EQ(device_bytes(splat.rotation_raw()), rotation);
+            EXPECT_EQ(device_bytes(splat.shN()), shN);
+            continue;
+        }
+        completed = true;
+        EXPECT_EQ(device_bytes(splat.means()), device_bytes(reference.means()));
+        EXPECT_EQ(device_bytes(splat.rotation_raw()), device_bytes(reference.rotation_raw()));
+        EXPECT_EQ(device_bytes(splat.shN()), device_bytes(reference.shN()));
+    }
+    EXPECT_TRUE(completed);
 }
 
 // Fails if a cell or slot group lands at the wrong offset, a group is skipped

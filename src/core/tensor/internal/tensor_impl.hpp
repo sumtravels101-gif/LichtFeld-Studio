@@ -429,6 +429,7 @@ namespace lfs::core {
             std::monostate,
             float,
             std::tuple<float, float, float>,
+            std::tuple<int64_t, int64_t, int64_t>,
             std::pair<float, float>,
             std::pair<int, int>,
             void*,
@@ -468,6 +469,11 @@ namespace lfs::core {
         RandomGenerator& operator=(const RandomGenerator&) = delete;
     };
 
+    // Physical backing of a zeros_direct tensor whose reserved capacity exceeds
+    // its rows: the capacity is a virtual reservation and only the prefix that
+    // has been grown into is committed (see Tensor::commit_rows).
+    struct LazyDeviceStorage;
+
     struct StorageMeta {
         std::atomic<uint64_t> generation{0};
         std::atomic<uint32_t> pending_lazy_snapshots{0};
@@ -482,6 +488,7 @@ namespace lfs::core {
         std::shared_ptr<void> exportable_control;
         std::uint32_t exportable_region = 0;
         std::uint64_t exportable_bound_generation = 0;
+        std::weak_ptr<LazyDeviceStorage> lazy_storage;
     };
 
 } // namespace lfs::core
@@ -494,6 +501,7 @@ namespace lfs::core {
     class LFS_CORE_API Tensor {
     private:
         friend struct internal::LazyIrTensorAccess;
+        friend struct LazyDeviceStorage;
         friend class TensorLeaf;
         friend void pin_operands(std::initializer_list<const Tensor*> tensors);
         friend std::shared_ptr<Tensor> internal::lazy_executor_snapshot_operand(
@@ -1573,6 +1581,10 @@ namespace lfs::core {
         static Tensor arange(float end);
         static Tensor arange(float start, float end, float step = 1.0f);
         static Tensor arange(float start, float end, float step, Device device);
+        static Tensor arange(int64_t start, int64_t end, int64_t step, Device device, DataType dtype);
+        template <typename Start, typename End, typename Step>
+            requires(std::floating_point<Start> || std::floating_point<End> || std::floating_point<Step>)
+        static Tensor arange(Start start, End end, Step step, Device device, DataType dtype) = delete;
         static Tensor linspace(float start, float end, size_t steps, Device device = Device::CUDA);
         static Tensor eye(size_t n, Device device = Device::CUDA);
         static Tensor eye(size_t m, size_t n, Device device = Device::CUDA);
@@ -1938,6 +1950,15 @@ namespace lfs::core {
             return storage_meta_ ? storage_meta_->exportable_bound_generation : 0u;
         }
         static std::size_t cuda_direct_storage_live_bytes();
+
+        // Backs rows [0, rows) of the reserved capacity with zeroed device memory.
+        // zeros_direct commits only its logical rows when the capacity is large;
+        // every write past shape()[0] must commit first. append_zeros,
+        // append_gather and the in-place cat do so. The zero fill is ordered on
+        // stream(). Throws MemoryAllocationError when the device is out of memory.
+        void commit_rows(size_t rows) const;
+        // Rows backed by device memory: capacity() unless the storage is lazy.
+        [[nodiscard]] size_t committed_rows() const;
 
         // reserve() pre-allocates memory for future growth along dimension 0
         // Supports multi-dimensional tensors: [N, D1, D2, ...] reserves N "rows"
@@ -2922,6 +2943,10 @@ namespace lfs::core {
          * @return reference to this tensor (for chaining)
          */
         Tensor& append_zeros(size_t n_rows);
+
+        // Drops the rows past n_rows without freeing or moving them; append_zeros
+        // grows into them again. Undoes appends that a failed mutation left behind.
+        Tensor& truncate_rows(size_t n_rows);
 
         // Lazy indexing operations (returns expression template)
         auto gather_lazy(const Tensor& indices) const -> PermutationExpr<TensorLeaf, TensorLeaf>;
